@@ -1,0 +1,307 @@
+const std = @import("std");
+const Config = @import("config.zig").Config;
+const backend = @import("net/backend.zig");
+const ack = @import("protocol/ack.zig");
+const connected = @import("protocol/connected.zig");
+const datagram = @import("protocol/datagram.zig");
+const frame = @import("protocol/frame.zig");
+const offline = @import("protocol/offline.zig");
+const recovery = @import("reliability/recovery.zig");
+const core_mod = @import("session/core.zig");
+
+pub const Options = struct {
+    config: Config = .{},
+    protocol_version: u8 = 11,
+    mtu: u16 = 1492,
+    client_guid: u64 = 0,
+    handshake_timeout_ms: u32 = 5_000,
+    handshake_retry_ms: u32 = 500,
+};
+pub const MessageFn = *const fn (context: *anyopaque, payload: []const u8) anyerror!void;
+
+pub const Client = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    socket: backend.Socket,
+    server: std.Io.net.IpAddress,
+    core: core_mod.Core,
+    scratch: []u8,
+    receive_buffer: []u8,
+    client_guid: u64,
+    server_guid: u64,
+    mtu: u16,
+    closed: bool = false,
+
+    pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
+        try options.config.validate();
+        if (options.mtu < options.config.minimum_mtu or options.mtu > options.config.maximum_mtu or options.handshake_timeout_ms == 0 or options.handshake_retry_ms == 0 or options.handshake_retry_ms > options.handshake_timeout_ms) return error.InvalidConfiguration;
+        const self = try allocator.create(Client);
+        errdefer allocator.destroy(self);
+        const local: std.Io.net.IpAddress = switch (server) {
+            .ip4 => .{ .ip4 = .unspecified(0) },
+            .ip6 => .{ .ip6 = .unspecified(0) },
+        };
+        var socket = try backend.Socket.bind(io, local, options.config.maximum_datagram_size);
+        errdefer socket.close();
+        const scratch = try allocator.alloc(u8, options.config.maximum_datagram_size);
+        errdefer allocator.free(scratch);
+        const receive_buffer = try allocator.alloc(u8, options.config.maximum_datagram_size);
+        errdefer allocator.free(receive_buffer);
+        var random: [8]u8 = undefined;
+        io.random(&random);
+        const guid = if (options.client_guid != 0) options.client_guid else (std.mem.readInt(u64, &random, .little) | 0x8000_0000_0000_0000);
+        const deadline = deadlineAfter(io, options.handshake_timeout_ms);
+
+        const request1 = try offline.encodeOpenConnectionRequest1(options.protocol_version, options.mtu, scratch);
+        const reply1_wire = try exchangeExpected(&socket, server, request1, receive_buffer, offline.Id.open_connection_reply_1, deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
+        const reply1 = try offline.decodeOpenConnectionReply1(reply1_wire, options.config.minimum_mtu, options.config.maximum_mtu);
+        const request2 = try offline.encodeOpenConnectionRequest2(toRakAddress(server), reply1.cookie, reply1.mtu, guid, scratch);
+        const reply2_wire = try exchangeExpected(&socket, server, request2, receive_buffer, offline.Id.open_connection_reply_2, deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
+        const reply2 = try offline.decodeOpenConnectionReply2(reply2_wire, options.config.minimum_mtu, options.config.maximum_mtu);
+        if (reply2.server_guid != reply1.server_guid or reply2.mtu > reply1.mtu) return error.HandshakeMismatch;
+
+        var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
+        errdefer core.deinit();
+        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu };
+        try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
+        return self;
+    }
+
+    pub fn close(self: *Client) void {
+        if (self.closed) return;
+        self.closed = true;
+        var payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
+        _ = self.sendWire(&payload, .reliable_ordered, 0, nowMilliseconds(self.io)) catch {};
+        self.socket.close();
+    }
+    pub fn destroy(self: *Client) void {
+        self.close();
+        self.core.deinit();
+        self.allocator.free(self.receive_buffer);
+        self.allocator.free(self.scratch);
+        self.allocator.destroy(self);
+    }
+    pub fn send(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
+        if (self.closed) return error.ConnectionClosed;
+        _ = try self.sendWire(payload, reliability, channel, nowMilliseconds(self.io));
+    }
+
+    /// Delivers borrowed application payloads valid only during the callback.
+    pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
+        if (self.closed) return error.ConnectionClosed;
+        const message = try receiveTimed(&self.socket.value, self.io, self.receive_buffer, timeout);
+        if (!std.meta.eql(message.from, self.server) or message.flags.trunc) return 0;
+        const now_ms = nowMilliseconds(self.io);
+        const Bridge = struct {
+            client: *Client,
+            context: *anyopaque,
+            callback: MessageFn,
+            now_ms: u64,
+            fn deliver(raw: *anyopaque, payload: []const u8) !void {
+                const bridge: *@This() = @ptrCast(@alignCast(raw));
+                switch (try connected.decode(payload)) {
+                    .connected_ping => |sent| {
+                        var wire: [17]u8 = undefined;
+                        _ = try bridge.client.sendWire(try connected.encodePong(sent, bridge.now_ms, &wire), .unreliable, 0, bridge.now_ms);
+                    },
+                    .disconnect => bridge.client.closed = true,
+                    .detect_lost_connections => {
+                        var wire: [9]u8 = undefined;
+                        _ = try bridge.client.sendWire(try connected.encodePing(bridge.now_ms, &wire), .reliable, 0, bridge.now_ms);
+                    },
+                    .user => |data| try bridge.callback(bridge.context, data),
+                    else => {},
+                }
+            }
+        };
+        var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
+        const incoming = try self.core.processIncoming(message.data, now_ms, &bridge, Bridge.deliver);
+        if (incoming == .data) try self.flushReceipt(incoming.data);
+        try self.flushRetransmissions(now_ms);
+        return if (incoming == .data) incoming.data.delivered else 0;
+    }
+
+    fn finishConnectedHandshake(self: *Client, deadline: std.Io.Timeout, retry_ms: u32, maximum_work: usize) !void {
+        var control: [18]u8 = undefined;
+        _ = try self.sendWire(try connected.encodeConnectionRequest(self.client_guid, nowMilliseconds(self.io), &control), .reliable_ordered, 0, nowMilliseconds(self.io));
+        var work: usize = 0;
+        while (work < maximum_work) : (work += 1) {
+            const attempt = earliest(deadline, deadlineAfter(self.io, retry_ms));
+            const message = receiveTimed(&self.socket.value, self.io, self.receive_buffer, attempt) catch |err| switch (err) {
+                error.Timeout => {
+                    try self.flushRetransmissions(nowMilliseconds(self.io));
+                    continue;
+                },
+                else => return err,
+            };
+            if (!std.meta.eql(message.from, self.server) or message.flags.trunc) continue;
+            const Handshake = struct {
+                client: *Client,
+                accepted: bool = false,
+                now_ms: u64,
+                fn deliver(raw: *anyopaque, payload: []const u8) !void {
+                    const value: *@This() = @ptrCast(@alignCast(raw));
+                    if ((try connected.decode(payload)) != .connection_request_accepted) return;
+                    var wire: [512]u8 = undefined;
+                    const packet = try connected.encodeAddressList(.incoming, toRakAddress(value.client.server), 0, &.{}, value.now_ms, value.now_ms, &wire);
+                    _ = try value.client.sendWire(packet, .reliable_ordered, 0, value.now_ms);
+                    value.accepted = true;
+                }
+            };
+            const now_ms = nowMilliseconds(self.io);
+            var state: Handshake = .{ .client = self, .now_ms = now_ms };
+            const incoming = try self.core.processIncoming(message.data, now_ms, &state, Handshake.deliver);
+            if (incoming == .data) try self.flushReceipt(incoming.data);
+            if (state.accepted) return;
+        }
+        return error.HandshakeWorkLimitExceeded;
+    }
+
+    fn sendWire(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64) !usize {
+        const Emitter = struct {
+            client: *Client,
+            count: usize = 0,
+            fn emit(raw: *anyopaque, wire: []const u8) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                try value.client.socket.send(value.client.server, wire);
+                value.count += 1;
+            }
+        };
+        var emitter: Emitter = .{ .client = self };
+        _ = try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
+        return emitter.count;
+    }
+    fn flushReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt) !void {
+        if (receipt.acknowledge) |sequence| try self.socket.send(self.server, try datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch));
+        if (receipt.missing) |gap| {
+            var ranges: [2]ack.Record = undefined;
+            const count: usize = if (gap.first <= gap.last) blk: {
+                ranges[0] = .{ .first = gap.first, .last = gap.last };
+                break :blk 1;
+            } else blk: {
+                ranges[0] = .{ .first = 0, .last = gap.last };
+                ranges[1] = .{ .first = gap.first, .last = 0xffffff };
+                break :blk 2;
+            };
+            try self.socket.send(self.server, try datagram.encodeControl(.nack, ranges[0..count], self.scratch));
+        }
+    }
+    fn flushRetransmissions(self: *Client, now_ms: u64) !void {
+        var due: [256]recovery.Due = undefined;
+        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, self.core.config.maximum_packets_per_iteration)]);
+        if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
+        for (batch.items) |item| try self.socket.send(self.server, item.data);
+    }
+};
+
+fn exchangeExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, request: []const u8, buffer: []u8, id: offline.Id, overall: std.Io.Timeout, retry_ms: u32, maximum_work: usize) ![]const u8 {
+    while (std.Io.Clock.awake.now(socket.io).nanoseconds < overall.deadline.raw.nanoseconds) {
+        try socket.send(server, request);
+        const attempt = earliest(overall, deadlineAfter(socket.io, retry_ms));
+        return receiveExpected(socket, server, buffer, id, attempt, maximum_work) catch |err| switch (err) {
+            error.Timeout, error.HandshakeWorkLimitExceeded => continue,
+            else => return err,
+        };
+    }
+    return error.Timeout;
+}
+
+fn earliest(a: std.Io.Timeout, b: std.Io.Timeout) std.Io.Timeout {
+    if (a == .none) return b;
+    if (b == .none) return a;
+    return if (a.deadline.raw.nanoseconds < b.deadline.raw.nanoseconds) a else b;
+}
+fn receiveTimed(socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, timeout: std.Io.Timeout) !std.Io.net.IncomingMessage {
+    return socket.receiveTimeout(io, buffer, timeout) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => try socket.receive(io, buffer),
+        else => return err,
+    };
+}
+fn receiveExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, buffer: []u8, id: offline.Id, deadline: std.Io.Timeout, maximum_work: usize) ![]const u8 {
+    for (0..maximum_work) |_| {
+        const message = try receiveTimed(&socket.value, socket.io, buffer, deadline);
+        if (!std.meta.eql(message.from, server) or message.flags.trunc or message.data.len == 0) continue;
+        if (message.data[0] == @intFromEnum(offline.Id.incompatible_protocol_version)) return error.IncompatibleProtocol;
+        if (message.data[0] == @intFromEnum(id)) return message.data;
+    }
+    return error.HandshakeWorkLimitExceeded;
+}
+fn deadlineAfter(io: std.Io, milliseconds: u32) std.Io.Timeout {
+    return .{ .deadline = .{ .raw = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(milliseconds)), .clock = .awake } };
+}
+fn toRakAddress(address: std.Io.net.IpAddress) offline.Address {
+    return switch (address) {
+        .ip4 => |v| .{ .ipv4 = .{ .octets = v.bytes, .port = v.port } },
+        .ip6 => |v| .{ .ipv6 = .{ .octets = v.bytes, .port = v.port, .flow = v.flow, .scope = v.interface.index } },
+    };
+}
+fn nowMilliseconds(io: std.Io) u64 {
+    return @intCast(@max(@as(i96, 0), @divTrunc(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms)));
+}
+
+test "client and server complete a real loopback handshake" {
+    const server_mod = @import("server.zig");
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try server_mod.Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;interop" });
+    defer listener.destroy();
+    const Harness = struct {
+        listener: *server_mod.Listener,
+        connected: std.atomic.Value(bool) = .init(false),
+        message_data: [32]u8 = undefined,
+        message_len: usize = 0,
+        fn onConnect(raw: *anyopaque, _: *server_mod.Session) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.connected.store(true, .release);
+        }
+        fn onMessage(raw: *anyopaque, _: *server_mod.Session, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (payload.len > self.message_data.len) return error.MessageTooLarge;
+            @memcpy(self.message_data[0..payload.len], payload);
+            self.message_len = payload.len;
+        }
+        fn run(self: *@This(), io_value: std.Io) !void {
+            _ = io_value;
+            while (!self.connected.load(.acquire)) {
+                _ = try self.listener.poll(.none, .{ .context = self, .connected = onConnect, .message = onMessage });
+            }
+        }
+    };
+    var harness: Harness = .{ .listener = listener };
+    var server_task = try io.concurrent(Harness.run, .{ &harness, io });
+    defer server_task.cancel(io) catch {};
+    const client = Client.connect(std.testing.allocator, io, listener.socket.value.address, .{}) catch |err| {
+        std.debug.print("client connect failed: {any}\n", .{err});
+        return err;
+    };
+    defer client.destroy();
+    try server_task.await(io);
+    try std.testing.expect(harness.connected.load(.acquire));
+    try std.testing.expectEqual(listener.handshake_handler.server_guid, client.server_guid);
+
+    try client.send("\xfehello", .reliable_ordered, 0);
+    for (0..4) |_| {
+        _ = try listener.poll(.none, .{ .context = &harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+        if (harness.message_len != 0) break;
+    }
+    try std.testing.expectEqualStrings("\xfehello", harness.message_data[0..harness.message_len]);
+
+    var session_iterator = listener.sessions.valueIterator();
+    const session = session_iterator.next().?.*;
+    try session.send("\xfeworld", .reliable_ordered, 0);
+    const ClientCollector = struct {
+        data: [32]u8 = undefined,
+        len: usize = 0,
+        fn collect(raw: *anyopaque, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(self.data[0..payload.len], payload);
+            self.len = payload.len;
+        }
+    };
+    var collector: ClientCollector = .{};
+    for (0..8) |_| {
+        _ = try client.poll(.none, &collector, ClientCollector.collect);
+        if (collector.len != 0) break;
+    }
+    try std.testing.expectEqualStrings("\xfeworld", collector.data[0..collector.len]);
+}
