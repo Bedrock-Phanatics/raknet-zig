@@ -557,3 +557,121 @@ test "callback errors become terminal delivery failures" {
     try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
 }
+fn checkOrderedReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
+    const Discard = struct {
+        fn deliver(_: *anyopaque, _: []const u8) !void {}
+    };
+
+    var config: Config = .{};
+    config.receive_window = 8;
+    config.reliable_window = 8;
+    config.maximum_order_channels = 1;
+    config.maximum_ordered_packets = 4;
+    config.maximum_ordered_bytes = 64;
+    config.maximum_packets_per_iteration = 2;
+    var receiver = try Receiver.init(allocator, config);
+    defer receiver.deinit();
+
+    const frames = [_]frame.Frame{.{
+        .reliability = .reliable_ordered,
+        .reliable_index = 0,
+        .order_index = 1,
+        .order_channel = 0,
+        .payload = "retained",
+    }};
+    var wire_storage: [64]u8 = undefined;
+    const wire = try @import("../protocol/datagram.zig").encodeData(0, &frames, &wire_storage);
+    var descriptors: [1]frame.Frame = undefined;
+    var unused: u8 = 0;
+
+    _ = receiver.processWithScratch(wire, 0, &descriptors, &unused, Discard.deliver) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
+        try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
+        try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+        try std.testing.expectEqual(@as(usize, 0), receiver.ordered.total_bytes);
+        return err;
+    };
+
+    try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
+    try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
+    try std.testing.expectEqual(@as(usize, 1), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 8), receiver.ordered.total_bytes);
+}
+
+test "ordered receive state survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOrderedReceiveAllocationFailures, .{});
+}
+
+fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
+    const Counter = struct {
+        count: usize = 0,
+        fn deliver(raw: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+
+    var config: Config = .{};
+    config.receive_window = 8;
+    config.reliable_window = 8;
+    config.maximum_order_channels = 1;
+    config.maximum_frame_payload = 64;
+    config.maximum_split_parts = 4;
+    config.maximum_split_bytes = 64;
+    config.maximum_split_bytes_per_connection = 64;
+    config.maximum_concurrent_splits = 2;
+    config.maximum_packets_per_iteration = 2;
+    var receiver = try Receiver.init(allocator, config);
+    defer receiver.deinit();
+
+    var descriptors: [1]frame.Frame = undefined;
+    var wire_storage: [64]u8 = undefined;
+    var counter: Counter = .{};
+    const first = [_]frame.Frame{.{
+        .reliability = .reliable_ordered,
+        .reliable_index = 0,
+        .order_index = 0,
+        .order_channel = 0,
+        .split = .{ .count = 2, .id = 9, .index = 0 },
+        .payload = "hello ",
+    }};
+    const first_wire = try @import("../protocol/datagram.zig").encodeData(0, &first, &wire_storage);
+    _ = receiver.processWithScratch(first_wire, 0, &descriptors, &counter, Counter.deliver) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
+        try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
+        try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
+        try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
+        return err;
+    };
+
+    const second = [_]frame.Frame{.{
+        .reliability = .reliable_ordered,
+        .reliable_index = 1,
+        .order_index = 0,
+        .order_channel = 0,
+        .split = .{ .count = 2, .id = 9, .index = 1 },
+        .payload = "world",
+    }};
+    const second_wire = try @import("../protocol/datagram.zig").encodeData(1, &second, &wire_storage);
+    _ = receiver.processWithScratch(second_wire, 1, &descriptors, &counter, Counter.deliver) catch |err| {
+        if (err != error.OutOfMemory) return err;
+        try std.testing.expectEqual(@as(usize, 0), counter.count);
+        try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
+        try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
+        try std.testing.expectEqual(@as(usize, 1), receiver.splits.assemblies.count());
+        try std.testing.expect(receiver.splits.total_bytes == 6 or receiver.splits.total_bytes == 11);
+        return err;
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), counter.count);
+    try std.testing.expectEqual(@as(u32, 2), receiver.datagrams.expected);
+    try std.testing.expectEqual(@as(u32, 2), receiver.reliable.expected);
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
+}
+
+test "split receive state survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSplitReceiveAllocationFailures, .{});
+}

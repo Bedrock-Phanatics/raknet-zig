@@ -72,3 +72,14 @@ test "global quotas span channels and in-order fast path advances" {
     try std.testing.expect(try store.push(1, 1, "b"));
     try std.testing.expectError(error.OrderQueueFull, store.push(1, 2, "c"));
 }
+fn checkOrderedAllocationFailures(allocator: std.mem.Allocator) !void {
+    var store = try Store.init(allocator, 2, 4, 64, 8);
+    defer store.deinit();
+    try std.testing.expect(try store.push(0, 1, "retained"));
+    try std.testing.expectEqual(@as(usize, 1), store.packets.count());
+    try std.testing.expectEqual(@as(usize, 8), store.total_bytes);
+}
+
+test "ordered retention handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOrderedAllocationFailures, .{});
+}

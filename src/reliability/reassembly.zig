@@ -180,3 +180,24 @@ test "new assembly allocation failure leaves no retained state" {
     try std.testing.expectEqual(@as(usize, 1), value.assemblies.count());
     try std.testing.expectEqual(@as(usize, 5), value.total_bytes);
 }
+fn checkReassemblyAllocationFailures(allocator: std.mem.Allocator) !void {
+    var value = try Reassembler.init(allocator, .{
+        .maximum_parts = 4,
+        .maximum_bytes = 32,
+        .maximum_concurrent = 2,
+        .maximum_total_bytes = 64,
+        .timeout_ms = 10,
+    });
+    defer value.deinit();
+
+    try std.testing.expect((try value.push(1, 2, 0, "hello ", 0)) == null);
+    const complete = (try value.push(1, 2, 1, "world", 1)).?;
+    defer allocator.free(complete);
+    try std.testing.expectEqualStrings("hello world", complete);
+    try std.testing.expectEqual(@as(usize, 0), value.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
+}
+
+test "split reassembly handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReassemblyAllocationFailures, .{});
+}
