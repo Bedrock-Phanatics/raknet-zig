@@ -373,5 +373,6 @@ test "client and server complete a real loopback handshake" {
     try std.testing.expectEqual(@as(usize, 0), malformed);
     try std.testing.expectEqual(@as(usize, 1), application_failures);
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
     try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
 }

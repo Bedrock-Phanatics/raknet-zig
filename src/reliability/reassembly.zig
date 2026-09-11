@@ -151,6 +151,27 @@ test "split assembly handles duplicates, conflicts, collision, and expiry" {
     try std.testing.expectEqual(@as(usize, 1), value.expire(100, 2));
 }
 
+test "small fragments detach from large receive buffers" {
+    const limits: Limits = .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .timeout_ms = 10 };
+    var value = try Reassembler.init(std.testing.allocator, limits);
+    defer value.deinit();
+
+    var source: [4096]u8 = @splat(0);
+    @memcpy(source[100..104], "tiny");
+    try std.testing.expect((try value.push(7, 2, 0, source[100..104], 0)) == null);
+
+    const retained = value.assemblies.getPtr(7).?.fragments[0].data.?;
+    const retained_start = @intFromPtr(retained.ptr);
+    const source_start = @intFromPtr(&source);
+    try std.testing.expectEqual(@as(usize, 4), retained.len);
+    try std.testing.expect(retained_start + retained.len <= source_start or retained_start >= source_start + source.len);
+
+    @memset(&source, 0xaa);
+    const complete = (try value.push(7, 2, 1, "!", 1)).?;
+    defer complete.deinit();
+    try std.testing.expectEqualStrings("tiny!", complete.bytes);
+}
+
 test "split limits reject before allocation" {
     var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 8, .maximum_concurrent = 1, .maximum_total_bytes = 8, .timeout_ms = 10 });
     defer value.deinit();

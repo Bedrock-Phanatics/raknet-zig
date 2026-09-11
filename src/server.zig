@@ -11,10 +11,11 @@ const cookie = @import("security/cookie.zig");
 const rate = @import("security/rate_limit.zig");
 const core_mod = @import("session/core.zig");
 const handshake = @import("session/offline_handshake.zig");
+const deadline_queue = @import("session/deadline_queue.zig");
 const receiver = @import("session/receiver.zig");
 const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
 
-const EndpointKey = [23]u8;
+const EndpointKey = deadline_queue.Key;
 const State = enum { connecting, connected, closed };
 
 pub const Options = struct {
@@ -145,6 +146,7 @@ pub const Listener = struct {
     socket: backend.Socket,
     session_quota: QuotaAllocator,
     sessions: std.AutoHashMapUnmanaged(EndpointKey, *Session) = .empty,
+    deadlines: deadline_queue.Queue,
     advertisement: []u8,
     rate_entries: []rate.Entry,
     limiter: rate.Limiter,
@@ -155,8 +157,6 @@ pub const Listener = struct {
     frame_scratch: []frame.Frame,
     handshake_output: []u8,
     closed: bool = false,
-    last_sweep_ms: u64 = 0,
-    last_maintenance_ms: u64 = 0,
     maintenance_interval_ms: u32,
 
     pub fn listen(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, options: Options) !*Listener {
@@ -181,6 +181,8 @@ pub const Listener = struct {
         errdefer allocator.free(handshake_output);
         const frame_scratch = try allocator.alloc(frame.Frame, options.config.maximum_packets_per_iteration);
         errdefer allocator.free(frame_scratch);
+        var deadlines = try deadline_queue.Queue.init(allocator, options.config.maximum_connections);
+        errdefer deadlines.deinit();
         var random: [80]u8 = undefined;
         io.random(&random);
         const guid = if (options.server_guid != 0) options.server_guid else std.mem.readInt(u64, random[0..8], .little);
@@ -190,6 +192,7 @@ pub const Listener = struct {
             .config = options.config,
             .socket = socket,
             .session_quota = QuotaAllocator.init(allocator, options.maximum_session_memory_bytes),
+            .deadlines = deadlines,
             .advertisement = advertisement,
             .rate_entries = rate_entries,
             .limiter = limiter,
@@ -215,6 +218,7 @@ pub const Listener = struct {
         while (iterator.next()) |session| session.*.destroy();
         self.sessions.deinit(self.session_quota.allocator());
         std.debug.assert(self.session_quota.used_bytes == 0);
+        self.deadlines.deinit();
         self.close();
         self.allocator.free(self.frame_scratch);
         self.allocator.free(self.handshake_output);
@@ -230,9 +234,7 @@ pub const Listener = struct {
         var stats: PollStats = .{};
         const batch = self.socket.receiveMany(self.messages, self.receive_storage, timeout) catch |err| switch (err) {
             error.Timeout => {
-                const now_ms = nowMilliseconds(self.io);
-                self.maintain(now_ms, callbacks);
-                stats.sessions_expired = self.expire(now_ms, callbacks);
+                self.processDue(nowMilliseconds(self.io), callbacks, &stats);
                 return stats;
             },
             else => return err,
@@ -330,7 +332,15 @@ pub const Listener = struct {
                     recordSessionFailure(&stats, failure.class);
                     session.state = .closed;
                 };
-                if (session.state == .closed) self.removeSession(key, callbacks);
+                if (session.state == .closed) {
+                    self.removeSession(key, callbacks);
+                } else {
+                    self.scheduleSession(session, now_ms) catch {
+                        recordSessionFailure(&stats, .internal);
+                        session.state = .closed;
+                        self.removeSession(key, callbacks);
+                    };
+                }
                 continue;
             }
 
@@ -352,7 +362,13 @@ pub const Listener = struct {
                         session.destroy();
                         return err;
                     };
+                    self.scheduleSession(session, now_ms) catch |err| {
+                        _ = self.sessions.remove(key);
+                        session.destroy();
+                        return err;
+                    };
                     self.socket.send(message.from, accepted.response) catch |err| {
+                        _ = self.deadlines.remove(key);
                         _ = self.sessions.remove(key);
                         session.destroy();
                         return err;
@@ -360,45 +376,46 @@ pub const Listener = struct {
                 },
             }
         }
-        const maintenance_now_ms = nowMilliseconds(self.io);
-        self.maintain(maintenance_now_ms, callbacks);
-        stats.sessions_expired = self.expire(maintenance_now_ms, callbacks);
+        self.processDue(nowMilliseconds(self.io), callbacks, &stats);
         return stats;
     }
 
-    fn maintain(self: *Listener, now_ms: u64, callbacks: Callbacks) void {
-        if (now_ms -| self.last_maintenance_ms < self.maintenance_interval_ms) return;
-        self.last_maintenance_ms = now_ms;
-        var failed: [256]EndpointKey = undefined;
-        var count: usize = 0;
-        var iterator = self.sessions.iterator();
-        while (iterator.next()) |entry| {
-            entry.value_ptr.*.flushRetransmissions(now_ms) catch {
-                if (count < failed.len) {
-                    failed[count] = entry.key_ptr.*;
-                    count += 1;
-                }
-            };
-        }
-        for (failed[0..count]) |key| self.removeSession(key, callbacks);
+    fn scheduleSession(self: *Listener, session: *const Session, now_ms: u64) !void {
+        const maintenance = now_ms +| self.maintenance_interval_ms;
+        const idle = session.last_seen_ms +| self.config.idle_timeout_ms;
+        try self.deadlines.upsert(session.key, @min(maintenance, idle));
     }
 
-    fn expire(self: *Listener, now_ms: u64, callbacks: Callbacks) usize {
-        if (now_ms -| self.last_sweep_ms < 1000) return 0;
-        self.last_sweep_ms = now_ms;
-        var keys: [256]EndpointKey = undefined;
-        var count: usize = 0;
-        var iterator = self.sessions.iterator();
-        while (iterator.next()) |entry| {
-            if (count >= keys.len) break;
-            if (now_ms -| entry.value_ptr.*.last_seen_ms < self.config.idle_timeout_ms) continue;
-            keys[count] = entry.key_ptr.*;
-            count += 1;
+    fn processDue(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats) void {
+        var work: usize = 0;
+        while (work < self.config.maximum_packets_per_iteration) : (work += 1) {
+            const entry = self.deadlines.popDue(now_ms) orelse break;
+            const session = self.sessions.get(entry.key) orelse continue;
+            if (session.state == .closed) {
+                self.removeSession(entry.key, callbacks);
+                continue;
+            }
+            if (now_ms -| session.last_seen_ms >= self.config.idle_timeout_ms) {
+                stats.sessions_expired += 1;
+                self.removeSession(entry.key, callbacks);
+                continue;
+            }
+            session.flushRetransmissions(now_ms) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.retransmission, err).class);
+                session.state = .closed;
+                self.removeSession(entry.key, callbacks);
+                continue;
+            };
+            self.scheduleSession(session, now_ms) catch {
+                recordSessionFailure(stats, .internal);
+                session.state = .closed;
+                self.removeSession(entry.key, callbacks);
+            };
         }
-        for (keys[0..count]) |key| self.removeSession(key, callbacks);
-        return count;
     }
+
     fn removeSession(self: *Listener, key: EndpointKey, callbacks: Callbacks) void {
+        _ = self.deadlines.remove(key);
         const removed = self.sessions.fetchRemove(key) orelse return;
         if (callbacks.disconnected) |notify| notify(callbacks.context, removed.value);
         removed.value.destroy();
@@ -496,11 +513,13 @@ test "listener answers an offline ping over loopback" {
     const reply2 = try client.value.receive(io, &response);
     try std.testing.expectEqual(@intFromEnum(offline.Id.open_connection_reply_2), reply2.data[0]);
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
 
     try client.send(listener.socket.value.address, request2.written());
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
     _ = try client.value.receive(io, &response);
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
 
     const Sender = struct {
         socket: *backend.Socket,

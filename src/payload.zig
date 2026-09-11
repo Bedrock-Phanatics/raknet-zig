@@ -40,6 +40,7 @@ test "owned copies allocate exactly the payload length" {
     const owned = try BorrowedPayload.init(bytes).toOwned(quota.allocator());
     try std.testing.expectEqual(bytes.len, quota.used_bytes);
     try std.testing.expectEqualStrings(bytes, owned.bytes);
+    try std.testing.expect(@intFromPtr(owned.bytes.ptr) != @intFromPtr(bytes.ptr));
     owned.deinit();
     try std.testing.expectEqual(@as(usize, 0), quota.used_bytes);
 

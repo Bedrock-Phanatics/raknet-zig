@@ -107,6 +107,3 @@ The benchmark target measures isolated in-memory codec/window operations. It is
 useful for regressions but is not a network-throughput claim. Validate limits,
 loss behavior, and interoperability against the Bedrock versions and platforms
 you deploy before exposing a service to the public Internet.
-
-See [SECURITY.md](SECURITY.md) for the threat model and reporting guidance.
-

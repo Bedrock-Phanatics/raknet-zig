@@ -239,9 +239,15 @@ test "receiver delivers in order with a zero-copy fast path" {
     defer receiver.deinit();
     var collector: Collector = .{};
     var descriptors: [2]frame.Frame = undefined;
-    var wire: [128]u8 = undefined;
+    var wire: [4096]u8 = undefined;
     const second = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 1, .order_channel = 0, .payload = "second" }};
     _ = try receiver.processWithScratch(try @import("../protocol/datagram.zig").encodeData(0, &second, &wire), 0, &descriptors, &collector, Collector.add);
+    const retained = receiver.ordered.packets.get(1).?;
+    const retained_start = @intFromPtr(retained.ptr);
+    const wire_start = @intFromPtr(&wire);
+    try std.testing.expectEqual(second[0].payload.len, retained.len);
+    try std.testing.expect(retained_start + retained.len <= wire_start or retained_start >= wire_start + wire.len);
+
     const first = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 0, .order_channel = 0, .payload = "first" }};
     const receipt = try receiver.processWithScratch(try @import("../protocol/datagram.zig").encodeData(1, &first, &wire), 1, &descriptors, &collector, Collector.add);
     try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
@@ -537,7 +543,7 @@ test "small descriptor scratch is rejected before state changes" {
     try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
     try std.testing.expectEqual(@as(usize, 2), counter.count);
 }
-test "explicit application callback failures are preserved" {
+test "callback failure before prepared state keeps stores empty" {
     const Failing = struct {
         calls: usize = 0,
         fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
@@ -567,7 +573,80 @@ test "explicit application callback failures are preserved" {
     try std.testing.expectEqual(@as(usize, 1), failing.calls);
     try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
+    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
 }
+
+test "callback failure after prepared ordered state releases it" {
+    const FailingSecond = struct {
+        calls: usize = 0,
+        first: [8]u8 = undefined,
+        first_len: usize = 0,
+        failed: [8]u8 = undefined,
+        failed_len: usize = 0,
+
+        fn deliver(raw: *anyopaque, payload: BorrowedPayload) DeliveryError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (payload.bytes.len > self.first.len) return error.ApplicationFailure;
+            self.calls += 1;
+            if (self.calls == 1) {
+                @memcpy(self.first[0..payload.bytes.len], payload.bytes);
+                self.first_len = payload.bytes.len;
+                return;
+            }
+            @memcpy(self.failed[0..payload.bytes.len], payload.bytes);
+            self.failed_len = payload.bytes.len;
+            return error.ApplicationFailure;
+        }
+    };
+
+    var config: Config = .{};
+    config.receive_window = 8;
+    config.reliable_window = 8;
+    config.maximum_order_channels = 1;
+    config.maximum_ordered_packets = 2;
+    config.maximum_ordered_bytes = 16;
+    config.maximum_packets_per_iteration = 2;
+    var receiver = try Receiver.init(std.testing.allocator, config);
+    defer receiver.deinit();
+
+    var callback: FailingSecond = .{};
+    var descriptors: [1]frame.Frame = undefined;
+    var wire_storage: [64]u8 = undefined;
+    const queued = [_]frame.Frame{.{
+        .reliability = .reliable_ordered,
+        .reliable_index = 0,
+        .order_index = 1,
+        .order_channel = 0,
+        .payload = "second",
+    }};
+    const queued_wire = try @import("../protocol/datagram.zig").encodeData(0, &queued, &wire_storage);
+    const queued_receipt = try receiver.processWithScratch(queued_wire, 0, &descriptors, &callback, FailingSecond.deliver);
+    try std.testing.expectEqual(@as(usize, 0), queued_receipt.delivered);
+    try std.testing.expectEqual(@as(usize, 1), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 6), receiver.ordered.total_bytes);
+
+    const immediate = [_]frame.Frame{.{
+        .reliability = .reliable_ordered,
+        .reliable_index = 1,
+        .order_index = 0,
+        .order_channel = 0,
+        .payload = "first",
+    }};
+    const immediate_wire = try @import("../protocol/datagram.zig").encodeData(1, &immediate, &wire_storage);
+    try std.testing.expectError(error.ApplicationFailure, receiver.processWithScratch(immediate_wire, 1, &descriptors, &callback, FailingSecond.deliver));
+
+    try std.testing.expectEqual(@as(usize, 2), callback.calls);
+    try std.testing.expectEqualStrings("first", callback.first[0..callback.first_len]);
+    try std.testing.expectEqualStrings("second", callback.failed[0..callback.failed_len]);
+    try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
+    try std.testing.expectEqual(@as(u32, 2), receiver.reliable.expected);
+    try std.testing.expectEqual(@as(u32, 2), receiver.ordered.expected[0]);
+    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.total_bytes);
+}
+
 fn checkOrderedReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
     const Discard = struct {
         fn deliver(_: *anyopaque, _: BorrowedPayload) !void {}

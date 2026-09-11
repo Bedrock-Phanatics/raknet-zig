@@ -28,5 +28,5 @@ pub fn build(b: *std.Build) void {
     const bench_root = module(b, "bench/main.zig", target, .ReleaseFast);
     bench_root.addImport("raknet", module(b, "src/root.zig", target, .ReleaseFast));
     const bench = b.addExecutable(.{ .name = "raknet-bench", .root_module = bench_root });
-    b.step("bench", "Run codec and receive-window microbenchmarks").dependOn(&b.addRunArtifact(bench).step);
+    b.step("bench", "Run codec, scheduler, and receive-window microbenchmarks").dependOn(&b.addRunArtifact(bench).step);
 }

@@ -5,6 +5,7 @@ const frame = raknet.protocol.frame;
 const cursor = raknet.protocol.cursor;
 const datagram = raknet.protocol.datagram;
 const receive_window = raknet.reliability.receive_window;
+const deadline_queue = raknet.session.deadline_queue;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -44,6 +45,47 @@ pub fn main(init: std.process.Init) !void {
         std.mem.doNotOptimizeAway(window.expected);
     }
     const window_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+
+    const scheduler_capacity = 4096;
+    var scheduler = try deadline_queue.Queue.init(std.heap.page_allocator, scheduler_capacity);
+    defer scheduler.deinit();
+    var scheduler_keys: [scheduler_capacity]deadline_queue.Key = undefined;
+    var linear_deadlines: [scheduler_capacity]u64 = undefined;
+    for (0..scheduler_capacity) |index| {
+        var key: deadline_queue.Key = @splat(0);
+        key[0] = @truncate(index);
+        key[1] = @truncate(index >> 8);
+        scheduler_keys[index] = key;
+        linear_deadlines[index] = index + 1;
+        try scheduler.upsert(key, index + 1);
+    }
+
+    const scheduler_iterations: usize = 500_000;
+    start = std.Io.Clock.awake.now(io);
+    for (0..scheduler_iterations) |iteration| {
+        const index = iteration & (scheduler_capacity - 1);
+        try scheduler.upsert(scheduler_keys[index], scheduler_capacity + iteration + 1);
+        checksum +%= scheduler.peek().?.deadline_ms;
+    }
+    const scheduler_update_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+
+    const timer_turns: usize = 25_000;
+    start = std.Io.Clock.awake.now(io);
+    for (0..timer_turns) |_| {
+        checksum +%= scheduler.peek().?.deadline_ms;
+        std.mem.doNotOptimizeAway(scheduler.peek());
+    }
+    const scheduler_peek_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+
+    start = std.Io.Clock.awake.now(io);
+    for (0..timer_turns) |turn| {
+        linear_deadlines[turn & (scheduler_capacity - 1)] +%= scheduler_capacity;
+        var earliest = linear_deadlines[0];
+        for (linear_deadlines[1..]) |deadline| earliest = @min(earliest, deadline);
+        checksum +%= earliest;
+        std.mem.doNotOptimizeAway(earliest);
+    }
+    const linear_scan_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
 
     const wire_count = 64;
     const frames_per_datagram = 8;
@@ -94,6 +136,9 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print(
         "ack_decode: {d:.2} ns/op\nframe_decode: {d:.2} ns/op\nwindow_add: {d:.2} ns/op\n" ++
+            "deadline_reschedule_4096: {d:.2} ns/op\n" ++
+            "deadline_next_4096: {d:.2} ns/turn\n" ++
+            "deadline_linear_scan_4096: {d:.2} ns/turn\n" ++
             "datagram_parse_1pass_8_frames: {d:.2} ns/op\n" ++
             "datagram_parse_2pass_8_frames: {d:.2} ns/op\n" ++
             "datagram_parse_descriptors_8_frames: {d:.2} ns/op\n" ++
@@ -102,6 +147,9 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(ack_ns)) / @as(f64, @floatFromInt(iterations)),
             @as(f64, @floatFromInt(frame_ns)) / @as(f64, @floatFromInt(iterations)),
             @as(f64, @floatFromInt(window_ns)) / @as(f64, @floatFromInt(iterations)),
+            @as(f64, @floatFromInt(scheduler_update_ns)) / @as(f64, @floatFromInt(scheduler_iterations)),
+            @as(f64, @floatFromInt(scheduler_peek_ns)) / @as(f64, @floatFromInt(timer_turns)),
+            @as(f64, @floatFromInt(linear_scan_ns)) / @as(f64, @floatFromInt(timer_turns)),
             @as(f64, @floatFromInt(one_pass_ns)) / @as(f64, @floatFromInt(parser_iterations)),
             @as(f64, @floatFromInt(two_pass_ns)) / @as(f64, @floatFromInt(parser_iterations)),
             @as(f64, @floatFromInt(descriptor_ns)) / @as(f64, @floatFromInt(parser_iterations)),
