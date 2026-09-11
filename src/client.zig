@@ -18,7 +18,7 @@ pub const Options = struct {
     handshake_timeout_ms: u32 = 5_000,
     handshake_retry_ms: u32 = 500,
 };
-pub const MessageFn = *const fn (context: *anyopaque, payload: []const u8) core_mod.ApplicationCallbackError!void;
+pub const MessageFn = *const fn (context: *anyopaque, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void;
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -114,9 +114,9 @@ pub const Client = struct {
             callback: MessageFn,
             now_ms: u64,
             remote_disconnect: bool = false,
-            fn deliver(raw: *anyopaque, payload: []const u8) receiver.DeliveryError!void {
+            fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
                 const bridge: *@This() = @ptrCast(@alignCast(raw));
-                const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
+                const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
                 switch (packet) {
                     .connected_ping => |sent| {
                         var wire: [17]u8 = undefined;
@@ -129,7 +129,7 @@ pub const Client = struct {
                         const ping = connected.encodePing(bridge.now_ms, &wire) catch return error.InternalFailure;
                         _ = bridge.client.sendWire(ping, .reliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     },
-                    .user => |data| bridge.callback(bridge.context, data) catch return error.ApplicationFailure,
+                    .user => |data| bridge.callback(bridge.context, .init(data)) catch return error.ApplicationFailure,
                     else => {},
                 }
             }
@@ -175,9 +175,9 @@ pub const Client = struct {
                 client: *Client,
                 accepted: bool = false,
                 now_ms: u64,
-                fn deliver(raw: *anyopaque, payload: []const u8) receiver.DeliveryError!void {
+                fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
                     const value: *@This() = @ptrCast(@alignCast(raw));
-                    const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
+                    const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
                     if (packet != .connection_request_accepted) return;
                     var wire: [512]u8 = undefined;
                     const incoming = connected.encodeAddressList(.incoming, toRakAddress(value.client.server), 0, &.{}, value.now_ms, value.now_ms, &wire) catch return error.InternalFailure;
@@ -297,11 +297,11 @@ test "client and server complete a real loopback handshake" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.connected.store(true, .release);
         }
-        fn onMessage(raw: *anyopaque, _: *server_mod.Session, payload: []const u8) !void {
+        fn onMessage(raw: *anyopaque, _: *server_mod.Session, payload: receiver.BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.fail_messages or payload.len > self.message_data.len) return error.ApplicationFailure;
-            @memcpy(self.message_data[0..payload.len], payload);
-            self.message_len = payload.len;
+            if (self.fail_messages or payload.bytes.len > self.message_data.len) return error.ApplicationFailure;
+            @memcpy(self.message_data[0..payload.bytes.len], payload.bytes);
+            self.message_len = payload.bytes.len;
         }
         fn onDisconnect(raw: *anyopaque, _: *server_mod.Session) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -339,10 +339,10 @@ test "client and server complete a real loopback handshake" {
     const ClientCollector = struct {
         data: [32]u8 = undefined,
         len: usize = 0,
-        fn collect(raw: *anyopaque, payload: []const u8) !void {
+        fn collect(raw: *anyopaque, payload: receiver.BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            @memcpy(self.data[0..payload.len], payload);
-            self.len = payload.len;
+            @memcpy(self.data[0..payload.bytes.len], payload.bytes);
+            self.len = payload.bytes.len;
         }
     };
     var collector: ClientCollector = .{};

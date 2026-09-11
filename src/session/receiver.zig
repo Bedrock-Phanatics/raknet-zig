@@ -6,6 +6,9 @@ const reassembly = @import("../reliability/reassembly.zig");
 const ordering = @import("../reliability/ordering.zig");
 const ordered_store = @import("../reliability/ordered_store.zig");
 
+pub const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
+pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
+
 pub const Receipt = struct { acknowledge: ?u32 = null, missing: ?receive_window.Gap = null, delivered: usize = 0 };
 pub const DeliveryError = error{
     PeerProtocolFailure,
@@ -14,7 +17,7 @@ pub const DeliveryError = error{
     ApplicationFailure,
     InternalFailure,
 };
-pub const DeliverFn = *const fn (context: *anyopaque, payload: []const u8) DeliveryError!void;
+pub const DeliverFn = *const fn (context: *anyopaque, payload: BorrowedPayload) DeliveryError!void;
 
 /// Single-owner connected receive state. It retains no slice into the datagram after `process` returns.
 pub const Receiver = struct {
@@ -152,15 +155,15 @@ pub const Receiver = struct {
         if (!try self.previewReliable(value.reliable_index)) return 0;
 
         var payload = value.payload;
-        var complete: ?[]u8 = null;
-        defer if (complete) |owned| self.allocator.free(owned);
+        var complete: ?OwnedPayload = null;
+        defer if (complete) |owned| owned.deinit();
         if (value.split) |split| {
             complete = try self.splits.push(split.id, split.count, split.index, payload, now_ms);
             if (complete == null) {
                 try self.commitReliable(value.reliable_index);
                 return 0;
             }
-            payload = complete.?;
+            payload = complete.?.bytes;
         }
 
         if (value.reliability.hasSequenceIndex()) {
@@ -181,7 +184,7 @@ pub const Receiver = struct {
                 var delivered: usize = 1;
                 while (try self.ordered.pop(channel)) |owned| {
                     defer owned.deinit();
-                    try deliverPayload(context, owned.data, deliver);
+                    try deliverPayload(context, owned.bytes, deliver);
                     delivered += 1;
                     if (delivered >= self.config.maximum_packets_per_iteration) break;
                 }
@@ -198,7 +201,7 @@ pub const Receiver = struct {
     }
 
     fn deliverPayload(context: *anyopaque, payload: []const u8, deliver: DeliverFn) !void {
-        try deliver(context, payload);
+        try deliver(context, .init(payload));
     }
     fn previewReliable(self: *const Receiver, reliable_index: ?u32) !bool {
         const index = reliable_index orelse return true;
@@ -223,11 +226,11 @@ test "receiver delivers in order with a zero-copy fast path" {
         values: [2][8]u8 = undefined,
         lengths: [2]usize = @splat(0),
         count: usize = 0,
-        fn add(raw: *anyopaque, payload: []const u8) !void {
+        fn add(raw: *anyopaque, payload: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.count >= self.values.len or payload.len > self.values[0].len) return error.ApplicationFailure;
-            @memcpy(self.values[self.count][0..payload.len], payload);
-            self.lengths[self.count] = payload.len;
+            if (self.count >= self.values.len or payload.bytes.len > self.values[0].len) return error.ApplicationFailure;
+            @memcpy(self.values[self.count][0..payload.bytes.len], payload.bytes);
+            self.lengths[self.count] = payload.bytes.len;
             self.count += 1;
         }
     };
@@ -249,7 +252,7 @@ test "receiver delivers in order with a zero-copy fast path" {
 test "malformed suffix cannot consume sequence state or invoke callbacks" {
     const Counter = struct {
         count: usize = 0,
-        fn deliver(raw: *anyopaque, _: []const u8) !void {
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.count += 1;
         }
@@ -298,7 +301,7 @@ test "malformed suffix cannot consume sequence state or invoke callbacks" {
 test "invalid later frame metadata is rejected before earlier delivery" {
     const Counter = struct {
         count: usize = 0,
-        fn deliver(raw: *anyopaque, _: []const u8) !void {
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.count += 1;
         }
@@ -327,7 +330,7 @@ test "invalid later frame metadata is rejected before earlier delivery" {
 test "retained allocation failure does not consume datagram or reliable indices" {
     const Counter = struct {
         count: usize = 0,
-        fn deliver(raw: *anyopaque, _: []const u8) !void {
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.count += 1;
         }
@@ -383,7 +386,7 @@ test "retained allocation failure does not consume datagram or reliable indices"
 test "every truncation inside a later frame is atomic" {
     const Counter = struct {
         count: usize = 0,
-        fn deliver(raw: *anyopaque, _: []const u8) !void {
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.count += 1;
         }
@@ -433,10 +436,10 @@ test "completed split can retry after final allocation failure" {
         value: [16]u8 = undefined,
         length: usize = 0,
         count: usize = 0,
-        fn deliver(raw: *anyopaque, payload: []const u8) !void {
+        fn deliver(raw: *anyopaque, payload: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            @memcpy(self.value[0..payload.len], payload);
-            self.length = payload.len;
+            @memcpy(self.value[0..payload.bytes.len], payload.bytes);
+            self.length = payload.bytes.len;
             self.count += 1;
         }
     };
@@ -501,7 +504,7 @@ test "completed split can retry after final allocation failure" {
 test "small descriptor scratch is rejected before state changes" {
     const Counter = struct {
         count: usize = 0,
-        fn deliver(raw: *anyopaque, _: []const u8) !void {
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.count += 1;
         }
@@ -536,7 +539,7 @@ test "small descriptor scratch is rejected before state changes" {
 test "explicit application callback failures are preserved" {
     const Failing = struct {
         calls: usize = 0,
-        fn deliver(raw: *anyopaque, _: []const u8) !void {
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             return error.ApplicationFailure;
@@ -566,7 +569,7 @@ test "explicit application callback failures are preserved" {
 }
 fn checkOrderedReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
     const Discard = struct {
-        fn deliver(_: *anyopaque, _: []const u8) !void {}
+        fn deliver(_: *anyopaque, _: BorrowedPayload) !void {}
     };
 
     var config: Config = .{};
@@ -613,7 +616,7 @@ test "ordered receive state survives every allocation failure" {
 fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
     const Counter = struct {
         count: usize = 0,
-        fn deliver(raw: *anyopaque, _: []const u8) !void {
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.count += 1;
         }

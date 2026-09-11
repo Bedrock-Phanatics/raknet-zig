@@ -1,13 +1,6 @@
 const std = @import("std");
 const uint24 = @import("../util/uint24.zig");
-
-pub const OwnedPacket = struct {
-    allocator: std.mem.Allocator,
-    data: []u8,
-    pub fn deinit(self: OwnedPacket) void {
-        self.allocator.free(self.data);
-    }
-};
+pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
 /// One reliable-ordered channel. It owns queued payloads and has hard entry/byte/window caps.
 pub const OrderedQueue = struct {
@@ -48,11 +41,11 @@ pub const OrderedQueue = struct {
     }
 
     /// Transfers ownership of the next contiguous packet to the caller.
-    pub fn pop(self: *OrderedQueue) ?OwnedPacket {
+    pub fn pop(self: *OrderedQueue) ?OwnedPayload {
         const removed = self.packets.fetchRemove(self.expected) orelse return null;
         self.expected = uint24.add(self.expected, 1);
         self.total_bytes -= removed.value.len;
-        return .{ .allocator = self.allocator, .data = removed.value };
+        return .{ .allocator = self.allocator, .bytes = removed.value };
     }
 };
 
@@ -77,10 +70,10 @@ test "ordered delivery wraps, deduplicates, and transfers ownership" {
     try std.testing.expect(!(try queue.push(0, "replacement")));
     try std.testing.expect(try queue.push(0xffffff, "last"));
     var packet = queue.pop().?;
-    try std.testing.expectEqualStrings("last", packet.data);
+    try std.testing.expectEqualStrings("last", packet.bytes);
     packet.deinit();
     packet = queue.pop().?;
-    try std.testing.expectEqualStrings("zero", packet.data);
+    try std.testing.expectEqualStrings("zero", packet.bytes);
     packet.deinit();
     try std.testing.expect(queue.pop() == null);
     try std.testing.expectError(error.OrderWindowExceeded, queue.push(100, "far"));

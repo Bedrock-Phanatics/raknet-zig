@@ -1,4 +1,5 @@
 const std = @import("std");
+const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
 const Fragment = struct { data: ?[]u8 = null };
 const Assembly = struct {
@@ -43,7 +44,7 @@ pub const Reassembler = struct {
     }
 
     /// Returns a newly allocated complete payload. The caller owns it.
-    pub fn push(self: *Reassembler, id: u16, count: u32, index: u32, payload: []const u8, now_ms: u64) !?[]u8 {
+    pub fn push(self: *Reassembler, id: u16, count: u32, index: u32, payload: []const u8, now_ms: u64) !?OwnedPayload {
         if (count < 2 or count > self.limits.maximum_parts or index >= count) return error.InvalidSplit;
         if (payload.len == 0 or payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
 
@@ -91,7 +92,7 @@ pub const Reassembler = struct {
         return try self.finish(id, assembly);
     }
 
-    fn finish(self: *Reassembler, id: u16, assembly: *Assembly) ![]u8 {
+    fn finish(self: *Reassembler, id: u16, assembly: *Assembly) !OwnedPayload {
         const output = try self.allocator.alloc(u8, assembly.bytes);
         errdefer self.allocator.free(output);
         var offset: usize = 0;
@@ -101,7 +102,7 @@ pub const Reassembler = struct {
             offset += bytes.len;
         }
         self.remove(id);
-        return output;
+        return .{ .allocator = self.allocator, .bytes = output };
     }
 
     pub fn expire(self: *Reassembler, now_ms: u64, maximum_work: usize) usize {
@@ -141,8 +142,8 @@ test "split assembly handles duplicates, conflicts, collision, and expiry" {
     try std.testing.expectError(error.ConflictingFragment, value.push(1, 2, 1, "evil", 2));
     try std.testing.expect((try value.push(2, 2, 0, "hello ", 3)) == null);
     const complete = (try value.push(2, 2, 1, "world", 4)).?;
-    defer std.testing.allocator.free(complete);
-    try std.testing.expectEqualStrings("hello world", complete);
+    defer complete.deinit();
+    try std.testing.expectEqualStrings("hello world", complete.bytes);
     try std.testing.expect((try value.push(3, 2, 0, "x", 5)) == null);
     try std.testing.expectError(error.SplitIdCollision, value.push(3, 3, 1, "y", 6));
     try std.testing.expect((try value.push(4, 2, 0, "z", 7)) == null);
@@ -192,8 +193,8 @@ fn checkReassemblyAllocationFailures(allocator: std.mem.Allocator) !void {
 
     try std.testing.expect((try value.push(1, 2, 0, "hello ", 0)) == null);
     const complete = (try value.push(1, 2, 1, "world", 1)).?;
-    defer allocator.free(complete);
-    try std.testing.expectEqualStrings("hello world", complete);
+    defer complete.deinit();
+    try std.testing.expectEqualStrings("hello world", complete.bytes);
     try std.testing.expectEqual(@as(usize, 0), value.assemblies.count());
     try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
 }

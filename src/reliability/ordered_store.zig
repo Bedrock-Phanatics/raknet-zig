@@ -1,6 +1,6 @@
 const std = @import("std");
 const uint24 = @import("../util/uint24.zig");
-const OwnedPacket = @import("ordering.zig").OwnedPacket;
+const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
 /// Shared storage for every order channel, so many channels cannot multiply configured limits.
 pub const Store = struct {
@@ -51,12 +51,12 @@ pub const Store = struct {
         self.total_bytes += copy.len;
         return true;
     }
-    pub fn pop(self: *Store, channel: u8) !?OwnedPacket {
+    pub fn pop(self: *Store, channel: u8) !?OwnedPayload {
         if (channel >= self.expected.len) return error.InvalidOrderChannel;
         const removed = self.packets.fetchRemove(makeKey(channel, self.expected[channel])) orelse return null;
         self.expected[channel] = uint24.add(self.expected[channel], 1);
         self.total_bytes -= removed.value.len;
-        return .{ .allocator = self.allocator, .data = removed.value };
+        return .{ .allocator = self.allocator, .bytes = removed.value };
     }
     fn makeKey(channel: u8, index: u32) u32 {
         return (@as(u32, channel) << 24) | uint24.normalize(index);

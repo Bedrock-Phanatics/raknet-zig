@@ -261,7 +261,7 @@ pub const Core = struct {
 
 test "core validates ACKs against actual send state" {
     const Collector = struct {
-        fn discard(_: *anyopaque, _: []const u8) !void {}
+        fn discard(_: *anyopaque, _: receiver.BorrowedPayload) !void {}
     };
     var core = try Core.init(std.testing.allocator, 1200, .{});
     defer core.deinit();

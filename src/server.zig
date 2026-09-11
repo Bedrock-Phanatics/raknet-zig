@@ -36,7 +36,7 @@ pub const Options = struct {
 pub const Callbacks = struct {
     context: *anyopaque,
     connected: *const fn (context: *anyopaque, session: *Session) core_mod.ApplicationCallbackError!void,
-    message: *const fn (context: *anyopaque, session: *Session, payload: []const u8) core_mod.ApplicationCallbackError!void,
+    message: *const fn (context: *anyopaque, session: *Session, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void,
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
 };
 
@@ -260,9 +260,9 @@ pub const Listener = struct {
                     session: *Session,
                     now_ms: u64,
 
-                    fn deliver(raw: *anyopaque, payload: []const u8) receiver.DeliveryError!void {
+                    fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
                         const bridge: *@This() = @ptrCast(@alignCast(raw));
-                        const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
+                        const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
                         switch (packet) {
                             .connected_ping => |sent| {
                                 var wire: [17]u8 = undefined;
@@ -295,7 +295,7 @@ pub const Listener = struct {
                             .connected_pong => {},
                             .user => |user| {
                                 if (bridge.session.state == .connected) {
-                                    bridge.callbacks.message(bridge.callbacks.context, bridge.session, user) catch return error.ApplicationFailure;
+                                    bridge.callbacks.message(bridge.callbacks.context, bridge.session, .init(user)) catch return error.ApplicationFailure;
                                 }
                             },
                             .connection_request_accepted => {},
@@ -461,7 +461,7 @@ test "listener answers an offline ping over loopback" {
             const value: *TestContext = @ptrCast(@alignCast(raw));
             value.connections += 1;
         }
-        fn message(_: *anyopaque, _: *Session, _: []const u8) !void {}
+        fn message(_: *anyopaque, _: *Session, _: receiver.BorrowedPayload) !void {}
     };
     var context: TestContext = .{};
     const stats = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });

@@ -1,6 +1,8 @@
 //! Bounded RakNet protocol primitives for Minecraft: Bedrock Edition.
 
 pub const Config = @import("config.zig").Config;
+pub const BorrowedPayload = @import("payload.zig").BorrowedPayload;
+pub const OwnedPayload = @import("payload.zig").OwnedPayload;
 pub const Client = @import("client.zig").Client;
 pub const ClientOptions = @import("client.zig").Options;
 pub const Server = @import("server.zig").Listener;
@@ -36,6 +38,7 @@ pub const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
 
 test {
     _ = @import("config.zig");
+    _ = @import("payload.zig");
     _ = @import("server.zig");
     _ = @import("client.zig");
     _ = @import("net/backend.zig");
