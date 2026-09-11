@@ -135,6 +135,7 @@ pub const Listener = struct {
     source_secret: u64,
     messages: []std.Io.net.IncomingMessage,
     receive_storage: []u8,
+    frame_scratch: []frame.Frame,
     handshake_output: []u8,
     closed: bool = false,
     last_sweep_ms: u64 = 0,
@@ -161,6 +162,8 @@ pub const Listener = struct {
         errdefer allocator.free(receive_storage);
         const handshake_output = try allocator.alloc(u8, options.config.maximum_datagram_size);
         errdefer allocator.free(handshake_output);
+        const frame_scratch = try allocator.alloc(frame.Frame, options.config.maximum_packets_per_iteration);
+        errdefer allocator.free(frame_scratch);
         var random: [80]u8 = undefined;
         io.random(&random);
         const guid = if (options.server_guid != 0) options.server_guid else std.mem.readInt(u64, random[0..8], .little);
@@ -177,6 +180,7 @@ pub const Listener = struct {
             .source_secret = std.mem.readInt(u64, random[72..80], .little),
             .messages = messages,
             .receive_storage = receive_storage,
+            .frame_scratch = frame_scratch,
             .handshake_output = handshake_output,
             .maintenance_interval_ms = options.maintenance_interval_ms,
         };
@@ -195,6 +199,7 @@ pub const Listener = struct {
         self.sessions.deinit(self.session_quota.allocator());
         std.debug.assert(self.session_quota.used_bytes == 0);
         self.close();
+        self.allocator.free(self.frame_scratch);
         self.allocator.free(self.handshake_output);
         self.allocator.free(self.receive_storage);
         self.allocator.free(self.messages);
@@ -273,7 +278,7 @@ pub const Listener = struct {
                     }
                 };
                 var bridge: Bridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
-                const incoming = session.core.processIncoming(message.data, now_ms, &bridge, Bridge.deliver) catch {
+                const incoming = session.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch {
                     stats.malformed += 1;
                     continue;
                 };

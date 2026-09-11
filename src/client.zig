@@ -27,6 +27,7 @@ pub const Client = struct {
     core: core_mod.Core,
     scratch: []u8,
     receive_buffer: []u8,
+    frame_scratch: []frame.Frame,
     client_guid: u64,
     server_guid: u64,
     mtu: u16,
@@ -60,9 +61,12 @@ pub const Client = struct {
         const reply2 = try offline.decodeOpenConnectionReply2(reply2_wire, options.config.minimum_mtu, options.config.maximum_mtu);
         if (reply2.server_guid != reply1.server_guid or reply2.mtu > reply1.mtu) return error.HandshakeMismatch;
 
+        const frame_scratch = try allocator.alloc(frame.Frame, options.config.maximum_packets_per_iteration);
+        errdefer allocator.free(frame_scratch);
+
         var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
         errdefer core.deinit();
-        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu };
+        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .frame_scratch = frame_scratch, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu };
         try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
         return self;
     }
@@ -77,6 +81,7 @@ pub const Client = struct {
     pub fn destroy(self: *Client) void {
         self.close();
         self.core.deinit();
+        self.allocator.free(self.frame_scratch);
         self.allocator.free(self.receive_buffer);
         self.allocator.free(self.scratch);
         self.allocator.destroy(self);
@@ -115,7 +120,7 @@ pub const Client = struct {
             }
         };
         var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
-        const incoming = try self.core.processIncoming(message.data, now_ms, &bridge, Bridge.deliver);
+        const incoming = try self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver);
         if (incoming == .data) try self.flushReceipt(incoming.data);
         try self.flushRetransmissions(now_ms);
         return if (incoming == .data) incoming.data.delivered else 0;
@@ -150,7 +155,7 @@ pub const Client = struct {
             };
             const now_ms = nowMilliseconds(self.io);
             var state: Handshake = .{ .client = self, .now_ms = now_ms };
-            const incoming = try self.core.processIncoming(message.data, now_ms, &state, Handshake.deliver);
+            const incoming = try self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &state, Handshake.deliver);
             if (incoming == .data) try self.flushReceipt(incoming.data);
             if (state.accepted) return;
         }

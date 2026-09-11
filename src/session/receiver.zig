@@ -59,19 +59,11 @@ pub const Receiver = struct {
 
         // Validate the whole datagram before changing state.
         try self.validateDatagram(data);
-        _ = self.splits.expire(now_ms, self.config.maximum_packets_per_iteration);
         var datagram = try frame.decodeDatagram(data);
-        var receipt: Receipt = .{};
-        const datagram_result = self.datagrams.inspect(datagram.sequence, self.config.maximum_acknowledged_datagrams);
-        switch (datagram_result) {
-            .accepted => {},
-            .duplicate, .stale => {
-                receipt.acknowledge = datagram.sequence;
-                return receipt;
-            },
-            .too_far_ahead, .ambiguous => return error.DatagramWindowExceeded,
-        }
+        if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;
+        _ = self.splits.expire(now_ms, self.config.maximum_packets_per_iteration);
 
+        var receipt: Receipt = .{};
         var work: usize = 0;
         while (datagram.frames.remaining() > 0) {
             if (work >= self.config.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
@@ -79,15 +71,42 @@ pub const Receiver = struct {
             const value = try frame.decodeOne(&datagram.frames, self.config.maximum_frame_payload, self.config.maximum_split_parts);
             receipt.delivered += try self.processFrame(value, now_ms, context, deliver);
         }
+        return self.commitDatagram(datagram.sequence, receipt);
+    }
 
-        switch (self.datagrams.add(datagram.sequence, self.config.maximum_acknowledged_datagrams)) {
-            .accepted => |gap| {
-                receipt.acknowledge = datagram.sequence;
-                receipt.missing = gap;
-            },
-            else => return error.InternalInvariant,
+    pub fn processWithScratch(self: *Receiver, data: []const u8, now_ms: u64, scratch: []frame.Frame, context: *anyopaque, deliver: DeliverFn) !Receipt {
+        if (data.len > self.config.maximum_datagram_size) return error.DatagramTooLarge;
+
+        const datagram = try self.decodeDatagramInto(data, scratch);
+        if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;
+        _ = self.splits.expire(now_ms, self.config.maximum_packets_per_iteration);
+
+        var receipt: Receipt = .{};
+        for (datagram.frames) |value| {
+            receipt.delivered += try self.processFrame(value, now_ms, context, deliver);
         }
-        return receipt;
+        return self.commitDatagram(datagram.sequence, receipt);
+    }
+
+    const ParsedDatagram = struct {
+        sequence: u32,
+        frames: []const frame.Frame,
+    };
+
+    fn decodeDatagramInto(self: *const Receiver, data: []const u8, scratch: []frame.Frame) !ParsedDatagram {
+        var datagram = try frame.decodeDatagram(data);
+        var count: usize = 0;
+        while (datagram.frames.remaining() > 0) {
+            if (count >= self.config.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
+            if (count >= scratch.len) return error.FrameScratchTooSmall;
+            const value = try frame.decodeOne(&datagram.frames, self.config.maximum_frame_payload, self.config.maximum_split_parts);
+            if (value.order_channel) |channel| {
+                if (channel >= self.config.maximum_order_channels) return error.InvalidOrderChannel;
+            }
+            scratch[count] = value;
+            count += 1;
+        }
+        return .{ .sequence = datagram.sequence, .frames = scratch[0..count] };
     }
 
     fn validateDatagram(self: *const Receiver, data: []const u8) !void {
@@ -103,6 +122,25 @@ pub const Receiver = struct {
         }
     }
 
+    fn beginDatagram(self: *const Receiver, sequence: u32) !?Receipt {
+        return switch (self.datagrams.inspect(sequence, self.config.maximum_acknowledged_datagrams)) {
+            .accepted => null,
+            .duplicate, .stale => .{ .acknowledge = sequence },
+            .too_far_ahead, .ambiguous => error.DatagramWindowExceeded,
+        };
+    }
+
+    fn commitDatagram(self: *Receiver, sequence: u32, receipt: Receipt) !Receipt {
+        var committed = receipt;
+        switch (self.datagrams.add(sequence, self.config.maximum_acknowledged_datagrams)) {
+            .accepted => |gap| {
+                committed.acknowledge = sequence;
+                committed.missing = gap;
+            },
+            else => return error.InternalInvariant,
+        }
+        return committed;
+    }
     fn processFrame(self: *Receiver, value: frame.Frame, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !usize {
         if (!try self.previewReliable(value.reliable_index)) return 0;
 
@@ -186,11 +224,12 @@ test "receiver delivers in order with a zero-copy fast path" {
     var receiver = try Receiver.init(std.testing.allocator, .{});
     defer receiver.deinit();
     var collector: Collector = .{};
+    var descriptors: [2]frame.Frame = undefined;
     var wire: [128]u8 = undefined;
     const second = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 1, .order_channel = 0, .payload = "second" }};
-    _ = try receiver.process(try @import("../protocol/datagram.zig").encodeData(0, &second, &wire), 0, &collector, Collector.add);
+    _ = try receiver.processWithScratch(try @import("../protocol/datagram.zig").encodeData(0, &second, &wire), 0, &descriptors, &collector, Collector.add);
     const first = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 0, .order_channel = 0, .payload = "first" }};
-    const receipt = try receiver.process(try @import("../protocol/datagram.zig").encodeData(1, &first, &wire), 1, &collector, Collector.add);
+    const receipt = try receiver.processWithScratch(try @import("../protocol/datagram.zig").encodeData(1, &first, &wire), 1, &descriptors, &collector, Collector.add);
     try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
     try std.testing.expectEqual(@as(usize, 2), collector.count);
     try std.testing.expectEqualStrings("first", collector.values[0][0..collector.lengths[0]]);
@@ -269,7 +308,8 @@ test "invalid later frame metadata is rejected before earlier delivery" {
         .{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 0, .order_channel = 32, .payload = "invalid" },
     };
     const wire = try @import("../protocol/datagram.zig").encodeData(0, &frames, &wire_storage);
-    try std.testing.expectError(error.InvalidOrderChannel, receiver.process(wire, 0, &counter, Counter.deliver));
+    var descriptors: [2]frame.Frame = undefined;
+    try std.testing.expectError(error.InvalidOrderChannel, receiver.processWithScratch(wire, 0, &descriptors, &counter, Counter.deliver));
     try std.testing.expectEqual(@as(usize, 0), counter.count);
     try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
@@ -361,9 +401,10 @@ test "every truncation inside a later frame is atomic" {
         if (cut == first_frame_end) continue;
         var receiver = try Receiver.init(std.testing.allocator, config);
         defer receiver.deinit();
+        var descriptors: [2]frame.Frame = undefined;
         var counter: Counter = .{};
 
-        if (receiver.process(full[0..cut], 0, &counter, Counter.deliver)) |_| {
+        if (receiver.processWithScratch(full[0..cut], 0, &descriptors, &counter, Counter.deliver)) |_| {
             return error.ExpectedTruncationRejection;
         } else |_| {}
         try std.testing.expectEqual(@as(usize, 0), counter.count);
@@ -446,4 +487,39 @@ test "completed split can retry after final allocation failure" {
     try std.testing.expectEqual(@as(u32, 2), receiver.reliable.expected);
     try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
     try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
+}
+test "small descriptor scratch is rejected before state changes" {
+    const Counter = struct {
+        count: usize = 0,
+        fn deliver(raw: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+
+    var config: Config = .{};
+    config.receive_window = 8;
+    config.reliable_window = 8;
+    config.maximum_packets_per_iteration = 2;
+    var receiver = try Receiver.init(std.testing.allocator, config);
+    defer receiver.deinit();
+
+    const frames = [_]frame.Frame{
+        .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .payload = "first" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 1, .order_channel = 0, .payload = "second" },
+    };
+    var wire_storage: [128]u8 = undefined;
+    const wire = try @import("../protocol/datagram.zig").encodeData(0, &frames, &wire_storage);
+    var too_small: [1]frame.Frame = undefined;
+    var counter: Counter = .{};
+
+    try std.testing.expectError(error.FrameScratchTooSmall, receiver.processWithScratch(wire, 0, &too_small, &counter, Counter.deliver));
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+    try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
+    try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
+
+    var enough: [2]frame.Frame = undefined;
+    const receipt = try receiver.processWithScratch(wire, 1, &enough, &counter, Counter.deliver);
+    try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
 }

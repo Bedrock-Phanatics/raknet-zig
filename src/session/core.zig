@@ -81,9 +81,20 @@ pub const Core = struct {
     }
 
     pub fn processIncoming(self: *Core, wire: []const u8, now_ms: u64, context: *anyopaque, deliver: receiver.DeliverFn) !Incoming {
+        return self.processIncomingImpl(wire, now_ms, null, context, deliver);
+    }
+
+    pub fn processIncomingWithScratch(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: []frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !Incoming {
+        return self.processIncomingImpl(wire, now_ms, frame_scratch, context, deliver);
+    }
+
+    fn processIncomingImpl(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: ?[]frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !Incoming {
         if (wire.len > self.config.maximum_datagram_size) return error.DatagramTooLarge;
         return switch (try datagram.decode(wire, self.ack_records, self.config.maximum_ack_records, self.config.maximum_acknowledged_datagrams)) {
-            .data => .{ .data = try self.receiver_state.process(wire, now_ms, context, deliver) },
+            .data => .{ .data = if (frame_scratch) |scratch|
+                try self.receiver_state.processWithScratch(wire, now_ms, scratch, context, deliver)
+            else
+                try self.receiver_state.process(wire, now_ms, context, deliver) },
             .ack => |decoded| blk: {
                 const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
                 if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes);
@@ -97,7 +108,6 @@ pub const Core = struct {
             },
         };
     }
-
     pub fn collectRetransmissions(self: *Core, now_ms: u64, output: []recovery.Due) recovery.DueBatch {
         const batch = self.recovery_state.collectDue(now_ms, self.rtt_state.rto(), output, self.config.maximum_packets_per_iteration);
         for (batch.items) |item| if (item.timed_out) {
