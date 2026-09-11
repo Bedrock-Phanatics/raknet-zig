@@ -31,6 +31,7 @@ pub const Reassembler = struct {
     assemblies: std.AutoHashMapUnmanaged(u16, Assembly) = .empty,
     total_bytes: usize = 0,
     next_deadline_ms: ?u64 = null,
+    scan_index: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Reassembler {
         try limits.validate();
@@ -114,9 +115,20 @@ pub const Reassembler = struct {
     pub fn expire(self: *Reassembler, now_ms: u64, maximum_work: usize) usize {
         var expired: usize = 0;
         var inspected: usize = 0;
+        const visit_limit = @min(maximum_work, @as(usize, self.assemblies.count()));
+        const capacity = self.assemblies.capacity();
+        const start_index = if (self.scan_index < capacity) self.scan_index else 0;
         var iterator = self.assemblies.iterator();
-        while (iterator.next()) |entry| {
-            if (inspected >= maximum_work) break;
+        iterator.index = start_index;
+        var wrapped = false;
+        while (inspected < visit_limit) {
+            const entry = iterator.next() orelse {
+                if (wrapped or start_index == 0) break;
+                iterator = self.assemblies.iterator();
+                wrapped = true;
+                continue;
+            };
+            self.scan_index = if (iterator.index == capacity) 0 else iterator.index;
             inspected += 1;
             if (now_ms -| entry.value_ptr.updated_ms < self.limits.timeout_ms) continue;
             self.freeAssembly(entry.value_ptr);
@@ -245,4 +257,28 @@ fn checkReassemblyAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "split reassembly handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReassemblyAllocationFailures, .{});
+}
+
+test "bounded split expiry resumes fairly" {
+    const count = 8;
+    var value = try Reassembler.init(std.testing.allocator, .{
+        .maximum_parts = 2,
+        .maximum_bytes = count,
+        .maximum_concurrent = count,
+        .maximum_total_bytes = count,
+        .timeout_ms = 10,
+    });
+    defer value.deinit();
+    for (0..count) |id| try std.testing.expect((try value.push(@intCast(id), 2, 0, "x", 100)) == null);
+
+    var iterator = value.assemblies.iterator();
+    var last: ?u16 = null;
+    while (iterator.next()) |entry| last = entry.key_ptr.*;
+    value.assemblies.getPtr(last.?).?.updated_ms = 0;
+    value.recomputeNextDeadline();
+
+    var expired: usize = 0;
+    for (0..count) |_| expired += value.expire(11, 1);
+    try std.testing.expectEqual(@as(usize, 1), expired);
+    try std.testing.expectEqual(@as(usize, count - 1), value.assemblies.count());
 }

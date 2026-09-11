@@ -23,6 +23,7 @@ pub const Recovery = struct {
     maximum_transmissions: u8,
     total_bytes: usize = 0,
     next_deadline_ms: ?u64 = null,
+    scan_index: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, maximum_entries: usize, maximum_bytes: usize, maximum_transmissions: u8) !Recovery {
         if (maximum_entries == 0 or maximum_bytes == 0 or maximum_transmissions < 2 or maximum_entries > std.math.maxInt(u32)) return error.InvalidConfiguration;
@@ -81,13 +82,25 @@ pub const Recovery = struct {
     }
 
     /// Scans at most `maximum_work` records and borrows payloads until the next mutation.
+    /// Each call resumes where the previous scan stopped.
     pub fn collectDue(self: *Recovery, now_ms: u64, rto_ms: u32, output: []Due, maximum_work: usize) DueBatch {
         var count: usize = 0;
         var inspected: usize = 0;
         var exhausted: usize = 0;
+        const visit_limit = @min(maximum_work, @as(usize, self.records.count()));
+        const capacity = self.records.capacity();
+        const start_index = if (self.scan_index < capacity) self.scan_index else 0;
         var iterator = self.records.iterator();
-        while (iterator.next()) |entry| {
-            if (inspected >= maximum_work or count >= output.len) break;
+        iterator.index = start_index;
+        var wrapped = false;
+        while (inspected < visit_limit and count < output.len) {
+            const entry = iterator.next() orelse {
+                if (wrapped or start_index == 0) break;
+                iterator = self.records.iterator();
+                wrapped = true;
+                continue;
+            };
+            self.scan_index = if (iterator.index == capacity) 0 else iterator.index;
             inspected += 1;
             const record = entry.value_ptr;
             if (record.deadline_ms > now_ms) continue;
@@ -134,4 +147,22 @@ test "recovery owns once, ignores duplicate ACKs, and bounds retransmits" {
     try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(61, 50, &due, 2).items.len);
     try std.testing.expectEqualStrings("two", due[0].data);
     try std.testing.expectEqual(@as(?u64, 111), recovery.nextDeadline());
+}
+
+test "bounded recovery scans resume fairly" {
+    const count = 8;
+    var recovery = try Recovery.init(std.testing.allocator, count, count, 3);
+    defer recovery.deinit();
+    for (0..count) |sequence| try recovery.track(@intCast(sequence), "x", 1, 0, 10);
+
+    var seen: [count]bool = @splat(false);
+    var due: [1]Due = undefined;
+    for (0..count) |_| {
+        const batch = recovery.collectDue(11, 1_000, &due, 1);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+        const sequence = batch.items[0].sequence;
+        try std.testing.expect(!seen[sequence]);
+        seen[sequence] = true;
+    }
+    for (seen) |present| try std.testing.expect(present);
 }
