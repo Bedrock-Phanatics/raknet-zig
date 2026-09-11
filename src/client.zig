@@ -93,7 +93,12 @@ pub const Client = struct {
     }
     pub fn send(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
         if (self.closed) return error.ConnectionClosed;
-        _ = try self.sendWire(payload, reliability, channel, nowMilliseconds(self.io));
+        _ = self.sendWire(payload, reliability, channel, nowMilliseconds(self.io)) catch |err| {
+            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
+                self.abort();
+            }
+            return err;
+        };
     }
 
     /// Delivers borrowed application payloads valid only during the callback.
@@ -107,6 +112,7 @@ pub const Client = struct {
             context: *anyopaque,
             callback: MessageFn,
             now_ms: u64,
+            remote_disconnect: bool = false,
             fn deliver(raw: *anyopaque, payload: []const u8) !void {
                 const bridge: *@This() = @ptrCast(@alignCast(raw));
                 const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
@@ -116,7 +122,7 @@ pub const Client = struct {
                         const pong = connected.encodePong(sent, bridge.now_ms, &wire) catch return error.InternalFailure;
                         _ = bridge.client.sendWire(pong, .unreliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     },
-                    .disconnect => bridge.client.abort(),
+                    .disconnect => bridge.remote_disconnect = true,
                     .detect_lost_connections => {
                         var wire: [9]u8 = undefined;
                         const ping = connected.encodePing(bridge.now_ms, &wire) catch return error.InternalFailure;
@@ -133,8 +139,20 @@ pub const Client = struct {
             if (failure.disposition == .close_session) self.abort();
             return err;
         };
-        if (incoming == .data) try self.flushReceipt(incoming.data);
-        try self.flushRetransmissions(now_ms);
+        if (incoming == .data) {
+            self.flushReceipt(incoming.data) catch |err| {
+                if (core_mod.classifyTransitionError(.receipt, err).disposition == .close_session) self.abort();
+                return err;
+            };
+        }
+        if (bridge.remote_disconnect) {
+            self.abort();
+            return if (incoming == .data) incoming.data.delivered else 0;
+        }
+        self.flushRetransmissions(now_ms) catch |err| {
+            if (core_mod.classifyTransitionError(.retransmission, err).disposition == .close_session) self.abort();
+            return err;
+        };
         return if (incoming == .data) incoming.data.delivered else 0;
     }
 
@@ -190,7 +208,10 @@ pub const Client = struct {
         return emitter.count;
     }
     fn flushReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt) !void {
-        if (receipt.acknowledge) |sequence| try self.socket.send(self.server, try datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch));
+        if (receipt.acknowledge) |sequence| {
+            const wire = datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch) catch return error.InternalFailure;
+            self.socket.send(self.server, wire) catch return error.TransportFailure;
+        }
         if (receipt.missing) |gap| {
             var ranges: [2]ack.Record = undefined;
             const count: usize = if (gap.first <= gap.last) blk: {
@@ -201,14 +222,15 @@ pub const Client = struct {
                 ranges[1] = .{ .first = gap.first, .last = 0xffffff };
                 break :blk 2;
             };
-            try self.socket.send(self.server, try datagram.encodeControl(.nack, ranges[0..count], self.scratch));
+            const wire = datagram.encodeControl(.nack, ranges[0..count], self.scratch) catch return error.InternalFailure;
+            self.socket.send(self.server, wire) catch return error.TransportFailure;
         }
     }
     fn flushRetransmissions(self: *Client, now_ms: u64) !void {
         var due: [256]recovery.Due = undefined;
         const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, self.core.config.maximum_packets_per_iteration)]);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
-        for (batch.items) |item| try self.socket.send(self.server, item.data);
+        for (batch.items) |item| self.socket.send(self.server, item.data) catch return error.TransportFailure;
     }
 };
 

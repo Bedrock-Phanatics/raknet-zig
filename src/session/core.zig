@@ -25,7 +25,16 @@ pub const IncomingErrorClass = enum {
 
 pub const IncomingErrorDisposition = enum {
     reject,
+    retry,
     close_session,
+};
+
+pub const SessionTransition = enum {
+    receive,
+    application_send,
+    receipt,
+    retransmission,
+    handshake,
 };
 
 pub const IncomingFailure = struct {
@@ -92,6 +101,56 @@ pub fn deliverySendFailure(err: anyerror) anyerror {
         => error.ResourceLimitFailure,
         error.TransportFailure => error.TransportFailure,
         else => error.InternalFailure,
+    };
+}
+pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) IncomingFailure {
+    return switch (transition) {
+        .receive => classifyIncomingError(err),
+        .application_send => switch (err) {
+            error.EmptyPayload,
+            error.MessageTooLarge,
+            error.InvalidOrderChannel,
+            error.UnreliableMessageTooLarge,
+            error.NotConnected,
+            error.ConnectionClosed,
+            => .{ .class = .application, .disposition = .reject },
+
+            error.CongestionWindowFull => .{ .class = .resource, .disposition = .retry },
+
+            error.OutOfMemory,
+            error.ResourceLimitFailure,
+            error.RecoveryFull,
+            error.RecoveryBytesExceeded,
+            => .{ .class = .resource, .disposition = .close_session },
+
+            error.TransportFailure => .{ .class = .transport, .disposition = .close_session },
+            else => .{ .class = .internal, .disposition = .close_session },
+        },
+        .receipt => switch (err) {
+            error.TransportFailure => .{ .class = .transport, .disposition = .close_session },
+            error.OutOfMemory => .{ .class = .resource, .disposition = .close_session },
+            else => .{ .class = .internal, .disposition = .close_session },
+        },
+        .retransmission => switch (err) {
+            error.TransportFailure,
+            error.RetransmissionLimitExceeded,
+            => .{ .class = .transport, .disposition = .close_session },
+            else => .{ .class = .internal, .disposition = .close_session },
+        },
+        .handshake => switch (err) {
+            error.IncompatibleProtocol,
+            error.HandshakeMismatch,
+            error.PeerProtocolFailure,
+            => .{ .class = .protocol, .disposition = .close_session },
+            error.Timeout,
+            error.HandshakeWorkLimitExceeded,
+            error.TransportFailure,
+            => .{ .class = .transport, .disposition = .close_session },
+            error.OutOfMemory,
+            error.ResourceLimitFailure,
+            => .{ .class = .resource, .disposition = .close_session },
+            else => .{ .class = .internal, .disposition = .close_session },
+        },
     };
 }
 /// Protocol state owned by one event-loop context. It performs no socket I/O and needs no locks.
@@ -234,4 +293,27 @@ test "incoming failures keep their origin and commit safety" {
     try std.testing.expect(deliverySendFailure(error.OutOfMemory) == error.ResourceLimitFailure);
     try std.testing.expect(deliverySendFailure(error.TransportFailure) == error.TransportFailure);
     try std.testing.expect(deliverySendFailure(error.UnexpectedOrderIndex) == error.InternalFailure);
+}
+
+test "transition policy distinguishes rejection, retry, and closure" {
+    const bad_send = classifyTransitionError(.application_send, error.EmptyPayload);
+    try std.testing.expectEqual(IncomingErrorClass.application, bad_send.class);
+    try std.testing.expectEqual(IncomingErrorDisposition.reject, bad_send.disposition);
+
+    const pressure = classifyTransitionError(.application_send, error.CongestionWindowFull);
+    try std.testing.expectEqual(IncomingErrorClass.resource, pressure.class);
+    try std.testing.expectEqual(IncomingErrorDisposition.retry, pressure.disposition);
+
+    const allocation = classifyTransitionError(.application_send, error.OutOfMemory);
+    try std.testing.expectEqual(IncomingErrorClass.resource, allocation.class);
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, allocation.disposition);
+
+    const send_transport = classifyTransitionError(.application_send, error.TransportFailure);
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, send_transport.disposition);
+    try std.testing.expectEqual(IncomingErrorClass.transport, send_transport.class);
+
+    try std.testing.expectEqual(IncomingErrorClass.internal, classifyTransitionError(.receipt, error.NoSpaceLeft).class);
+    try std.testing.expectEqual(IncomingErrorClass.transport, classifyTransitionError(.retransmission, error.RetransmissionLimitExceeded).class);
+    try std.testing.expectEqual(IncomingErrorClass.protocol, classifyTransitionError(.handshake, error.IncompatibleProtocol).class);
+    try std.testing.expectEqual(IncomingErrorClass.transport, classifyTransitionError(.handshake, error.Timeout).class);
 }

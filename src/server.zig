@@ -85,7 +85,12 @@ pub const Session = struct {
     }
     pub fn send(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
         if (self.state != .connected) return error.NotConnected;
-        _ = try self.sendAt(payload, reliability, channel, nowMilliseconds(self.socket.io));
+        _ = self.sendAt(payload, reliability, channel, nowMilliseconds(self.socket.io)) catch |err| {
+            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
+                self.state = .closed;
+            }
+            return err;
+        };
     }
     fn sendAt(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64) !usize {
         const Emitter = struct {
@@ -106,8 +111,8 @@ pub const Session = struct {
     }
     fn flushReceipt(self: *Session, receipt: @import("session/receiver.zig").Receipt) !void {
         if (receipt.acknowledge) |sequence| {
-            const wire = try datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch);
-            try self.socket.send(self.address, wire);
+            const wire = datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch) catch return error.InternalFailure;
+            self.socket.send(self.address, wire) catch return error.TransportFailure;
         }
         if (receipt.missing) |gap| {
             var ranges: [2]ack.Record = undefined;
@@ -119,15 +124,15 @@ pub const Session = struct {
                 ranges[1] = .{ .first = gap.first, .last = 0xffffff };
                 break :blk 2;
             };
-            const wire = try datagram.encodeControl(.nack, ranges[0..count], self.scratch);
-            try self.socket.send(self.address, wire);
+            const wire = datagram.encodeControl(.nack, ranges[0..count], self.scratch) catch return error.InternalFailure;
+            self.socket.send(self.address, wire) catch return error.TransportFailure;
         }
     }
     fn flushRetransmissions(self: *Session, now_ms: u64) !void {
         var due: [256]recovery.Due = undefined;
         const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, self.core.config.maximum_packets_per_iteration)]);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
-        for (batch.items) |item| try self.socket.send(self.address, item.data);
+        for (batch.items) |item| self.socket.send(self.address, item.data) catch return error.TransportFailure;
     }
 };
 
@@ -304,20 +309,23 @@ pub const Listener = struct {
                         continue;
                     }
 
-                    stats.sessions_failed += 1;
-                    switch (failure.class) {
-                        .protocol => stats.malformed += 1,
-                        .resource => stats.resource_failures += 1,
-                        .transport => stats.transport_failures += 1,
-                        .application => stats.application_failures += 1,
-                        .internal => stats.internal_failures += 1,
-                    }
+                    recordSessionFailure(&stats, failure.class);
                     session.state = .closed;
                     self.removeSession(key, callbacks);
                     continue;
                 };
-                if (incoming == .data) session.flushReceipt(incoming.data) catch {};
-                session.flushRetransmissions(now_ms) catch {
+                if (incoming == .data) {
+                    session.flushReceipt(incoming.data) catch |err| {
+                        const failure = core_mod.classifyTransitionError(.receipt, err);
+                        recordSessionFailure(&stats, failure.class);
+                        session.state = .closed;
+                        self.removeSession(key, callbacks);
+                        continue;
+                    };
+                }
+                session.flushRetransmissions(now_ms) catch |err| {
+                    const failure = core_mod.classifyTransitionError(.retransmission, err);
+                    recordSessionFailure(&stats, failure.class);
                     session.state = .closed;
                 };
                 if (session.state == .closed) self.removeSession(key, callbacks);
@@ -395,6 +403,16 @@ pub const Listener = struct {
     }
 };
 
+fn recordSessionFailure(stats: *PollStats, class: core_mod.IncomingErrorClass) void {
+    stats.sessions_failed += 1;
+    switch (class) {
+        .protocol => stats.malformed += 1,
+        .resource => stats.resource_failures += 1,
+        .transport => stats.transport_failures += 1,
+        .application => stats.application_failures += 1,
+        .internal => stats.internal_failures += 1,
+    }
+}
 fn endpointKey(address: std.Io.net.IpAddress) EndpointKey {
     var key: EndpointKey = @splat(0);
     switch (address) {
