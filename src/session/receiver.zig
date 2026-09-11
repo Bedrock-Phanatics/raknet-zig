@@ -161,7 +161,7 @@ pub const Receiver = struct {
             if (channel >= self.sequenced.len) return error.InvalidOrderChannel;
             try self.commitReliable(value.reliable_index);
             if (!self.sequenced[channel].accept(value.sequence_index.?)) return 0;
-            try deliver(context, payload);
+            try deliverPayload(context, payload, deliver);
             return 1;
         }
         if (value.reliability.hasOrderIndex()) {
@@ -169,12 +169,12 @@ pub const Receiver = struct {
             const index = value.order_index.?;
             if (index == try self.ordered.expectedIndex(channel)) {
                 try self.commitReliable(value.reliable_index);
-                try deliver(context, payload);
+                try deliverPayload(context, payload, deliver);
                 try self.ordered.advanceBorrowed(channel, index);
                 var delivered: usize = 1;
                 while (try self.ordered.pop(channel)) |owned| {
                     defer owned.deinit();
-                    try deliver(context, owned.data);
+                    try deliverPayload(context, owned.data, deliver);
                     delivered += 1;
                     if (delivered >= self.config.maximum_packets_per_iteration) break;
                 }
@@ -186,10 +186,13 @@ pub const Receiver = struct {
         }
 
         try self.commitReliable(value.reliable_index);
-        try deliver(context, payload);
+        try deliverPayload(context, payload, deliver);
         return 1;
     }
 
+    fn deliverPayload(context: *anyopaque, payload: []const u8, deliver: DeliverFn) !void {
+        deliver(context, payload) catch return error.DeliveryFailed;
+    }
     fn previewReliable(self: *const Receiver, reliable_index: ?u32) !bool {
         const index = reliable_index orelse return true;
         return switch (self.reliable.inspect(index, 0)) {
@@ -522,4 +525,35 @@ test "small descriptor scratch is rejected before state changes" {
     const receipt = try receiver.processWithScratch(wire, 1, &enough, &counter, Counter.deliver);
     try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
     try std.testing.expectEqual(@as(usize, 2), counter.count);
+}
+test "callback errors become terminal delivery failures" {
+    const Failing = struct {
+        calls: usize = 0,
+        fn deliver(raw: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.CallbackRejected;
+        }
+    };
+
+    var config: Config = .{};
+    config.receive_window = 8;
+    config.reliable_window = 8;
+    var receiver = try Receiver.init(std.testing.allocator, config);
+    defer receiver.deinit();
+
+    const frames = [_]frame.Frame{.{
+        .reliability = .reliable,
+        .reliable_index = 0,
+        .payload = "payload",
+    }};
+    var wire_storage: [64]u8 = undefined;
+    const wire = try @import("../protocol/datagram.zig").encodeData(0, &frames, &wire_storage);
+    var descriptors: [1]frame.Frame = undefined;
+    var failing: Failing = .{};
+
+    try std.testing.expectError(error.DeliveryFailed, receiver.processWithScratch(wire, 0, &descriptors, &failing, Failing.deliver));
+    try std.testing.expectEqual(@as(usize, 1), failing.calls);
+    try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
+    try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
 }

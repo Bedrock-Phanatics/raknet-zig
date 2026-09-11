@@ -15,6 +15,36 @@ pub const Incoming = union(enum) {
     nack_marked: usize,
 };
 
+pub const IncomingErrorDisposition = enum {
+    reject,
+    close_session,
+};
+
+pub fn incomingErrorDisposition(err: anyerror) IncomingErrorDisposition {
+    return switch (err) {
+        error.DatagramTooLarge,
+        error.Truncated,
+        error.NotDatagram,
+        error.InvalidDatagramFlags,
+        error.EmptyDatagram,
+        error.TooManyRecords,
+        error.InvalidRecordType,
+        error.ReversedRange,
+        error.TooManyAcknowledgements,
+        error.OverlappingRanges,
+        error.TrailingData,
+        error.InvalidFrameFlags,
+        error.EmptyPayload,
+        error.PayloadTooLarge,
+        error.InvalidSplit,
+        error.InvalidOrderChannel,
+        error.PacketWorkLimitExceeded,
+        error.DatagramWindowExceeded,
+        => .reject,
+        else => .close_session,
+    };
+}
+
 /// Protocol state owned by one event-loop context. It performs no socket I/O and needs no locks.
 pub const Core = struct {
     allocator: std.mem.Allocator,
@@ -132,4 +162,16 @@ test "core validates ACKs against actual send state" {
     try std.testing.expectEqual(@as(usize, 1), result.acknowledged.packets);
     try std.testing.expectEqual(@as(?u64, 50), result.acknowledged.rtt_sample_ms);
     try std.testing.expectEqual(@as(usize, 0), (try core.processIncoming(wire, 160, &unused, Collector.discard)).acknowledged.packets);
+}
+test "incoming failure disposition only rejects pre-commit errors" {
+    try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.Truncated));
+    try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.InvalidOrderChannel));
+    try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.PacketWorkLimitExceeded));
+    try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.DatagramWindowExceeded));
+
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.DeliveryFailed));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.OutOfMemory));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.InternalInvariant));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ReliableWindowExceeded));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.OrderQueueFull));
 }

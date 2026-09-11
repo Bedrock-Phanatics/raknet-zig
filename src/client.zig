@@ -78,6 +78,11 @@ pub const Client = struct {
         _ = self.sendWire(&payload, .reliable_ordered, 0, nowMilliseconds(self.io)) catch {};
         self.socket.close();
     }
+    fn abort(self: *Client) void {
+        if (self.closed) return;
+        self.closed = true;
+        self.socket.close();
+    }
     pub fn destroy(self: *Client) void {
         self.close();
         self.core.deinit();
@@ -109,7 +114,7 @@ pub const Client = struct {
                         var wire: [17]u8 = undefined;
                         _ = try bridge.client.sendWire(try connected.encodePong(sent, bridge.now_ms, &wire), .unreliable, 0, bridge.now_ms);
                     },
-                    .disconnect => bridge.client.closed = true,
+                    .disconnect => bridge.client.abort(),
                     .detect_lost_connections => {
                         var wire: [9]u8 = undefined;
                         _ = try bridge.client.sendWire(try connected.encodePing(bridge.now_ms, &wire), .reliable, 0, bridge.now_ms);
@@ -120,7 +125,10 @@ pub const Client = struct {
             }
         };
         var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
-        const incoming = try self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver);
+        const incoming = self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
+            if (core_mod.incomingErrorDisposition(err) == .close_session) self.abort();
+            return err;
+        };
         if (incoming == .data) try self.flushReceipt(incoming.data);
         try self.flushRetransmissions(now_ms);
         return if (incoming == .data) incoming.data.delivered else 0;
@@ -255,15 +263,22 @@ test "client and server complete a real loopback handshake" {
         connected: std.atomic.Value(bool) = .init(false),
         message_data: [32]u8 = undefined,
         message_len: usize = 0,
+        fail_messages: bool = false,
+        disconnected: usize = 0,
         fn onConnect(raw: *anyopaque, _: *server_mod.Session) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.connected.store(true, .release);
         }
         fn onMessage(raw: *anyopaque, _: *server_mod.Session, payload: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail_messages) return error.CallbackRejected;
             if (payload.len > self.message_data.len) return error.MessageTooLarge;
             @memcpy(self.message_data[0..payload.len], payload);
             self.message_len = payload.len;
+        }
+        fn onDisconnect(raw: *anyopaque, _: *server_mod.Session) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.disconnected += 1;
         }
         fn run(self: *@This(), io_value: std.Io) !void {
             _ = io_value;
@@ -309,4 +324,24 @@ test "client and server complete a real loopback handshake" {
         if (collector.len != 0) break;
     }
     try std.testing.expectEqualStrings("\xfeworld", collector.data[0..collector.len]);
+
+    harness.fail_messages = true;
+    try client.send("\xfefail", .reliable_ordered, 0);
+    var failed_sessions: usize = 0;
+    var malformed: usize = 0;
+    for (0..4) |_| {
+        const stats = try listener.poll(.none, .{
+            .context = &harness,
+            .connected = Harness.onConnect,
+            .message = Harness.onMessage,
+            .disconnected = Harness.onDisconnect,
+        });
+        failed_sessions += stats.sessions_failed;
+        malformed += stats.malformed;
+        if (listener.sessions.count() == 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), failed_sessions);
+    try std.testing.expectEqual(@as(usize, 0), malformed);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
 }

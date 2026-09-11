@@ -39,7 +39,7 @@ pub const Callbacks = struct {
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
 };
 
-pub const PollStats = struct { datagrams: usize = 0, malformed: usize = 0, rate_limited_or_dropped: usize = 0, sessions_expired: usize = 0 };
+pub const PollStats = struct { datagrams: usize = 0, malformed: usize = 0, rate_limited_or_dropped: usize = 0, sessions_expired: usize = 0, sessions_failed: usize = 0 };
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -278,9 +278,17 @@ pub const Listener = struct {
                     }
                 };
                 var bridge: Bridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
-                const incoming = session.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch {
-                    stats.malformed += 1;
-                    continue;
+                const incoming = session.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| switch (core_mod.incomingErrorDisposition(err)) {
+                    .reject => {
+                        stats.malformed += 1;
+                        continue;
+                    },
+                    .close_session => {
+                        stats.sessions_failed += 1;
+                        session.state = .closed;
+                        self.removeSession(key, callbacks);
+                        continue;
+                    },
                 };
                 if (incoming == .data) session.flushReceipt(incoming.data) catch {};
                 session.flushRetransmissions(now_ms) catch {
