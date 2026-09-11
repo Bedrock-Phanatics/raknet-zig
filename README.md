@@ -62,8 +62,9 @@ pub fn serve(allocator: std.mem.Allocator, io: std.Io) !void {
 `Listener`, each `Session`, and `Client` are single-owner objects. Call their
 methods from one event-loop context; the packet path deliberately has no locks.
 Callbacks run synchronously from `poll`. A `BorrowedPayload` and its `bytes`
-expire when the callback returns. Copy `bytes` into application-owned memory
-before queueing, deferring, or retaining them. Wrapping the slice does not extend
+expire when the callback returns. Call `payload.toOwned(allocator)` before
+queueing, deferring, or retaining it; the method copies exactly `bytes.len`
+bytes. Wrapping the slice does not extend
 its lifetime. A session pointer is borrowed from its listener and must not be
 retained after disconnection or listener destruction. `OwnedPayload` values own
 their bytes and must be released exactly once with `deinit`.

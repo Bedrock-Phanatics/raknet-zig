@@ -1,5 +1,6 @@
 const std = @import("std");
 const uint24 = @import("../util/uint24.zig");
+const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
 /// One reliable-ordered channel. It owns queued payloads and has hard entry/byte/window caps.
@@ -33,10 +34,10 @@ pub const OrderedQueue = struct {
         if (self.packets.contains(index)) return false;
         if (self.packets.count() >= self.maximum_entries) return error.OrderQueueFull;
         if (payload.len > self.maximum_bytes -| self.total_bytes) return error.OrderBytesExceeded;
-        const copy = try self.allocator.dupe(u8, payload);
-        errdefer self.allocator.free(copy);
-        try self.packets.put(self.allocator, index, copy);
-        self.total_bytes += copy.len;
+        const copy = try BorrowedPayload.init(payload).toOwned(self.allocator);
+        errdefer copy.deinit();
+        try self.packets.put(self.allocator, index, copy.bytes);
+        self.total_bytes += copy.bytes.len;
         return true;
     }
 

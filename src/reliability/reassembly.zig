@@ -1,4 +1,5 @@
 const std = @import("std");
+const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
 const Fragment = struct { data: ?[]u8 = null };
@@ -82,11 +83,11 @@ pub const Reassembler = struct {
             self.remove(id);
             return error.ReassemblyLimitExceeded;
         }
-        const copy = try self.allocator.dupe(u8, payload);
-        slot.data = copy;
+        const copy = try BorrowedPayload.init(payload).toOwned(self.allocator);
+        slot.data = copy.bytes;
         assembly.received += 1;
-        assembly.bytes += payload.len;
-        self.total_bytes += payload.len;
+        assembly.bytes += copy.bytes.len;
+        self.total_bytes += copy.bytes.len;
         assembly.updated_ms = now_ms;
         if (assembly.received != assembly.fragments.len) return null;
         return try self.finish(id, assembly);

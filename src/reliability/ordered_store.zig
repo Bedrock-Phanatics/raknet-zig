@@ -1,5 +1,6 @@
 const std = @import("std");
 const uint24 = @import("../util/uint24.zig");
+const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
 /// Shared storage for every order channel, so many channels cannot multiply configured limits.
@@ -45,10 +46,10 @@ pub const Store = struct {
         if (self.packets.contains(key)) return false;
         if (self.packets.count() >= self.maximum_entries) return error.OrderQueueFull;
         if (payload.len > self.maximum_bytes -| self.total_bytes) return error.OrderBytesExceeded;
-        const copy = try self.allocator.dupe(u8, payload);
-        errdefer self.allocator.free(copy);
-        try self.packets.put(self.allocator, key, copy);
-        self.total_bytes += copy.len;
+        const copy = try BorrowedPayload.init(payload).toOwned(self.allocator);
+        errdefer copy.deinit();
+        try self.packets.put(self.allocator, key, copy.bytes);
+        self.total_bytes += copy.bytes.len;
         return true;
     }
     pub fn pop(self: *Store, channel: u8) !?OwnedPayload {
