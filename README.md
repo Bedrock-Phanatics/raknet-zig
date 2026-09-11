@@ -253,8 +253,9 @@ zig build test -Doptimize=ReleaseSafe
 zig build bench
 ```
 
-The default test run includes unit, loopback integration, adversarial, and
-deterministic malformed-input coverage. Increase the fuzz workload with
+Unit tests stay beside their modules; repository-level adversarial and fuzz
+coverage lives in `tests/`. The default test run includes both. Increase the fuzz
+workload with
 `-Dfuzz-iterations=<count>`. Benchmarks are isolated in-memory regression tools,
 not network-throughput claims.
 

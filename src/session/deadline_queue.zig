@@ -154,3 +154,36 @@ test "indexed deadlines update and remove without stale entries" {
     try std.testing.expectEqual(third, queue.popDue(100).?.key);
     try std.testing.expectEqual(@as(usize, 0), queue.count());
 }
+
+test "rescheduling never accumulates stale entries" {
+    const capacity = 64;
+    var queue = try Queue.init(std.testing.allocator, capacity);
+    defer queue.deinit();
+
+    var keys: [capacity]Key = @splat(@splat(0));
+    for (&keys, 0..) |*key, index| {
+        key[0] = @intCast(index);
+        try queue.upsert(key.*, index);
+    }
+
+    for (0..100_000) |iteration| {
+        const index = iteration & (capacity - 1);
+        const deadline = (iteration *% 2_654_435_761) % 100_003;
+        try queue.upsert(keys[index], deadline);
+    }
+    try std.testing.expectEqual(@as(usize, capacity), queue.count());
+    try std.testing.expectEqual(@as(u32, capacity), queue.indices.count());
+
+    var seen: [capacity]bool = @splat(false);
+    var previous: u64 = 0;
+    while (queue.popDue(std.math.maxInt(u64))) |entry| {
+        try std.testing.expect(entry.deadline_ms >= previous);
+        previous = entry.deadline_ms;
+        const index = entry.key[0];
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+    }
+    try std.testing.expectEqual(@as(usize, 0), queue.count());
+    try std.testing.expectEqual(@as(u32, 0), queue.indices.count());
+    for (seen) |present| try std.testing.expect(present);
+}

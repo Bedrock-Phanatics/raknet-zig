@@ -12,13 +12,14 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(usize, "fuzz_iterations", fuzz_iterations);
 
-    _ = b.addModule("raknet", .{
+    const raknet_module = b.addModule("raknet", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const test_root = module(b, "tests.zig", target, optimize);
+    const test_root = module(b, "tests/root.zig", target, optimize);
+    test_root.addImport("raknet", raknet_module);
     test_root.addOptions("build_options", options);
     const tests = b.addTest(.{ .root_module = test_root });
     const run_tests = b.addRunArtifact(tests);
