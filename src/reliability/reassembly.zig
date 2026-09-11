@@ -48,23 +48,27 @@ pub const Reassembler = struct {
         if (payload.len == 0 or payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
 
         var entry = self.assemblies.getPtr(id);
+        var created = false;
         if (entry == null) {
             if (self.assemblies.count() >= self.limits.maximum_concurrent) return error.TooManyAssemblies;
             const fragments = try self.allocator.alloc(Fragment, count);
             @memset(fragments, .{});
             errdefer self.allocator.free(fragments);
             try self.assemblies.put(self.allocator, id, .{ .count = count, .fragments = fragments, .updated_ms = now_ms });
+            created = true;
             entry = self.assemblies.getPtr(id).?;
         }
+        errdefer if (created) self.remove(id);
+
         const assembly = entry.?;
         if (assembly.count != count) {
             self.remove(id);
             return error.SplitIdCollision;
         }
-        assembly.updated_ms = now_ms;
         const slot = &assembly.fragments[index];
         if (slot.data) |existing| {
             if (std.mem.eql(u8, existing, payload)) {
+                assembly.updated_ms = now_ms;
                 if (assembly.received == assembly.fragments.len) return try self.finish(id, assembly);
                 return null;
             }
@@ -82,6 +86,7 @@ pub const Reassembler = struct {
         assembly.received += 1;
         assembly.bytes += payload.len;
         self.total_bytes += payload.len;
+        assembly.updated_ms = now_ms;
         if (assembly.received != assembly.fragments.len) return null;
         return try self.finish(id, assembly);
     }
@@ -152,4 +157,26 @@ test "split limits reject before allocation" {
     try std.testing.expect((try value.push(1, 2, 0, "12345678", 0)) == null);
     try std.testing.expectError(error.TooManyAssemblies, value.push(2, 2, 0, "x", 0));
     try std.testing.expectError(error.ReassemblyLimitExceeded, value.push(1, 2, 1, "x", 0));
+}
+test "new assembly allocation failure leaves no retained state" {
+    const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
+    var quota = QuotaAllocator.init(std.testing.allocator, 0);
+    var value = try Reassembler.init(quota.allocator(), .{
+        .maximum_parts = 4,
+        .maximum_bytes = 16,
+        .maximum_concurrent = 2,
+        .maximum_total_bytes = 32,
+        .timeout_ms = 10,
+    });
+    defer value.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, value.push(1, 2, 0, "first", 0));
+    try std.testing.expectEqual(@as(usize, 0), value.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), quota.used_bytes);
+
+    quota.maximum_bytes = std.math.maxInt(usize);
+    try std.testing.expect((try value.push(1, 2, 0, "first", 1)) == null);
+    try std.testing.expectEqual(@as(usize, 1), value.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 5), value.total_bytes);
 }

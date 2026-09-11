@@ -22,7 +22,8 @@ pub const Window = struct {
         return .{ .present = storage, .expected = uint24.normalize(initial_expected) };
     }
 
-    pub fn add(self: *Window, raw_index: u32, maximum_gap_report: usize) Result {
+    /// Checks an index without changing the window.
+    pub fn inspect(self: *const Window, raw_index: u32, maximum_gap_report: usize) Result {
         const index = uint24.normalize(raw_index);
         const forward = uint24.distance(self.expected, index);
         if (forward == uint24.half_range) return .ambiguous;
@@ -32,7 +33,6 @@ pub const Window = struct {
         const slot = index % self.present.len;
         if (forward != 0) {
             if (self.present[slot]) return .duplicate;
-            self.present[slot] = true;
             const count = @min(forward, maximum_gap_report);
             return .{ .accepted = .{
                 .first = uint24.sub(index, @intCast(count)),
@@ -40,10 +40,26 @@ pub const Window = struct {
                 .count = count,
             } };
         }
+        return .{ .accepted = null };
+    }
+
+    pub fn add(self: *Window, raw_index: u32, maximum_gap_report: usize) Result {
+        const result = self.inspect(raw_index, maximum_gap_report);
+        const index = uint24.normalize(raw_index);
+        const forward = uint24.distance(self.expected, index);
+        switch (result) {
+            .accepted => {
+                if (forward != 0) {
+                    self.present[index % self.present.len] = true;
+                    return result;
+                }
+            },
+            else => return result,
+        }
 
         self.advanceOne();
         while (self.present[self.expected % self.present.len]) self.advanceOne();
-        return .{ .accepted = null };
+        return result;
     }
 
     fn advanceOne(self: *Window) void {
@@ -72,4 +88,12 @@ test "gap reports have a strict work cap" {
     const result = window.add(50, 5);
     try std.testing.expectEqual(@as(usize, 5), result.accepted.?.count);
     try std.testing.expectEqual(@as(u32, 45), result.accepted.?.first);
+}
+test "inspection is non-mutating" {
+    var slots: [8]bool = undefined;
+    var window = try Window.init(&slots, 4);
+    const result = window.inspect(6, 2);
+    try std.testing.expect(result == .accepted);
+    try std.testing.expectEqual(@as(u32, 4), window.expected);
+    try std.testing.expect(!slots[6]);
 }
