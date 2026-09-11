@@ -4,7 +4,16 @@ const datagram = @import("../protocol/datagram.zig");
 const frame = @import("../protocol/frame.zig");
 const uint24 = @import("../util/uint24.zig");
 
-pub const EmitFn = *const fn (context: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) anyerror!void;
+pub const EmitError = error{
+    OutOfMemory,
+    CongestionWindowFull,
+    RecoveryFull,
+    RecoveryBytesExceeded,
+    Overflow,
+    InvalidDatagram,
+    TransportFailure,
+};
+pub const EmitFn = *const fn (context: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void;
 pub const Sent = struct { datagrams: usize, wire_bytes: usize };
 
 /// Packetizes synchronously into caller scratch. The emit callback must consume/copy before returning.
@@ -122,7 +131,7 @@ test "transmitter packetizes a split message within MTU" {
         count: usize = 0,
         fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (!reliable or wire.len > 576 or sequence != self.count) return error.InvalidEmission;
+            if (!reliable or wire.len > 576 or sequence != self.count) return error.TransportFailure;
             self.count += 1;
         }
     };

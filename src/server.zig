@@ -11,6 +11,7 @@ const cookie = @import("security/cookie.zig");
 const rate = @import("security/rate_limit.zig");
 const core_mod = @import("session/core.zig");
 const handshake = @import("session/offline_handshake.zig");
+const receiver = @import("session/receiver.zig");
 const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
 
 const EndpointKey = [23]u8;
@@ -34,8 +35,8 @@ pub const Options = struct {
 
 pub const Callbacks = struct {
     context: *anyopaque,
-    connected: *const fn (context: *anyopaque, session: *Session) anyerror!void,
-    message: *const fn (context: *anyopaque, session: *Session, payload: []const u8) anyerror!void,
+    connected: *const fn (context: *anyopaque, session: *Session) core_mod.ApplicationCallbackError!void,
+    message: *const fn (context: *anyopaque, session: *Session, payload: []const u8) core_mod.ApplicationCallbackError!void,
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
 };
 
@@ -96,7 +97,7 @@ pub const Session = struct {
         const Emitter = struct {
             session: *Session,
             count: usize = 0,
-            fn emit(raw: *anyopaque, wire: []const u8) !void {
+            fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
                 const value: *@This() = @ptrCast(@alignCast(raw));
                 value.session.socket.send(value.session.address, wire) catch return error.TransportFailure;
                 value.count += 1;
@@ -259,7 +260,7 @@ pub const Listener = struct {
                     session: *Session,
                     now_ms: u64,
 
-                    fn deliver(raw: *anyopaque, payload: []const u8) !void {
+                    fn deliver(raw: *anyopaque, payload: []const u8) receiver.DeliveryError!void {
                         const bridge: *@This() = @ptrCast(@alignCast(raw));
                         const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
                         switch (packet) {
@@ -503,9 +504,9 @@ test "listener answers an offline ping over loopback" {
     const Sender = struct {
         socket: *backend.Socket,
         destination: std.Io.net.IpAddress,
-        fn emit(raw: *anyopaque, _: u32, _: bool, wire: []const u8) !void {
+        fn emit(raw: *anyopaque, _: u32, _: bool, wire: []const u8) @import("session/transmitter.zig").EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.socket.send(self.destination, wire);
+            self.socket.send(self.destination, wire) catch return error.TransportFailure;
         }
     };
     var sender: Sender = .{ .socket = &client, .destination = listener.socket.value.address };

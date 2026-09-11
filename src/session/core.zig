@@ -42,6 +42,9 @@ pub const IncomingFailure = struct {
     disposition: IncomingErrorDisposition,
 };
 
+pub const ApplicationCallbackError = error{ApplicationFailure};
+pub const SendError = error{TransportFailure};
+
 pub fn classifyIncomingError(err: anyerror) IncomingFailure {
     return switch (err) {
         error.DatagramTooLarge,
@@ -92,7 +95,7 @@ pub fn incomingErrorDisposition(err: anyerror) IncomingErrorDisposition {
     return classifyIncomingError(err).disposition;
 }
 
-pub fn deliverySendFailure(err: anyerror) anyerror {
+pub fn deliverySendFailure(err: anyerror) receiver.DeliveryError {
     return switch (err) {
         error.OutOfMemory,
         error.RecoveryFull,
@@ -191,7 +194,7 @@ pub const Core = struct {
         self.* = undefined;
     }
 
-    pub const SendFn = *const fn (context: *anyopaque, wire: []const u8) anyerror!void;
+    pub const SendFn = *const fn (context: *anyopaque, wire: []const u8) SendError!void;
 
     pub fn send(self: *Core, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         const wire_bytes = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
@@ -201,7 +204,7 @@ pub const Core = struct {
             user_context: *anyopaque,
             user_emit: SendFn,
             now_ms: u64,
-            fn forward(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) !void {
+            fn forward(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) transmitter.EmitError!void {
                 const bridge: *@This() = @ptrCast(@alignCast(raw));
                 if (reliable) try bridge.core.trackSent(sequence, wire, wire.len, bridge.now_ms);
                 try bridge.user_emit(bridge.user_context, wire);

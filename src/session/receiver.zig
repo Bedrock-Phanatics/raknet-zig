@@ -7,7 +7,14 @@ const ordering = @import("../reliability/ordering.zig");
 const ordered_store = @import("../reliability/ordered_store.zig");
 
 pub const Receipt = struct { acknowledge: ?u32 = null, missing: ?receive_window.Gap = null, delivered: usize = 0 };
-pub const DeliverFn = *const fn (context: *anyopaque, payload: []const u8) anyerror!void;
+pub const DeliveryError = error{
+    PeerProtocolFailure,
+    ResourceLimitFailure,
+    TransportFailure,
+    ApplicationFailure,
+    InternalFailure,
+};
+pub const DeliverFn = *const fn (context: *anyopaque, payload: []const u8) DeliveryError!void;
 
 /// Single-owner connected receive state. It retains no slice into the datagram after `process` returns.
 pub const Receiver = struct {
@@ -191,15 +198,7 @@ pub const Receiver = struct {
     }
 
     fn deliverPayload(context: *anyopaque, payload: []const u8, deliver: DeliverFn) !void {
-        deliver(context, payload) catch |err| return switch (err) {
-            error.PeerProtocolFailure,
-            error.ResourceLimitFailure,
-            error.TransportFailure,
-            error.ApplicationFailure,
-            error.InternalFailure,
-            => err,
-            else => error.ApplicationFailure,
-        };
+        try deliver(context, payload);
     }
     fn previewReliable(self: *const Receiver, reliable_index: ?u32) !bool {
         const index = reliable_index orelse return true;
@@ -226,7 +225,7 @@ test "receiver delivers in order with a zero-copy fast path" {
         count: usize = 0,
         fn add(raw: *anyopaque, payload: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.count >= self.values.len or payload.len > self.values[0].len) return error.Full;
+            if (self.count >= self.values.len or payload.len > self.values[0].len) return error.ApplicationFailure;
             @memcpy(self.values[self.count][0..payload.len], payload);
             self.lengths[self.count] = payload.len;
             self.count += 1;
@@ -534,13 +533,13 @@ test "small descriptor scratch is rejected before state changes" {
     try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
     try std.testing.expectEqual(@as(usize, 2), counter.count);
 }
-test "callback errors become application failures" {
+test "explicit application callback failures are preserved" {
     const Failing = struct {
         calls: usize = 0,
         fn deliver(raw: *anyopaque, _: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
-            return error.CallbackRejected;
+            return error.ApplicationFailure;
         }
     };
 

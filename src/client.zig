@@ -8,6 +8,7 @@ const frame = @import("protocol/frame.zig");
 const offline = @import("protocol/offline.zig");
 const recovery = @import("reliability/recovery.zig");
 const core_mod = @import("session/core.zig");
+const receiver = @import("session/receiver.zig");
 
 pub const Options = struct {
     config: Config = .{},
@@ -17,7 +18,7 @@ pub const Options = struct {
     handshake_timeout_ms: u32 = 5_000,
     handshake_retry_ms: u32 = 500,
 };
-pub const MessageFn = *const fn (context: *anyopaque, payload: []const u8) anyerror!void;
+pub const MessageFn = *const fn (context: *anyopaque, payload: []const u8) core_mod.ApplicationCallbackError!void;
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -113,7 +114,7 @@ pub const Client = struct {
             callback: MessageFn,
             now_ms: u64,
             remote_disconnect: bool = false,
-            fn deliver(raw: *anyopaque, payload: []const u8) !void {
+            fn deliver(raw: *anyopaque, payload: []const u8) receiver.DeliveryError!void {
                 const bridge: *@This() = @ptrCast(@alignCast(raw));
                 const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
                 switch (packet) {
@@ -174,7 +175,7 @@ pub const Client = struct {
                 client: *Client,
                 accepted: bool = false,
                 now_ms: u64,
-                fn deliver(raw: *anyopaque, payload: []const u8) !void {
+                fn deliver(raw: *anyopaque, payload: []const u8) receiver.DeliveryError!void {
                     const value: *@This() = @ptrCast(@alignCast(raw));
                     const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
                     if (packet != .connection_request_accepted) return;
@@ -197,7 +198,7 @@ pub const Client = struct {
         const Emitter = struct {
             client: *Client,
             count: usize = 0,
-            fn emit(raw: *anyopaque, wire: []const u8) !void {
+            fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
                 const value: *@This() = @ptrCast(@alignCast(raw));
                 value.client.socket.send(value.client.server, wire) catch return error.TransportFailure;
                 value.count += 1;
@@ -298,8 +299,7 @@ test "client and server complete a real loopback handshake" {
         }
         fn onMessage(raw: *anyopaque, _: *server_mod.Session, payload: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.fail_messages) return error.CallbackRejected;
-            if (payload.len > self.message_data.len) return error.MessageTooLarge;
+            if (self.fail_messages or payload.len > self.message_data.len) return error.ApplicationFailure;
             @memcpy(self.message_data[0..payload.len], payload);
             self.message_len = payload.len;
         }
