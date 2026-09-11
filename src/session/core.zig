@@ -249,6 +249,18 @@ pub const Core = struct {
             },
         };
     }
+    pub fn nextRetransmissionDeadline(self: Core) ?u64 {
+        return self.recovery_state.nextDeadline();
+    }
+
+    pub fn nextSplitDeadline(self: Core) ?u64 {
+        return self.receiver_state.nextSplitDeadline();
+    }
+
+    pub fn expireSplits(self: *Core, now_ms: u64) usize {
+        return self.receiver_state.expireSplits(now_ms);
+    }
+
     pub fn collectRetransmissions(self: *Core, now_ms: u64, output: []recovery.Due) recovery.DueBatch {
         const batch = self.recovery_state.collectDue(now_ms, self.rtt_state.rto(), output, self.config.maximum_packets_per_iteration);
         for (batch.items) |item| if (item.timed_out) {

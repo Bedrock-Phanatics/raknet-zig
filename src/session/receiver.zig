@@ -65,6 +65,14 @@ pub const Receiver = struct {
         self.* = undefined;
     }
 
+    pub fn nextSplitDeadline(self: Receiver) ?u64 {
+        return self.splits.nextDeadline();
+    }
+
+    pub fn expireSplits(self: *Receiver, now_ms: u64) usize {
+        return self.splits.expire(now_ms, self.config.maximum_packets_per_iteration);
+    }
+
     pub fn process(self: *Receiver, data: []const u8, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !Receipt {
         if (data.len > self.config.maximum_datagram_size) return error.DatagramTooLarge;
 
@@ -72,7 +80,6 @@ pub const Receiver = struct {
         try self.validateDatagram(data);
         var datagram = try frame.decodeDatagram(data);
         if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;
-        _ = self.splits.expire(now_ms, self.config.maximum_packets_per_iteration);
 
         var receipt: Receipt = .{};
         var work: usize = 0;
@@ -90,7 +97,6 @@ pub const Receiver = struct {
 
         const datagram = try self.decodeDatagramInto(data, scratch);
         if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;
-        _ = self.splits.expire(now_ms, self.config.maximum_packets_per_iteration);
 
         var receipt: Receipt = .{};
         for (datagram.frames) |value| {

@@ -31,6 +31,8 @@ pub const Options = struct {
     /// Hard aggregate cap for the session table and all remotely-created
     /// per-session protocol state.
     maximum_session_memory_bytes: usize = 512 * 1024 * 1024,
+    handshake_timeout_ms: u32 = 5_000,
+    /// Kept for source compatibility. Exact deadlines ignore it.
     maintenance_interval_ms: u32 = 10,
 };
 
@@ -61,22 +63,31 @@ pub const Session = struct {
     key: EndpointKey,
     core: core_mod.Core,
     scratch: []u8,
+    pending_acks: []u32,
+    pending_ack_count: usize = 0,
+    ack_deadline_ms: ?u64 = null,
+    deadlines: *deadline_queue.Queue,
     client_guid: u64,
     mtu: u16,
     state: State = .connecting,
     last_seen_ms: u64,
+    handshake_deadline_ms: u64,
+    idle_timeout_ms: u32,
 
-    fn create(allocator: std.mem.Allocator, socket: *backend.Socket, address: std.Io.net.IpAddress, key: EndpointKey, client_guid: u64, mtu: u16, now_ms: u64, config: Config) !*Session {
+    fn create(allocator: std.mem.Allocator, socket: *backend.Socket, deadlines: *deadline_queue.Queue, address: std.Io.net.IpAddress, key: EndpointKey, client_guid: u64, mtu: u16, now_ms: u64, handshake_timeout_ms: u32, ack_capacity: usize, config: Config) !*Session {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
         var core = try core_mod.Core.init(allocator, mtu, config);
         errdefer core.deinit();
         const scratch = try allocator.alloc(u8, mtu);
-        self.* = .{ .allocator = allocator, .socket = socket, .address = address, .key = key, .core = core, .scratch = scratch, .client_guid = client_guid, .mtu = mtu, .last_seen_ms = now_ms };
+        errdefer allocator.free(scratch);
+        const pending_acks = try allocator.alloc(u32, ack_capacity);
+        self.* = .{ .allocator = allocator, .socket = socket, .address = address, .key = key, .core = core, .scratch = scratch, .pending_acks = pending_acks, .deadlines = deadlines, .client_guid = client_guid, .mtu = mtu, .last_seen_ms = now_ms, .handshake_deadline_ms = now_ms +| handshake_timeout_ms, .idle_timeout_ms = config.idle_timeout_ms };
         return self;
     }
     fn destroy(self: *Session) void {
         self.core.deinit();
+        self.allocator.free(self.pending_acks);
         self.allocator.free(self.scratch);
         self.allocator.destroy(self);
     }
@@ -91,6 +102,7 @@ pub const Session = struct {
         _ = self.sendAt(payload, reliability, channel, nowMilliseconds(self.socket.io)) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.state = .closed;
+                self.deadlines.upsert(self.key, nowMilliseconds(self.socket.io)) catch {};
             }
             return err;
         };
@@ -107,15 +119,19 @@ pub const Session = struct {
         };
         var emitter: Emitter = .{ .session = self };
         _ = try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
+        try self.schedule();
         return emitter.count;
     }
     fn sendControl(self: *Session, payload: []const u8, reliability: frame.Reliability, now_ms: u64) !void {
         _ = try self.sendAt(payload, reliability, 0, now_ms);
     }
-    fn flushReceipt(self: *Session, receipt: @import("session/receiver.zig").Receipt) !void {
+    fn queueReceipt(self: *Session, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
         if (receipt.acknowledge) |sequence| {
-            const wire = datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch) catch return error.InternalFailure;
-            self.socket.send(self.address, wire) catch return error.TransportFailure;
+            if (self.pending_ack_count == self.pending_acks.len) try self.flushAcks();
+            self.pending_acks[self.pending_ack_count] = sequence;
+            self.pending_ack_count += 1;
+            self.ack_deadline_ms = if (self.ack_deadline_ms) |deadline| @min(deadline, now_ms) else now_ms;
+            try self.schedule();
         }
         if (receipt.missing) |gap| {
             var ranges: [2]ack.Record = undefined;
@@ -130,6 +146,22 @@ pub const Session = struct {
             const wire = datagram.encodeControl(.nack, ranges[0..count], self.scratch) catch return error.InternalFailure;
             self.socket.send(self.address, wire) catch return error.TransportFailure;
         }
+    }
+    fn flushAcks(self: *Session) !void {
+        for (self.pending_acks[0..self.pending_ack_count]) |sequence| {
+            const wire = datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch) catch return error.InternalFailure;
+            self.socket.send(self.address, wire) catch return error.TransportFailure;
+        }
+        self.pending_ack_count = 0;
+        self.ack_deadline_ms = null;
+    }
+    fn schedule(self: *Session) !void {
+        var deadline = self.last_seen_ms +| self.idle_timeout_ms;
+        if (self.state == .connecting) deadline = @min(deadline, self.handshake_deadline_ms);
+        if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
+        if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
+        if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
+        try self.deadlines.upsert(self.key, deadline);
     }
     fn flushRetransmissions(self: *Session, now_ms: u64) !void {
         var due: [256]recovery.Due = undefined;
@@ -157,11 +189,12 @@ pub const Listener = struct {
     frame_scratch: []frame.Frame,
     handshake_output: []u8,
     closed: bool = false,
-    maintenance_interval_ms: u32,
+    handshake_timeout_ms: u32,
+    ack_capacity: usize,
 
     pub fn listen(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, options: Options) !*Listener {
         try options.config.validate();
-        if (options.receive_batch_size == 0 or options.receive_batch_size > 256 or options.advertisement.len > options.config.maximum_datagram_size -| 35 or options.maximum_session_memory_bytes == 0 or options.maintenance_interval_ms == 0) return error.InvalidConfiguration;
+        if (options.receive_batch_size == 0 or options.receive_batch_size > 256 or options.advertisement.len > options.config.maximum_datagram_size -| 35 or options.maximum_session_memory_bytes == 0 or options.handshake_timeout_ms == 0) return error.InvalidConfiguration;
         const self = try allocator.create(Listener);
         errdefer allocator.destroy(self);
         var socket = try backend.Socket.bind(io, address, options.config.maximum_datagram_size);
@@ -202,7 +235,8 @@ pub const Listener = struct {
             .receive_storage = receive_storage,
             .frame_scratch = frame_scratch,
             .handshake_output = handshake_output,
-            .maintenance_interval_ms = options.maintenance_interval_ms,
+            .handshake_timeout_ms = options.handshake_timeout_ms,
+            .ack_capacity = options.receive_batch_size,
         };
         self.handshake_handler = try handshake.Handler.init(guid, options.protocol_version, options.config.minimum_mtu, options.config.maximum_mtu, self.advertisement, .{ .current_key = random[8..40].*, .previous_key = random[40..72].* }, &self.limiter);
         return self;
@@ -319,7 +353,7 @@ pub const Listener = struct {
                     continue;
                 };
                 if (incoming == .data) {
-                    session.flushReceipt(incoming.data) catch |err| {
+                    session.queueReceipt(incoming.data, now_ms) catch |err| {
                         const failure = core_mod.classifyTransitionError(.receipt, err);
                         recordSessionFailure(&stats, failure.class);
                         session.state = .closed;
@@ -327,15 +361,13 @@ pub const Listener = struct {
                         continue;
                     };
                 }
-                session.flushRetransmissions(now_ms) catch |err| {
-                    const failure = core_mod.classifyTransitionError(.retransmission, err);
-                    recordSessionFailure(&stats, failure.class);
-                    session.state = .closed;
-                };
                 if (session.state == .closed) {
+                    session.flushAcks() catch |err| {
+                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.receipt, err).class);
+                    };
                     self.removeSession(key, callbacks);
                 } else {
-                    self.scheduleSession(session, now_ms) catch {
+                    session.schedule() catch {
                         recordSessionFailure(&stats, .internal);
                         session.state = .closed;
                         self.removeSession(key, callbacks);
@@ -354,7 +386,7 @@ pub const Listener = struct {
                         continue;
                     }
                     const session_allocator = self.session_quota.allocator();
-                    const session = Session.create(session_allocator, &self.socket, message.from, key, accepted.client_guid, accepted.mtu, now_ms, self.config) catch {
+                    const session = Session.create(session_allocator, &self.socket, &self.deadlines, message.from, key, accepted.client_guid, accepted.mtu, now_ms, self.handshake_timeout_ms, self.ack_capacity, self.config) catch {
                         stats.rate_limited_or_dropped += 1;
                         continue;
                     };
@@ -362,7 +394,7 @@ pub const Listener = struct {
                         session.destroy();
                         return err;
                     };
-                    self.scheduleSession(session, now_ms) catch |err| {
+                    session.schedule() catch |err| {
                         _ = self.sessions.remove(key);
                         session.destroy();
                         return err;
@@ -380,12 +412,6 @@ pub const Listener = struct {
         return stats;
     }
 
-    fn scheduleSession(self: *Listener, session: *const Session, now_ms: u64) !void {
-        const maintenance = now_ms +| self.maintenance_interval_ms;
-        const idle = session.last_seen_ms +| self.config.idle_timeout_ms;
-        try self.deadlines.upsert(session.key, @min(maintenance, idle));
-    }
-
     fn processDue(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats) void {
         var work: usize = 0;
         while (work < self.config.maximum_packets_per_iteration) : (work += 1) {
@@ -395,25 +421,39 @@ pub const Listener = struct {
                 self.removeSession(entry.key, callbacks);
                 continue;
             }
-            if (now_ms -| session.last_seen_ms >= self.config.idle_timeout_ms) {
+            if ((session.state == .connecting and now_ms >= session.handshake_deadline_ms) or
+                now_ms -| session.last_seen_ms >= session.idle_timeout_ms)
+            {
                 stats.sessions_expired += 1;
                 self.removeSession(entry.key, callbacks);
                 continue;
             }
-            session.flushRetransmissions(now_ms) catch |err| {
-                recordSessionFailure(stats, core_mod.classifyTransitionError(.retransmission, err).class);
-                session.state = .closed;
-                self.removeSession(entry.key, callbacks);
-                continue;
+            if (session.ack_deadline_ms) |deadline| if (deadline <= now_ms) {
+                session.flushAcks() catch |err| {
+                    recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
+                    session.state = .closed;
+                    self.removeSession(entry.key, callbacks);
+                    continue;
+                };
             };
-            self.scheduleSession(session, now_ms) catch {
+            if (session.core.nextSplitDeadline()) |deadline| if (deadline <= now_ms) {
+                _ = session.core.expireSplits(now_ms);
+            };
+            if (session.core.nextRetransmissionDeadline()) |deadline| if (deadline <= now_ms) {
+                session.flushRetransmissions(now_ms) catch |err| {
+                    recordSessionFailure(stats, core_mod.classifyTransitionError(.retransmission, err).class);
+                    session.state = .closed;
+                    self.removeSession(entry.key, callbacks);
+                    continue;
+                };
+            };
+            session.schedule() catch {
                 recordSessionFailure(stats, .internal);
                 session.state = .closed;
                 self.removeSession(entry.key, callbacks);
             };
         }
     }
-
     fn removeSession(self: *Listener, key: EndpointKey, callbacks: Callbacks) void {
         _ = self.deadlines.remove(key);
         const removed = self.sessions.fetchRemove(key) orelse return;
@@ -514,6 +554,8 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expectEqual(@intFromEnum(offline.Id.open_connection_reply_2), reply2.data[0]);
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
+    const scheduled = listener.sessions.get(endpointKey(client.value.address)).?;
+    try std.testing.expectEqual(scheduled.handshake_deadline_ms, listener.deadlines.peek().?.deadline_ms);
 
     try client.send(listener.socket.value.address, request2.written());
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
@@ -536,6 +578,9 @@ test "listener answers an offline ping over loopback" {
     const connection_request = try connected.encodeConnectionRequest(0x8000_0000_0000_0001, 1000, &control);
     _ = try transmitter.send(connection_request, .reliable_ordered, 0, send_scratch[0..mtu], &sender, Sender.emit);
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
+    try std.testing.expectEqual(@as(usize, 0), scheduled.pending_ack_count);
+    const retransmission_deadline = scheduled.core.nextRetransmissionDeadline().?;
+    try std.testing.expectEqual(retransmission_deadline, listener.deadlines.peek().?.deadline_ms);
     const accepted_datagram = try client.value.receive(io, &response);
     var decoded_datagram = try @import("protocol/frame.zig").decodeDatagram(accepted_datagram.data);
     const accepted_frame = try @import("protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);

@@ -108,6 +108,7 @@ pub const Client = struct {
         const message = try receiveTimed(&self.socket.value, self.io, self.receive_buffer, timeout);
         if (!std.meta.eql(message.from, self.server) or message.flags.trunc) return 0;
         const now_ms = nowMilliseconds(self.io);
+        _ = self.core.expireSplits(now_ms);
         const Bridge = struct {
             client: *Client,
             context: *anyopaque,

@@ -30,6 +30,7 @@ pub const Reassembler = struct {
     limits: Limits,
     assemblies: std.AutoHashMapUnmanaged(u16, Assembly) = .empty,
     total_bytes: usize = 0,
+    next_deadline_ms: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Reassembler {
         try limits.validate();
@@ -71,6 +72,7 @@ pub const Reassembler = struct {
         if (slot.data) |existing| {
             if (std.mem.eql(u8, existing, payload)) {
                 assembly.updated_ms = now_ms;
+                self.recomputeNextDeadline();
                 if (assembly.received == assembly.fragments.len) return try self.finish(id, assembly);
                 return null;
             }
@@ -89,7 +91,10 @@ pub const Reassembler = struct {
         assembly.bytes += copy.bytes.len;
         self.total_bytes += copy.bytes.len;
         assembly.updated_ms = now_ms;
-        if (assembly.received != assembly.fragments.len) return null;
+        if (assembly.received != assembly.fragments.len) {
+            self.recomputeNextDeadline();
+            return null;
+        }
         return try self.finish(id, assembly);
     }
 
@@ -118,13 +123,28 @@ pub const Reassembler = struct {
             _ = self.assemblies.remove(entry.key_ptr.*);
             expired += 1;
         }
+        self.recomputeNextDeadline();
         return expired;
+    }
+
+    pub fn nextDeadline(self: Reassembler) ?u64 {
+        return self.next_deadline_ms;
     }
 
     fn remove(self: *Reassembler, id: u16) void {
         const removed = self.assemblies.fetchRemove(id) orelse return;
         var assembly = removed.value;
         self.freeAssembly(&assembly);
+        self.recomputeNextDeadline();
+    }
+
+    fn recomputeNextDeadline(self: *Reassembler) void {
+        self.next_deadline_ms = null;
+        var iterator = self.assemblies.valueIterator();
+        while (iterator.next()) |assembly| {
+            const deadline = assembly.updated_ms +| self.limits.timeout_ms;
+            self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, deadline) else deadline;
+        }
     }
 
     fn freeAssembly(self: *Reassembler, assembly: *Assembly) void {
@@ -148,7 +168,9 @@ test "split assembly handles duplicates, conflicts, collision, and expiry" {
     try std.testing.expect((try value.push(3, 2, 0, "x", 5)) == null);
     try std.testing.expectError(error.SplitIdCollision, value.push(3, 3, 1, "y", 6));
     try std.testing.expect((try value.push(4, 2, 0, "z", 7)) == null);
+    try std.testing.expectEqual(@as(?u64, 17), value.nextDeadline());
     try std.testing.expectEqual(@as(usize, 1), value.expire(100, 2));
+    try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
 }
 
 test "small fragments detach from large receive buffers" {

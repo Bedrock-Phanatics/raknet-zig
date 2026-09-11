@@ -22,6 +22,7 @@ pub const Recovery = struct {
     maximum_bytes: usize,
     maximum_transmissions: u8,
     total_bytes: usize = 0,
+    next_deadline_ms: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, maximum_entries: usize, maximum_bytes: usize, maximum_transmissions: u8) !Recovery {
         if (maximum_entries == 0 or maximum_bytes == 0 or maximum_transmissions < 2 or maximum_entries > std.math.maxInt(u32)) return error.InvalidConfiguration;
@@ -43,22 +44,28 @@ pub const Recovery = struct {
         if (data.len > self.maximum_bytes -| self.total_bytes) return error.RecoveryBytesExceeded;
         const copy = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(copy);
-        try self.records.put(self.allocator, sequence, .{ .data = copy, .sent_ms = now_ms, .deadline_ms = now_ms +| rto_ms, .in_flight_bytes = in_flight_bytes });
+        const deadline_ms = now_ms +| rto_ms;
+        try self.records.put(self.allocator, sequence, .{ .data = copy, .sent_ms = now_ms, .deadline_ms = deadline_ms, .in_flight_bytes = in_flight_bytes });
         self.total_bytes += copy.len;
+        self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, deadline_ms) else deadline_ms;
     }
 
     /// Unknown and duplicate ACKs are ignored, and iteration is bounded independently of the wire ranges.
     pub fn acknowledge(self: *Recovery, ranges: []const ack.Record, now_ms: u64, maximum_work: usize) !Acknowledged {
         var iterator = ack.SequenceIterator.init(ranges, maximum_work);
         var result: Acknowledged = .{};
+        var removed_earliest = false;
+        errdefer if (removed_earliest) self.recomputeNextDeadline();
         while (try iterator.next()) |sequence| {
             const removed = self.records.fetchRemove(sequence) orelse continue;
+            removed_earliest = removed_earliest or self.next_deadline_ms == removed.value.deadline_ms;
             result.packets += 1;
             result.bytes +|= removed.value.in_flight_bytes;
             if (removed.value.transmissions == 1) result.rtt_sample_ms = now_ms -| removed.value.sent_ms;
             self.total_bytes -= removed.value.data.len;
             self.allocator.free(removed.value.data);
         }
+        if (removed_earliest) self.recomputeNextDeadline();
         return result;
     }
 
@@ -67,6 +74,7 @@ pub const Recovery = struct {
         var marked: usize = 0;
         while (try iterator.next()) |sequence| if (self.records.getPtr(sequence)) |record| {
             record.deadline_ms = @min(record.deadline_ms, now_ms);
+            self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, record.deadline_ms) else record.deadline_ms;
             marked += 1;
         };
         return marked;
@@ -92,7 +100,20 @@ pub const Recovery = struct {
             record.transmissions += 1;
             record.deadline_ms = now_ms +| rto_ms;
         }
+        self.recomputeNextDeadline();
         return .{ .items = output[0..count], .exhausted = exhausted };
+    }
+
+    pub fn nextDeadline(self: Recovery) ?u64 {
+        return self.next_deadline_ms;
+    }
+
+    fn recomputeNextDeadline(self: *Recovery) void {
+        self.next_deadline_ms = null;
+        var iterator = self.records.valueIterator();
+        while (iterator.next()) |record| {
+            self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, record.deadline_ms) else record.deadline_ms;
+        }
     }
 };
 
@@ -101,13 +122,16 @@ test "recovery owns once, ignores duplicate ACKs, and bounds retransmits" {
     defer recovery.deinit();
     try recovery.track(0xffffff, "one", 7, 10, 50);
     try recovery.track(0, "two", 8, 10, 50);
+    try std.testing.expectEqual(@as(?u64, 60), recovery.nextDeadline());
     try std.testing.expectError(error.RecoveryFull, recovery.track(1, "x", 1, 10, 50));
     const records = [_]ack.Record{.{ .first = 0xffffff, .last = 0xffffff }};
     const first = try recovery.acknowledge(&records, 30, 4);
     try std.testing.expectEqual(@as(usize, 1), first.packets);
     try std.testing.expectEqual(@as(?u64, 20), first.rtt_sample_ms);
     try std.testing.expectEqual(@as(usize, 0), (try recovery.acknowledge(&records, 40, 4)).packets);
+    try std.testing.expectEqual(@as(?u64, 60), recovery.nextDeadline());
     var due: [2]Due = undefined;
     try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(61, 50, &due, 2).items.len);
     try std.testing.expectEqualStrings("two", due[0].data);
+    try std.testing.expectEqual(@as(?u64, 111), recovery.nextDeadline());
 }

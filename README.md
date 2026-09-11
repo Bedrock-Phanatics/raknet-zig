@@ -78,7 +78,7 @@ ACKs. Reliable wire copies are retained only in the bounded recovery store.
 
 `Config` holds protocol limits shared by client and server. `ServerOptions` adds
 listener limits such as the receive batch, offline rate limits, the aggregate
-session-memory quota, and maintenance cadence. Defaults are conservative general
+session-memory quota, and connected-handshake timeout. Defaults are conservative general
 purpose values, not a promise that every workload should use them unchanged.
 
 Important operational rules:
@@ -86,8 +86,8 @@ Important operational rules:
 - Set `maximum_connections` and `maximum_session_memory_bytes` together. The
   lower effective limit wins, and a quota failure drops a new handshake without
   destabilizing existing sessions.
-- Poll with a short finite timeout. Timeout polls perform recovery and expiry
-  maintenance and return zeroed statistics rather than surfacing `error.Timeout`.
+- Poll with a short finite timeout. Timeout polls process due protocol
+  deadlines and return zeroed statistics rather than surfacing `error.Timeout`.
 - `maximum_split_parts` defaults to 2048 because observed Bedrock ecosystems can
   exceed 1,400 fragments; byte and concurrent-assembly caps remain authoritative.
 - `maximum_datagram_size` is an input boundary, while negotiated MTU determines
