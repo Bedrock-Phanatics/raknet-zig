@@ -102,7 +102,7 @@ pub const Client = struct {
         };
     }
 
-    /// Delivers borrowed application payloads valid only during the callback.
+    /// The callback payload expires when the callback returns.
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         const message = try receiveTimed(&self.socket.value, self.io, self.receive_buffer, timeout);

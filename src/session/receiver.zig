@@ -17,6 +17,7 @@ pub const DeliveryError = error{
     ApplicationFailure,
     InternalFailure,
 };
+/// The payload expires when this function returns.
 pub const DeliverFn = *const fn (context: *anyopaque, payload: BorrowedPayload) DeliveryError!void;
 
 /// Single-owner connected receive state. It retains no slice into the datagram after `process` returns.

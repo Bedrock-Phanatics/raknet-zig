@@ -6,6 +6,7 @@ pub const OwnedPayload = @import("payload.zig").OwnedPayload;
 pub const Client = @import("client.zig").Client;
 pub const ClientOptions = @import("client.zig").Options;
 pub const Server = @import("server.zig").Listener;
+pub const Session = @import("server.zig").Session;
 pub const ServerOptions = @import("server.zig").Options;
 pub const net = struct {
     pub const Socket = @import("net/backend.zig").Socket;

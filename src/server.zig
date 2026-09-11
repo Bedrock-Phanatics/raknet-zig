@@ -36,6 +36,7 @@ pub const Options = struct {
 pub const Callbacks = struct {
     context: *anyopaque,
     connected: *const fn (context: *anyopaque, session: *Session) core_mod.ApplicationCallbackError!void,
+    /// The payload expires when this callback returns.
     message: *const fn (context: *anyopaque, session: *Session, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void,
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
 };
