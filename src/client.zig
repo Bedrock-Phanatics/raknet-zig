@@ -32,6 +32,7 @@ pub const Client = struct {
     client_guid: u64,
     server_guid: u64,
     mtu: u16,
+    last_seen_ms: u64,
     closed: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
@@ -67,8 +68,9 @@ pub const Client = struct {
 
         var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
         errdefer core.deinit();
-        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .frame_scratch = frame_scratch, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu };
+        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .frame_scratch = frame_scratch, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu, .last_seen_ms = nowMilliseconds(io) };
         try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
+        self.last_seen_ms = nowMilliseconds(io);
         return self;
     }
 
@@ -102,12 +104,40 @@ pub const Client = struct {
         };
     }
 
+    /// Returns the next absolute deadline in monotonic milliseconds.
+    pub fn nextDeadline(self: *const Client) ?u64 {
+        if (self.closed) return null;
+        var deadline = self.last_seen_ms +| self.core.config.idle_timeout_ms;
+        if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
+        if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
+        return deadline;
+    }
+
+    /// Processes due timers without waiting for socket traffic.
+    pub fn processTimers(self: *Client, now_ms: u64) !void {
+        if (self.closed) return error.ConnectionClosed;
+        if (now_ms -| self.last_seen_ms >= self.core.config.idle_timeout_ms) {
+            self.abort();
+            return error.ConnectionTimedOut;
+        }
+        if (self.core.nextSplitDeadline()) |deadline| if (deadline <= now_ms) {
+            _ = self.core.expireSplits(now_ms);
+        };
+        if (self.core.nextRetransmissionDeadline()) |deadline| if (deadline <= now_ms) {
+            self.flushRetransmissions(now_ms) catch |err| {
+                self.abort();
+                return err;
+            };
+        };
+    }
+
     /// The callback payload expires when the callback returns.
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         const message = try receiveTimed(&self.socket.value, self.io, self.receive_buffer, timeout);
         if (!std.meta.eql(message.from, self.server) or message.flags.trunc) return 0;
         const now_ms = nowMilliseconds(self.io);
+        self.last_seen_ms = now_ms;
         _ = self.core.expireSplits(now_ms);
         const Bridge = struct {
             client: *Client,
@@ -376,4 +406,11 @@ test "client and server complete a real loopback handshake" {
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
     try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+
+    const retransmission_deadline = client.core.nextRetransmissionDeadline().?;
+    try std.testing.expectEqual(retransmission_deadline, client.nextDeadline().?);
+    try client.processTimers(retransmission_deadline);
+    try std.testing.expect(client.core.nextRetransmissionDeadline().? > retransmission_deadline);
+    try std.testing.expectError(error.ConnectionTimedOut, client.processTimers(std.math.maxInt(u64)));
+    try std.testing.expect(client.nextDeadline() == null);
 }

@@ -116,6 +116,11 @@ listener allocations.
 malformed traffic, expired/failed sessions, and failure classes suitable for
 operational metrics.
 
+Custom event loops can call `Server.nextDeadline` to read the earliest protocol
+deadline and `Server.processTimers` to run due work without receiving a packet.
+Deadlines and the `now_ms` argument use monotonic milliseconds from the same
+`std.Io.Clock.awake` clock. `Server.poll` already processes due timers.
+
 A `Session` is owned by its listener. Use `Session.send`, `Session.isConnected`,
 and `Session.rttMs` only while the session is live. Do not retain a session
 pointer after its disconnect callback or after destroying the listener.
@@ -149,6 +154,10 @@ pub fn main(init: std.process.Init) !void {
 `Client.connect` completes the offline and connected handshakes before returning.
 `Client.poll` processes one incoming datagram. `Client.close` closes the transport;
 `Client.destroy` also releases all client resources.
+
+`Client.nextDeadline` reports its earliest idle, split-expiry, or retransmission
+deadline. `Client.processTimers` advances due work directly and uses the same
+monotonic-millisecond clock contract as the server.
 
 ## Payload ownership
 

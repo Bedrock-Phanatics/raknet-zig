@@ -263,12 +263,27 @@ pub const Listener = struct {
         self.allocator.destroy(self);
     }
 
+    /// Returns the next absolute deadline in monotonic milliseconds.
+    pub fn nextDeadline(self: *const Listener) ?u64 {
+        if (self.closed) return null;
+        const entry = self.deadlines.peek() orelse return null;
+        return entry.deadline_ms;
+    }
+
+    /// Processes due timers without waiting for socket traffic.
+    pub fn processTimers(self: *Listener, now_ms: u64, callbacks: Callbacks) !PollStats {
+        if (self.closed) return error.ConnectionClosed;
+        var stats: PollStats = .{};
+        self.processTimersInto(now_ms, callbacks, &stats);
+        return stats;
+    }
+
     pub fn poll(self: *Listener, timeout: std.Io.Timeout, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         var stats: PollStats = .{};
         const batch = self.socket.receiveMany(self.messages, self.receive_storage, timeout) catch |err| switch (err) {
             error.Timeout => {
-                self.processDue(nowMilliseconds(self.io), callbacks, &stats);
+                self.processTimersInto(nowMilliseconds(self.io), callbacks, &stats);
                 return stats;
             },
             else => return err,
@@ -408,11 +423,11 @@ pub const Listener = struct {
                 },
             }
         }
-        self.processDue(nowMilliseconds(self.io), callbacks, &stats);
+        self.processTimersInto(nowMilliseconds(self.io), callbacks, &stats);
         return stats;
     }
 
-    fn processDue(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats) void {
+    fn processTimersInto(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats) void {
         var work: usize = 0;
         while (work < self.config.maximum_packets_per_iteration) : (work += 1) {
             const entry = self.deadlines.popDue(now_ms) orelse break;
@@ -555,7 +570,7 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
     const scheduled = listener.sessions.get(endpointKey(client.value.address)).?;
-    try std.testing.expectEqual(scheduled.handshake_deadline_ms, listener.deadlines.peek().?.deadline_ms);
+    try std.testing.expectEqual(scheduled.handshake_deadline_ms, listener.nextDeadline().?);
 
     try client.send(listener.socket.value.address, request2.written());
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
@@ -580,7 +595,7 @@ test "listener answers an offline ping over loopback" {
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
     try std.testing.expectEqual(@as(usize, 0), scheduled.pending_ack_count);
     const retransmission_deadline = scheduled.core.nextRetransmissionDeadline().?;
-    try std.testing.expectEqual(retransmission_deadline, listener.deadlines.peek().?.deadline_ms);
+    try std.testing.expectEqual(retransmission_deadline, listener.nextDeadline().?);
     const accepted_datagram = try client.value.receive(io, &response);
     var decoded_datagram = try @import("protocol/frame.zig").decodeDatagram(accepted_datagram.data);
     const accepted_frame = try @import("protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
@@ -590,4 +605,8 @@ test "listener answers an offline ping over loopback" {
     _ = try transmitter.send(new_incoming, .reliable_ordered, 0, send_scratch[0..mtu], &sender, Sender.emit);
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
     try std.testing.expectEqual(@as(usize, 1), context.connections);
+    const timer_stats = try listener.processTimers(std.math.maxInt(u64), .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
+    try std.testing.expectEqual(@as(usize, 1), timer_stats.sessions_expired);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expect(listener.nextDeadline() == null);
 }
