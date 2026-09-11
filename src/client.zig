@@ -109,24 +109,28 @@ pub const Client = struct {
             now_ms: u64,
             fn deliver(raw: *anyopaque, payload: []const u8) !void {
                 const bridge: *@This() = @ptrCast(@alignCast(raw));
-                switch (try connected.decode(payload)) {
+                const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
+                switch (packet) {
                     .connected_ping => |sent| {
                         var wire: [17]u8 = undefined;
-                        _ = try bridge.client.sendWire(try connected.encodePong(sent, bridge.now_ms, &wire), .unreliable, 0, bridge.now_ms);
+                        const pong = connected.encodePong(sent, bridge.now_ms, &wire) catch return error.InternalFailure;
+                        _ = bridge.client.sendWire(pong, .unreliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     },
                     .disconnect => bridge.client.abort(),
                     .detect_lost_connections => {
                         var wire: [9]u8 = undefined;
-                        _ = try bridge.client.sendWire(try connected.encodePing(bridge.now_ms, &wire), .reliable, 0, bridge.now_ms);
+                        const ping = connected.encodePing(bridge.now_ms, &wire) catch return error.InternalFailure;
+                        _ = bridge.client.sendWire(ping, .reliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     },
-                    .user => |data| try bridge.callback(bridge.context, data),
+                    .user => |data| bridge.callback(bridge.context, data) catch return error.ApplicationFailure,
                     else => {},
                 }
             }
         };
         var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
         const incoming = self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
-            if (core_mod.incomingErrorDisposition(err) == .close_session) self.abort();
+            const failure = core_mod.classifyIncomingError(err);
+            if (failure.disposition == .close_session) self.abort();
             return err;
         };
         if (incoming == .data) try self.flushReceipt(incoming.data);
@@ -154,10 +158,11 @@ pub const Client = struct {
                 now_ms: u64,
                 fn deliver(raw: *anyopaque, payload: []const u8) !void {
                     const value: *@This() = @ptrCast(@alignCast(raw));
-                    if ((try connected.decode(payload)) != .connection_request_accepted) return;
+                    const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
+                    if (packet != .connection_request_accepted) return;
                     var wire: [512]u8 = undefined;
-                    const packet = try connected.encodeAddressList(.incoming, toRakAddress(value.client.server), 0, &.{}, value.now_ms, value.now_ms, &wire);
-                    _ = try value.client.sendWire(packet, .reliable_ordered, 0, value.now_ms);
+                    const incoming = connected.encodeAddressList(.incoming, toRakAddress(value.client.server), 0, &.{}, value.now_ms, value.now_ms, &wire) catch return error.InternalFailure;
+                    _ = value.client.sendWire(incoming, .reliable_ordered, 0, value.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     value.accepted = true;
                 }
             };
@@ -176,7 +181,7 @@ pub const Client = struct {
             count: usize = 0,
             fn emit(raw: *anyopaque, wire: []const u8) !void {
                 const value: *@This() = @ptrCast(@alignCast(raw));
-                try value.client.socket.send(value.client.server, wire);
+                value.client.socket.send(value.client.server, wire) catch return error.TransportFailure;
                 value.count += 1;
             }
         };
@@ -329,6 +334,7 @@ test "client and server complete a real loopback handshake" {
     try client.send("\xfefail", .reliable_ordered, 0);
     var failed_sessions: usize = 0;
     var malformed: usize = 0;
+    var application_failures: usize = 0;
     for (0..4) |_| {
         const stats = try listener.poll(.none, .{
             .context = &harness,
@@ -338,10 +344,12 @@ test "client and server complete a real loopback handshake" {
         });
         failed_sessions += stats.sessions_failed;
         malformed += stats.malformed;
+        application_failures += stats.application_failures;
         if (listener.sessions.count() == 0) break;
     }
     try std.testing.expectEqual(@as(usize, 1), failed_sessions);
     try std.testing.expectEqual(@as(usize, 0), malformed);
+    try std.testing.expectEqual(@as(usize, 1), application_failures);
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
 }

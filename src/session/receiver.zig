@@ -191,7 +191,15 @@ pub const Receiver = struct {
     }
 
     fn deliverPayload(context: *anyopaque, payload: []const u8, deliver: DeliverFn) !void {
-        deliver(context, payload) catch return error.DeliveryFailed;
+        deliver(context, payload) catch |err| return switch (err) {
+            error.PeerProtocolFailure,
+            error.ResourceLimitFailure,
+            error.TransportFailure,
+            error.ApplicationFailure,
+            error.InternalFailure,
+            => err,
+            else => error.ApplicationFailure,
+        };
     }
     fn previewReliable(self: *const Receiver, reliable_index: ?u32) !bool {
         const index = reliable_index orelse return true;
@@ -526,7 +534,7 @@ test "small descriptor scratch is rejected before state changes" {
     try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
     try std.testing.expectEqual(@as(usize, 2), counter.count);
 }
-test "callback errors become terminal delivery failures" {
+test "callback errors become application failures" {
     const Failing = struct {
         calls: usize = 0,
         fn deliver(raw: *anyopaque, _: []const u8) !void {
@@ -552,7 +560,7 @@ test "callback errors become terminal delivery failures" {
     var descriptors: [1]frame.Frame = undefined;
     var failing: Failing = .{};
 
-    try std.testing.expectError(error.DeliveryFailed, receiver.processWithScratch(wire, 0, &descriptors, &failing, Failing.deliver));
+    try std.testing.expectError(error.ApplicationFailure, receiver.processWithScratch(wire, 0, &descriptors, &failing, Failing.deliver));
     try std.testing.expectEqual(@as(usize, 1), failing.calls);
     try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);

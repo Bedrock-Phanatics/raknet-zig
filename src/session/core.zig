@@ -15,12 +15,25 @@ pub const Incoming = union(enum) {
     nack_marked: usize,
 };
 
+pub const IncomingErrorClass = enum {
+    protocol,
+    resource,
+    transport,
+    application,
+    internal,
+};
+
 pub const IncomingErrorDisposition = enum {
     reject,
     close_session,
 };
 
-pub fn incomingErrorDisposition(err: anyerror) IncomingErrorDisposition {
+pub const IncomingFailure = struct {
+    class: IncomingErrorClass,
+    disposition: IncomingErrorDisposition,
+};
+
+pub fn classifyIncomingError(err: anyerror) IncomingFailure {
     return switch (err) {
         error.DatagramTooLarge,
         error.Truncated,
@@ -40,11 +53,47 @@ pub fn incomingErrorDisposition(err: anyerror) IncomingErrorDisposition {
         error.InvalidOrderChannel,
         error.PacketWorkLimitExceeded,
         error.DatagramWindowExceeded,
-        => .reject,
-        else => .close_session,
+        => .{ .class = .protocol, .disposition = .reject },
+
+        error.PeerProtocolFailure,
+        error.ReliableWindowExceeded,
+        error.OrderWindowExceeded,
+        error.SplitIdCollision,
+        error.ConflictingFragment,
+        => .{ .class = .protocol, .disposition = .close_session },
+
+        error.OutOfMemory,
+        error.ResourceLimitFailure,
+        error.TooManyAssemblies,
+        error.ReassemblyLimitExceeded,
+        error.OrderQueueFull,
+        error.OrderBytesExceeded,
+        error.RecoveryFull,
+        error.RecoveryBytesExceeded,
+        error.CongestionWindowFull,
+        => .{ .class = .resource, .disposition = .close_session },
+
+        error.TransportFailure => .{ .class = .transport, .disposition = .close_session },
+        error.ApplicationFailure => .{ .class = .application, .disposition = .close_session },
+        else => .{ .class = .internal, .disposition = .close_session },
     };
 }
 
+pub fn incomingErrorDisposition(err: anyerror) IncomingErrorDisposition {
+    return classifyIncomingError(err).disposition;
+}
+
+pub fn deliverySendFailure(err: anyerror) anyerror {
+    return switch (err) {
+        error.OutOfMemory,
+        error.RecoveryFull,
+        error.RecoveryBytesExceeded,
+        error.CongestionWindowFull,
+        => error.ResourceLimitFailure,
+        error.TransportFailure => error.TransportFailure,
+        else => error.InternalFailure,
+    };
+}
 /// Protocol state owned by one event-loop context. It performs no socket I/O and needs no locks.
 pub const Core = struct {
     allocator: std.mem.Allocator,
@@ -163,15 +212,26 @@ test "core validates ACKs against actual send state" {
     try std.testing.expectEqual(@as(?u64, 50), result.acknowledged.rtt_sample_ms);
     try std.testing.expectEqual(@as(usize, 0), (try core.processIncoming(wire, 160, &unused, Collector.discard)).acknowledged.packets);
 }
-test "incoming failure disposition only rejects pre-commit errors" {
-    try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.Truncated));
-    try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.InvalidOrderChannel));
+test "incoming failures keep their origin and commit safety" {
+    const truncated = classifyIncomingError(error.Truncated);
+    try std.testing.expectEqual(IncomingErrorClass.protocol, truncated.class);
+    try std.testing.expectEqual(IncomingErrorDisposition.reject, truncated.disposition);
+
+    const peer = classifyIncomingError(error.PeerProtocolFailure);
+    try std.testing.expectEqual(IncomingErrorClass.protocol, peer.class);
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, peer.disposition);
+
+    try std.testing.expectEqual(IncomingErrorClass.resource, classifyIncomingError(error.OutOfMemory).class);
+    try std.testing.expectEqual(IncomingErrorClass.transport, classifyIncomingError(error.TransportFailure).class);
+    try std.testing.expectEqual(IncomingErrorClass.application, classifyIncomingError(error.ApplicationFailure).class);
+    try std.testing.expectEqual(IncomingErrorClass.internal, classifyIncomingError(error.InternalInvariant).class);
+
     try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.PacketWorkLimitExceeded));
     try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.DatagramWindowExceeded));
-
-    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.DeliveryFailed));
-    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.OutOfMemory));
-    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.InternalInvariant));
     try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ReliableWindowExceeded));
     try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.OrderQueueFull));
+
+    try std.testing.expect(deliverySendFailure(error.OutOfMemory) == error.ResourceLimitFailure);
+    try std.testing.expect(deliverySendFailure(error.TransportFailure) == error.TransportFailure);
+    try std.testing.expect(deliverySendFailure(error.UnexpectedOrderIndex) == error.InternalFailure);
 }

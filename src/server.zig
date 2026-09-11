@@ -39,7 +39,17 @@ pub const Callbacks = struct {
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
 };
 
-pub const PollStats = struct { datagrams: usize = 0, malformed: usize = 0, rate_limited_or_dropped: usize = 0, sessions_expired: usize = 0, sessions_failed: usize = 0 };
+pub const PollStats = struct {
+    datagrams: usize = 0,
+    malformed: usize = 0,
+    rate_limited_or_dropped: usize = 0,
+    sessions_expired: usize = 0,
+    sessions_failed: usize = 0,
+    resource_failures: usize = 0,
+    transport_failures: usize = 0,
+    application_failures: usize = 0,
+    internal_failures: usize = 0,
+};
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -83,7 +93,7 @@ pub const Session = struct {
             count: usize = 0,
             fn emit(raw: *anyopaque, wire: []const u8) !void {
                 const value: *@This() = @ptrCast(@alignCast(raw));
-                try value.session.socket.send(value.session.address, wire);
+                value.session.socket.send(value.session.address, wire) catch return error.TransportFailure;
                 value.count += 1;
             }
         };
@@ -243,12 +253,15 @@ pub const Listener = struct {
                     callbacks: Callbacks,
                     session: *Session,
                     now_ms: u64,
+
                     fn deliver(raw: *anyopaque, payload: []const u8) !void {
                         const bridge: *@This() = @ptrCast(@alignCast(raw));
-                        switch (try connected.decode(payload)) {
+                        const packet = connected.decode(payload) catch return error.PeerProtocolFailure;
+                        switch (packet) {
                             .connected_ping => |sent| {
                                 var wire: [17]u8 = undefined;
-                                try bridge.session.sendControl(try connected.encodePong(sent, bridge.now_ms, &wire), .unreliable, bridge.now_ms);
+                                const pong = connected.encodePong(sent, bridge.now_ms, &wire) catch return error.InternalFailure;
+                                bridge.session.sendControl(pong, .unreliable, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                             },
                             .connection_request => |request| {
                                 var wire: [1024]u8 = undefined;
@@ -258,37 +271,50 @@ pub const Listener = struct {
                                     .ipv6 => .{ .ipv6 = .{ .octets = @splat(0), .port = 0 } },
                                 };
                                 var systems: [20]offline.Address = @splat(local);
-                                try bridge.session.sendControl(try connected.encodeAddressList(.accepted, remote, 0, &systems, request.request_time, bridge.now_ms, &wire), .reliable_ordered, bridge.now_ms);
+                                const accepted = connected.encodeAddressList(.accepted, remote, 0, &systems, request.request_time, bridge.now_ms, &wire) catch return error.InternalFailure;
+                                bridge.session.sendControl(accepted, .reliable_ordered, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                             },
                             .new_incoming_connection => {
                                 if (bridge.session.state == .connecting) {
                                     bridge.session.state = .connected;
-                                    try bridge.callbacks.connected(bridge.callbacks.context, bridge.session);
+                                    bridge.callbacks.connected(bridge.callbacks.context, bridge.session) catch return error.ApplicationFailure;
                                 }
                             },
                             .disconnect => bridge.session.state = .closed,
                             .detect_lost_connections => {
                                 var wire: [9]u8 = undefined;
-                                try bridge.session.sendControl(try connected.encodePing(bridge.now_ms, &wire), .reliable, bridge.now_ms);
+                                const ping = connected.encodePing(bridge.now_ms, &wire) catch return error.InternalFailure;
+                                bridge.session.sendControl(ping, .reliable, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                             },
                             .connected_pong => {},
-                            .user => |user| if (bridge.session.state == .connected) try bridge.callbacks.message(bridge.callbacks.context, bridge.session, user),
+                            .user => |user| {
+                                if (bridge.session.state == .connected) {
+                                    bridge.callbacks.message(bridge.callbacks.context, bridge.session, user) catch return error.ApplicationFailure;
+                                }
+                            },
                             .connection_request_accepted => {},
                         }
                     }
                 };
                 var bridge: Bridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
-                const incoming = session.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| switch (core_mod.incomingErrorDisposition(err)) {
-                    .reject => {
+                const incoming = session.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
+                    const failure = core_mod.classifyIncomingError(err);
+                    if (failure.disposition == .reject) {
                         stats.malformed += 1;
                         continue;
-                    },
-                    .close_session => {
-                        stats.sessions_failed += 1;
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                        continue;
-                    },
+                    }
+
+                    stats.sessions_failed += 1;
+                    switch (failure.class) {
+                        .protocol => stats.malformed += 1,
+                        .resource => stats.resource_failures += 1,
+                        .transport => stats.transport_failures += 1,
+                        .application => stats.application_failures += 1,
+                        .internal => stats.internal_failures += 1,
+                    }
+                    session.state = .closed;
+                    self.removeSession(key, callbacks);
+                    continue;
                 };
                 if (incoming == .data) session.flushReceipt(incoming.data) catch {};
                 session.flushRetransmissions(now_ms) catch {
