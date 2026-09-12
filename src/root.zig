@@ -3,6 +3,9 @@
 pub const Config = @import("config.zig").Config;
 pub const BorrowedPayload = @import("payload.zig").BorrowedPayload;
 pub const OwnedPayload = @import("payload.zig").OwnedPayload;
+pub const SendHandle = @import("session/core.zig").SendHandle;
+pub const CancelResult = @import("session/core.zig").CancelResult;
+pub const FlushResult = @import("session/core.zig").FlushResult;
 pub const Client = @import("client.zig").Client;
 pub const ClientOptions = @import("client.zig").Options;
 pub const Server = @import("server.zig").Listener;

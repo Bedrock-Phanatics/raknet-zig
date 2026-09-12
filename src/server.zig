@@ -101,8 +101,37 @@ pub const Session = struct {
         return if (self.core.rtt_state.initialized) self.core.rtt_state.smoothed_ms else null;
     }
     pub fn send(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
+        if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
+    }
+    pub fn trySend(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
         if (self.state != .connected) return error.NotConnected;
         _ = self.sendAt(payload, reliability, channel, time.nowMilliseconds(self.socket.io)) catch |err| {
+            if (err == error.CongestionWindowFull) return false;
+            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
+                self.state = .closed;
+                self.deadlines.upsert(self.key, time.nowMilliseconds(self.socket.io)) catch {};
+            }
+            return err;
+        };
+        return true;
+    }
+    pub fn queueSend(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        if (self.state != .connected) return error.NotConnected;
+        return self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
+            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
+                self.state = .closed;
+                self.deadlines.upsert(self.key, time.nowMilliseconds(self.socket.io)) catch {};
+            }
+            return err;
+        };
+    }
+    pub fn cancelSend(self: *Session, handle: core_mod.SendHandle) core_mod.CancelResult {
+        if (self.state != .connected) return .not_found;
+        return self.core.cancelOutbound(handle);
+    }
+    pub fn flush(self: *Session) !core_mod.FlushResult {
+        if (self.state != .connected) return error.NotConnected;
+        return self.flushQueuedAt(time.nowMilliseconds(self.socket.io)) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.state = .closed;
                 self.deadlines.upsert(self.key, time.nowMilliseconds(self.socket.io)) catch {};
@@ -127,6 +156,19 @@ pub const Session = struct {
     }
     fn sendControl(self: *Session, payload: []const u8, reliability: frame.Reliability, now_ms: u64) !void {
         _ = try self.sendAt(payload, reliability, 0, now_ms);
+    }
+    fn flushQueuedAt(self: *Session, now_ms: u64) !core_mod.FlushResult {
+        const Emitter = struct {
+            session: *Session,
+            fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                value.session.socket.send(value.session.address, wire) catch return error.TransportFailure;
+            }
+        };
+        var emitter: Emitter = .{ .session = self };
+        const sent = try self.core.flushOutbound(.application, self.scratch, self.core.config.maximum_packets_per_iteration, now_ms, &emitter, Emitter.emit);
+        if (sent.datagrams != 0) try self.schedule();
+        return sent;
     }
     fn queueReceipt(self: *Session, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
         if (receipt.acknowledge) |sequence| {
@@ -419,6 +461,14 @@ pub const Listener = struct {
                     session.queueReceipt(incoming.data, now_ms) catch |err| {
                         const failure = core_mod.classifyTransitionError(.receipt, err);
                         recordSessionFailure(&stats, failure.class);
+                        session.state = .closed;
+                        self.removeSession(key, callbacks);
+                        continue;
+                    };
+                }
+                if (session.state != .closed) {
+                    _ = session.flushQueuedAt(now_ms) catch |err| {
+                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.application_send, err).class);
                         session.state = .closed;
                         self.removeSession(key, callbacks);
                         continue;

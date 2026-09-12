@@ -97,11 +97,41 @@ pub const Client = struct {
         self.allocator.destroy(self);
     }
     pub fn send(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
+        if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
+    }
+
+    /// Sends immediately, returning false without emitting when congestion blocks the whole message.
+    pub fn trySend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
         if (self.closed) return error.ConnectionClosed;
         _ = self.sendWire(payload, reliability, channel, time.nowMilliseconds(self.io)) catch |err| {
+            if (err == error.CongestionWindowFull) return false;
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.abort();
             }
+            return err;
+        };
+        return true;
+    }
+
+    /// Copies a message into the bounded application queue. Call flush to start it immediately.
+    pub fn queueSend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        if (self.closed) return error.ConnectionClosed;
+        return self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
+            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
+            return err;
+        };
+    }
+
+    pub fn cancelSend(self: *Client, handle: core_mod.SendHandle) core_mod.CancelResult {
+        if (self.closed) return .not_found;
+        return self.core.cancelOutbound(handle);
+    }
+
+    /// Sends queued application data until congestion or the per-turn work limit stops progress.
+    pub fn flush(self: *Client) !core_mod.FlushResult {
+        if (self.closed) return error.ConnectionClosed;
+        return self.flushQueuedAt(time.nowMilliseconds(self.io)) catch |err| {
+            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
             return err;
         };
     }
@@ -184,6 +214,10 @@ pub const Client = struct {
             self.abort();
             return if (incoming == .data) incoming.data.delivered else 0;
         }
+        _ = self.flushQueuedAt(now_ms) catch |err| {
+            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
+            return err;
+        };
         self.processDueTimers(now_ms) catch |err| {
             if (core_mod.classifyTransitionError(.retransmission, err).disposition == .close_session) self.abort();
             return err;
@@ -241,6 +275,17 @@ pub const Client = struct {
         var emitter: Emitter = .{ .client = self };
         _ = try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
         return emitter.count;
+    }
+    fn flushQueuedAt(self: *Client, now_ms: u64) !core_mod.FlushResult {
+        const Emitter = struct {
+            client: *Client,
+            fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                value.client.socket.send(value.client.server, wire) catch return error.TransportFailure;
+            }
+        };
+        var emitter: Emitter = .{ .client = self };
+        return self.core.flushOutbound(.application, self.scratch, self.core.config.maximum_packets_per_iteration, now_ms, &emitter, Emitter.emit);
     }
     fn flushReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt) !void {
         if (receipt.acknowledge) |sequence| {
@@ -379,6 +424,18 @@ test "client and server complete a real loopback handshake" {
         if (harness.message_len != 0) break;
     }
     try std.testing.expectEqualStrings("\xfehello", harness.message_data[0..harness.message_len]);
+
+    const canceled = try client.queueSend("\xfecanceled", .reliable_ordered, 0);
+    try std.testing.expectEqual(core_mod.CancelResult.canceled, client.cancelSend(canceled));
+    _ = try client.queueSend("\xfequeued", .reliable_ordered, 0);
+    const flushed = try client.flush();
+    try std.testing.expect(flushed.datagrams != 0);
+    harness.message_len = 0;
+    for (0..4) |_| {
+        _ = try listener.poll(.none, .{ .context = &harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+        if (harness.message_len != 0) break;
+    }
+    try std.testing.expectEqualStrings("\xfequeued", harness.message_data[0..harness.message_len]);
 
     var session_iterator = listener.sessions.valueIterator();
     const session = session_iterator.next().?.*;

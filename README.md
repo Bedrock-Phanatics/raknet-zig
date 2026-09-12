@@ -166,27 +166,22 @@ application-owned queue after copying any required payload.
 
 ## Sending and backpressure
 
-`Client.send` and `Session.send` accept a payload, a
-`raknet.protocol.frame.Reliability`, and an order channel. Available reliability
-modes are:
+```zig
+if (!session.isConnected()) return;
 
-- `unreliable`
-- `unreliable_sequenced`
-- `reliable`
-- `reliable_ordered`
-- `reliable_sequenced`
-- `unreliable_with_ack_receipt`
-- `reliable_with_ack_receipt`
-- `reliable_ordered_with_ack_receipt`
+try session.send("immediate", .reliable_ordered, 0);
 
-ACK-receipt variants preserve their RakNet wire mode, but this version does not
-yet expose application receipt callbacks.
+if (!try session.trySend("hello", .reliable_ordered, 0)) {
+    _ = try session.queueSend("hello", .reliable_ordered, 0);
+}
+_ = try session.flush();
 
-`error.CongestionWindowFull` is retryable: no packet is emitted or reserved when
-the current congestion window cannot fit the message. Retry after processing
-incoming ACKs. Other resource, transport, or invariant failures may close the
-connection. Application callbacks may return only `error.ApplicationFailure`;
-the listener reports it separately from malformed traffic.
+const pending = try session.queueSend("cancel me", .reliable, 0);
+_ = session.cancelSend(pending);
+
+const rtt_ms = session.rttMs();
+_ = rtt_ms;
+```
 
 ## Configuration
 

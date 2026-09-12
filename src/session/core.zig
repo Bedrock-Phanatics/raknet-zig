@@ -10,6 +10,8 @@ const transmitter = @import("transmitter.zig");
 const outbound_queue = @import("outbound_queue.zig");
 const frame = @import("../protocol/frame.zig");
 
+var next_send_owner: std.atomic.Value(u64) = .init(1);
+
 pub const Incoming = union(enum) {
     data: receiver.Receipt,
     acknowledged: recovery.Acknowledged,
@@ -45,6 +47,9 @@ pub const IncomingFailure = struct {
 
 pub const ApplicationCallbackError = error{ApplicationFailure};
 pub const SendError = error{TransportFailure};
+pub const SendHandle = struct { id: outbound_queue.Id, owner: u64 };
+pub const CancelResult = enum { canceled, not_found, in_progress };
+pub const FlushResult = transmitter.Sent;
 
 pub fn classifyIncomingError(err: anyerror) IncomingFailure {
     return switch (err) {
@@ -119,7 +124,11 @@ pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) Inc
             error.ConnectionClosed,
             => .{ .class = .application, .disposition = .reject },
 
-            error.CongestionWindowFull => .{ .class = .resource, .disposition = .retry },
+            error.CongestionWindowFull,
+            error.OutboundQueueFull,
+            error.OutboundQueueBytesExceeded,
+            error.OutboundQueueIdExhausted,
+            => .{ .class = .resource, .disposition = .retry },
 
             error.OutOfMemory,
             error.ResourceLimitFailure,
@@ -169,6 +178,7 @@ pub const Core = struct {
     congestion_state: congestion.Controller,
     rtt_state: rtt.Estimator,
     ack_records: []ack.Record,
+    send_owner: u64,
     newest_sent: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, mtu: u16, config: Config) !Core {
@@ -197,6 +207,7 @@ pub const Core = struct {
             .congestion_state = try congestion.Controller.init(mtu),
             .rtt_state = try rtt.Estimator.init(config.minimum_rto_ms, config.maximum_rto_ms),
             .ack_records = ack_records,
+            .send_owner = next_send_owner.fetchAdd(1, .monotonic),
         };
     }
     pub fn deinit(self: *Core) void {
@@ -240,9 +251,24 @@ pub const Core = struct {
         return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, maximum_datagrams, &bridge, Bridge.forward);
     }
 
-    pub fn enqueueOutbound(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
+    pub fn enqueueOutbound(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !SendHandle {
         _ = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
-        try self.outbound_state.enqueue(lane, payload, reliability, channel);
+        return .{ .id = try self.outbound_state.enqueue(lane, payload, reliability, channel), .owner = self.send_owner };
+    }
+
+    pub fn cancelOutbound(self: *Core, handle: SendHandle) CancelResult {
+        if (handle.owner != self.send_owner) return .not_found;
+        inline for (.{ outbound_queue.Lane.control, outbound_queue.Lane.application }) |lane| {
+            const lane_index = @intFromEnum(lane);
+            if (self.outbound_state.peek(lane)) |head| {
+                if (head.id == handle.id and self.outbound_packetization[lane_index] != null) return .in_progress;
+            }
+            if (self.outbound_state.cancel(lane, handle.id)) |message| {
+                message.payload.deinit();
+                return .canceled;
+            }
+        }
+        return .not_found;
     }
 
     /// Drains one FIFO lane while both congestion and work budgets permit.
@@ -404,7 +430,7 @@ test "queued split message resumes after congestion capacity returns" {
     var scratch: [576]u8 = undefined;
     var payload: [1200]u8 = @splat(1);
     var collector: Collector = .{};
-    try core.enqueueOutbound(.application, &payload, .reliable_ordered, 0);
+    _ = try core.enqueueOutbound(.application, &payload, .reliable_ordered, 0);
 
     const first = try core.flushOutbound(.application, &scratch, 8, 0, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 1), first.datagrams);
@@ -421,6 +447,26 @@ test "queued split message resumes after congestion capacity returns" {
     try std.testing.expectEqual(@as(usize, 3), collector.count);
     try std.testing.expectEqual(@as(usize, 0), core.outbound_state.count(.application));
     try std.testing.expectEqual(@as(usize, 0), core.outbound_state.total_bytes);
+}
+
+test "queued send cancellation is explicit and ownership safe" {
+    const Collector = struct {
+        fn emit(_: *anyopaque, _: []const u8) SendError!void {}
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    core.congestion_state.window = 576;
+    var scratch: [576]u8 = undefined;
+    var payload: [1200]u8 = @splat(1);
+    const active = try core.enqueueOutbound(.application, &payload, .reliable_ordered, 0);
+    const waiting = try core.enqueueOutbound(.application, "later", .reliable_ordered, 0);
+
+    try std.testing.expectEqual(CancelResult.canceled, core.cancelOutbound(waiting));
+    try std.testing.expectEqual(CancelResult.not_found, core.cancelOutbound(waiting));
+    var unused: u8 = 0;
+    _ = try core.flushOutbound(.application, &scratch, 1, 0, &unused, Collector.emit);
+    try std.testing.expectEqual(CancelResult.in_progress, core.cancelOutbound(active));
+    try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
 }
 test "incoming failures keep their origin and commit safety" {
     const truncated = classifyIncomingError(error.Truncated);
@@ -454,6 +500,8 @@ test "transition policy distinguishes rejection, retry, and closure" {
     const pressure = classifyTransitionError(.application_send, error.CongestionWindowFull);
     try std.testing.expectEqual(IncomingErrorClass.resource, pressure.class);
     try std.testing.expectEqual(IncomingErrorDisposition.retry, pressure.disposition);
+    try std.testing.expectEqual(IncomingErrorDisposition.retry, classifyTransitionError(.application_send, error.OutboundQueueFull).disposition);
+    try std.testing.expectEqual(IncomingErrorDisposition.retry, classifyTransitionError(.application_send, error.OutboundQueueBytesExceeded).disposition);
 
     const allocation = classifyTransitionError(.application_send, error.OutOfMemory);
     try std.testing.expectEqual(IncomingErrorClass.resource, allocation.class);

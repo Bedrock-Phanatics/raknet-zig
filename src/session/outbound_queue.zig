@@ -5,8 +5,10 @@ const payload_mod = @import("../payload.zig");
 const none = std.math.maxInt(u32);
 
 pub const Lane = enum(u1) { control, application };
+pub const Id = u64;
 
 pub const Message = struct {
+    id: Id,
     payload: payload_mod.OwnedPayload,
     reliability: frame.Reliability,
     channel: u8,
@@ -31,6 +33,7 @@ pub const Queue = struct {
     heads: [2]u32 = @splat(none),
     tails: [2]u32 = @splat(none),
     counts: [2]usize = @splat(0),
+    next_id: Id = 1,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -62,8 +65,9 @@ pub const Queue = struct {
         self.* = undefined;
     }
 
-    pub fn enqueue(self: *Queue, lane: Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
+    pub fn enqueue(self: *Queue, lane: Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !Id {
         if (payload.len == 0) return error.EmptyPayload;
+        if (self.next_id == std.math.maxInt(Id)) return error.OutboundQueueIdExhausted;
         if (payload.len > self.maximum_bytes -| self.total_bytes) return error.OutboundQueueBytesExceeded;
         if (self.free_head == none) return error.OutboundQueueFull;
         if (lane == .application) {
@@ -77,10 +81,11 @@ pub const Queue = struct {
 
         const owned = try payload_mod.BorrowedPayload.init(payload).toOwned(self.allocator);
         const index = self.free_head;
+        const id = self.next_id;
         const slot = &self.slots[index];
         self.free_head = slot.next;
         slot.* = .{
-            .message = .{ .payload = owned, .reliability = reliability, .channel = channel },
+            .message = .{ .id = id, .payload = owned, .reliability = reliability, .channel = channel },
             .occupied = true,
         };
 
@@ -94,6 +99,8 @@ pub const Queue = struct {
         self.counts[lane_index] += 1;
         self.bytes[lane_index] += payload.len;
         self.total_bytes += payload.len;
+        self.next_id += 1;
+        return id;
     }
 
     /// Transfers payload ownership to the caller.
@@ -119,6 +126,32 @@ pub const Queue = struct {
         return if (index == none) null else &self.slots[index].message;
     }
 
+    /// Removes one queued message without disturbing the lane's FIFO order.
+    pub fn cancel(self: *Queue, lane: Lane, id: Id) ?Message {
+        const lane_index = @intFromEnum(lane);
+        var previous: u32 = none;
+        var index = self.heads[lane_index];
+        while (index != none) {
+            const slot = &self.slots[index];
+            if (slot.message.id == id) {
+                const next = slot.next;
+                if (previous == none) self.heads[lane_index] = next else self.slots[previous].next = next;
+                if (self.tails[lane_index] == index) self.tails[lane_index] = previous;
+                const message = slot.message;
+                self.counts[lane_index] -= 1;
+                self.bytes[lane_index] -= message.payload.bytes.len;
+                self.total_bytes -= message.payload.bytes.len;
+                slot.occupied = false;
+                slot.next = self.free_head;
+                self.free_head = index;
+                return message;
+            }
+            previous = index;
+            index = slot.next;
+        }
+        return null;
+    }
+
     pub fn count(self: Queue, lane: Lane) usize {
         return self.counts[@intFromEnum(lane)];
     }
@@ -133,9 +166,9 @@ test "control and application lanes are bounded FIFOs" {
     defer queue.deinit();
 
     var source = [_]u8{ 'a', 'b' };
-    try queue.enqueue(.application, &source, .reliable_ordered, 2);
-    try queue.enqueue(.control, "c", .reliable, 0);
-    try queue.enqueue(.application, "de", .unreliable, 3);
+    _ = try queue.enqueue(.application, &source, .reliable_ordered, 2);
+    _ = try queue.enqueue(.control, "c", .reliable, 0);
+    _ = try queue.enqueue(.application, "de", .unreliable, 3);
     source = @splat('x');
 
     try std.testing.expectEqual(@as(usize, 2), queue.count(.application));
@@ -147,7 +180,7 @@ test "control and application lanes are bounded FIFOs" {
     try std.testing.expectEqualStrings("ab", first.payload.bytes);
     try std.testing.expectEqual(frame.Reliability.reliable_ordered, first.reliability);
     try std.testing.expectEqual(@as(u8, 2), first.channel);
-    try queue.enqueue(.application, "f", .reliable, 0);
+    _ = try queue.enqueue(.application, "f", .reliable, 0);
 
     const second = queue.pop(.application).?;
     defer second.payload.deinit();
@@ -168,12 +201,12 @@ test "queue rejection leaves ownership and accounting unchanged" {
     var queue = try Queue.init(std.testing.allocator, 2, 3, 1, 1);
     defer queue.deinit();
 
-    try queue.enqueue(.application, "ab", .reliable, 0);
+    _ = try queue.enqueue(.application, "ab", .reliable, 0);
     try std.testing.expectError(error.OutboundQueueBytesExceeded, queue.enqueue(.control, "xx", .reliable, 0));
     try std.testing.expectEqual(@as(usize, 1), queue.countAll());
     try std.testing.expectEqual(@as(usize, 2), queue.total_bytes);
 
-    try queue.enqueue(.control, "c", .reliable, 0);
+    _ = try queue.enqueue(.control, "c", .reliable, 0);
     try std.testing.expectError(error.OutboundQueueFull, queue.enqueue(.control, "x", .reliable, 0));
     try std.testing.expectEqual(@as(usize, 2), queue.countAll());
     try std.testing.expectEqual(@as(usize, 3), queue.total_bytes);
@@ -182,8 +215,8 @@ test "queue rejection leaves ownership and accounting unchanged" {
 fn checkAllocationFailures(allocator: std.mem.Allocator) !void {
     var queue = try Queue.init(allocator, 2, 8, 1, 1);
     defer queue.deinit();
-    try queue.enqueue(.application, "first", .reliable_ordered, 0);
-    try queue.enqueue(.control, "x", .reliable, 0);
+    _ = try queue.enqueue(.application, "first", .reliable_ordered, 0);
+    _ = try queue.enqueue(.control, "x", .reliable, 0);
 }
 
 test "queue handles every allocation failure" {
@@ -194,10 +227,10 @@ test "application traffic cannot consume reserved control slots" {
     var queue = try Queue.init(std.testing.allocator, 3, 32, 1, 1);
     defer queue.deinit();
 
-    try queue.enqueue(.application, "a", .reliable, 0);
-    try queue.enqueue(.application, "b", .reliable, 0);
+    _ = try queue.enqueue(.application, "a", .reliable, 0);
+    _ = try queue.enqueue(.application, "b", .reliable, 0);
     try std.testing.expectError(error.OutboundQueueFull, queue.enqueue(.application, "c", .reliable, 0));
-    try queue.enqueue(.control, "c", .reliable, 0);
+    _ = try queue.enqueue(.control, "c", .reliable, 0);
 
     const control = queue.pop(.control).?;
     control.payload.deinit();
@@ -208,9 +241,29 @@ test "application traffic cannot consume reserved control bytes" {
     var queue = try Queue.init(std.testing.allocator, 4, 6, 1, 2);
     defer queue.deinit();
 
-    try queue.enqueue(.application, "abcd", .reliable, 0);
+    _ = try queue.enqueue(.application, "abcd", .reliable, 0);
     try std.testing.expectError(error.OutboundQueueBytesExceeded, queue.enqueue(.application, "x", .reliable, 0));
-    try queue.enqueue(.control, "yz", .reliable, 0);
+    _ = try queue.enqueue(.control, "yz", .reliable, 0);
     try std.testing.expectEqual(@as(usize, 4), queue.bytes[@intFromEnum(Lane.application)]);
     try std.testing.expectEqual(@as(usize, 2), queue.bytes[@intFromEnum(Lane.control)]);
+}
+
+test "cancellation preserves FIFO order and accounting" {
+    var queue = try Queue.init(std.testing.allocator, 4, 16, 1, 1);
+    defer queue.deinit();
+    _ = try queue.enqueue(.application, "a", .reliable, 0);
+    const canceled_id = try queue.enqueue(.application, "bb", .reliable, 0);
+    _ = try queue.enqueue(.application, "c", .reliable, 0);
+
+    const canceled = queue.cancel(.application, canceled_id).?;
+    defer canceled.payload.deinit();
+    try std.testing.expectEqualStrings("bb", canceled.payload.bytes);
+    try std.testing.expectEqual(@as(usize, 2), queue.count(.application));
+    try std.testing.expectEqual(@as(usize, 2), queue.total_bytes);
+    const first = queue.pop(.application).?;
+    defer first.payload.deinit();
+    const second = queue.pop(.application).?;
+    defer second.payload.deinit();
+    try std.testing.expectEqualStrings("a", first.payload.bytes);
+    try std.testing.expectEqualStrings("c", second.payload.bytes);
 }
