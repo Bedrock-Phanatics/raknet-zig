@@ -24,6 +24,8 @@ pub const Config = struct {
     maximum_connections: usize = 4096,
     maximum_queued_outbound_packets: usize = 256,
     maximum_queued_outbound_bytes: usize = 16 * 1024 * 1024,
+    reserved_control_queue_packets: usize = 16,
+    reserved_control_queue_bytes: usize = 64 * 1024,
     maximum_packets_per_iteration: usize = 256,
     idle_timeout_ms: u32 = 10_000,
     minimum_rto_ms: u32 = 50,
@@ -43,6 +45,8 @@ pub const Config = struct {
         if (self.maximum_concurrent_splits == 0 or self.split_timeout_ms == 0) return error.InvalidConfiguration;
         if (self.maximum_pending_handshakes == 0 or self.maximum_connections == 0 or self.maximum_connections > 65_536) return error.InvalidConfiguration;
         if (self.maximum_queued_outbound_packets == 0 or self.maximum_queued_outbound_packets >= std.math.maxInt(u32) or self.maximum_queued_outbound_bytes == 0) return error.InvalidConfiguration;
+        if (self.reserved_control_queue_packets == 0 or self.reserved_control_queue_packets >= self.maximum_queued_outbound_packets) return error.InvalidConfiguration;
+        if (self.reserved_control_queue_bytes == 0 or self.reserved_control_queue_bytes >= self.maximum_queued_outbound_bytes) return error.InvalidConfiguration;
         if (self.maximum_packets_per_iteration == 0 or self.maximum_packets_per_iteration > 4096) return error.InvalidConfiguration;
         if (self.idle_timeout_ms == 0 or self.minimum_rto_ms == 0 or self.minimum_rto_ms > self.maximum_rto_ms) return error.InvalidConfiguration;
     }
@@ -61,5 +65,17 @@ test "default configuration is internally consistent" {
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
     bad = .{};
     bad.maximum_queued_outbound_bytes = 0;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.reserved_control_queue_packets = bad.maximum_queued_outbound_packets;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.reserved_control_queue_packets = 0;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.reserved_control_queue_bytes = bad.maximum_queued_outbound_bytes;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.reserved_control_queue_bytes = 0;
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
 }

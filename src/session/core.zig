@@ -177,7 +177,13 @@ pub const Core = struct {
         errdefer receiver_state.deinit();
         var recovery_state = try recovery.Recovery.init(allocator, config.maximum_retransmissions, config.maximum_recovery_bytes, 8);
         errdefer recovery_state.deinit();
-        var outbound_state = try outbound_queue.Queue.init(allocator, config.maximum_queued_outbound_packets, config.maximum_queued_outbound_bytes);
+        var outbound_state = try outbound_queue.Queue.init(
+            allocator,
+            config.maximum_queued_outbound_packets,
+            config.maximum_queued_outbound_bytes,
+            config.reserved_control_queue_packets,
+            config.reserved_control_queue_bytes,
+        );
         errdefer outbound_state.deinit();
         const ack_records = try allocator.alloc(ack.Record, config.maximum_ack_records);
         return .{
