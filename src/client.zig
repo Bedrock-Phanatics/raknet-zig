@@ -80,7 +80,7 @@ pub const Client = struct {
         if (self.closed) return;
         self.closed = true;
         var payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
-        _ = self.sendWire(&payload, .reliable_ordered, 0, time.nowMilliseconds(self.io)) catch {};
+        _ = self.sendControlWire(&payload, .reliable_ordered, 0, time.nowMilliseconds(self.io)) catch {};
         self.socket.close();
     }
     fn abort(self: *Client) void {
@@ -104,7 +104,7 @@ pub const Client = struct {
     pub fn trySend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
         if (self.closed) return error.ConnectionClosed;
         _ = self.sendWire(payload, reliability, channel, time.nowMilliseconds(self.io)) catch |err| {
-            if (err == error.CongestionWindowFull) return false;
+            if (err == error.CongestionWindowFull or err == error.OutboundQueuePending) return false;
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.abort();
             }
@@ -185,13 +185,13 @@ pub const Client = struct {
                     .connected_ping => |sent| {
                         var wire: [17]u8 = undefined;
                         const pong = connected.encodePong(sent, bridge.now_ms, &wire) catch return error.InternalFailure;
-                        _ = bridge.client.sendWire(pong, .unreliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
+                        _ = bridge.client.sendControlWire(pong, .unreliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     },
                     .disconnect => bridge.remote_disconnect = true,
                     .detect_lost_connections => {
                         var wire: [9]u8 = undefined;
                         const ping = connected.encodePing(bridge.now_ms, &wire) catch return error.InternalFailure;
-                        _ = bridge.client.sendWire(ping, .reliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
+                        _ = bridge.client.sendControlWire(ping, .reliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     },
                     .user => |data| bridge.callback(bridge.context, .init(data)) catch return error.ApplicationFailure,
                     else => {},
@@ -227,7 +227,7 @@ pub const Client = struct {
 
     fn finishConnectedHandshake(self: *Client, deadline: std.Io.Timeout, retry_ms: u32, maximum_work: usize) !void {
         var control: [18]u8 = undefined;
-        _ = try self.sendWire(try connected.encodeConnectionRequest(self.client_guid, time.nowMilliseconds(self.io), &control), .reliable_ordered, 0, time.nowMilliseconds(self.io));
+        _ = try self.sendControlWire(try connected.encodeConnectionRequest(self.client_guid, time.nowMilliseconds(self.io), &control), .reliable_ordered, 0, time.nowMilliseconds(self.io));
         var work: usize = 0;
         while (work < maximum_work) : (work += 1) {
             const attempt = time.earliest(self.io, deadline, time.after(self.io, retry_ms));
@@ -249,7 +249,7 @@ pub const Client = struct {
                     if (packet != .connection_request_accepted) return;
                     var wire: [512]u8 = undefined;
                     const incoming = connected.encodeAddressList(.incoming, toRakAddress(value.client.server), 0, &.{}, value.now_ms, value.now_ms, &wire) catch return error.InternalFailure;
-                    _ = value.client.sendWire(incoming, .reliable_ordered, 0, value.now_ms) catch |err| return core_mod.deliverySendFailure(err);
+                    _ = value.client.sendControlWire(incoming, .reliable_ordered, 0, value.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                     value.accepted = true;
                 }
             };
@@ -263,6 +263,12 @@ pub const Client = struct {
     }
 
     fn sendWire(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64) !usize {
+        return self.sendWireAs(payload, reliability, channel, now_ms, false);
+    }
+    fn sendControlWire(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64) !usize {
+        return self.sendWireAs(payload, reliability, channel, now_ms, true);
+    }
+    fn sendWireAs(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64, control: bool) !usize {
         const Emitter = struct {
             client: *Client,
             count: usize = 0,
@@ -273,7 +279,10 @@ pub const Client = struct {
             }
         };
         var emitter: Emitter = .{ .client = self };
-        _ = try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
+        _ = if (control)
+            try self.core.sendControl(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit)
+        else
+            try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
         return emitter.count;
     }
     fn flushQueuedAt(self: *Client, now_ms: u64) !core_mod.FlushResult {

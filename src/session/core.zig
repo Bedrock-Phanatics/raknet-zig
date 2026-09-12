@@ -125,6 +125,7 @@ pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) Inc
             => .{ .class = .application, .disposition = .reject },
 
             error.CongestionWindowFull,
+            error.OutboundQueuePending,
             error.OutboundQueueFull,
             error.OutboundQueueBytesExceeded,
             error.OutboundQueueIdExhausted,
@@ -221,7 +222,16 @@ pub const Core = struct {
     pub const SendFn = *const fn (context: *anyopaque, wire: []const u8) SendError!void;
 
     pub fn send(self: *Core, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        return self.sendImmediate(.application, payload, reliability, channel, scratch, now_ms, context, emit);
+    }
+
+    pub fn sendControl(self: *Core, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        return self.sendImmediate(.control, payload, reliability, channel, scratch, now_ms, context, emit);
+    }
+
+    fn sendImmediate(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         const wire_bytes = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
+        if (self.outbound_state.count(lane) != 0) return error.OutboundQueuePending;
         if (wire_bytes > self.congestion_state.available()) return error.CongestionWindowFull;
         var packetization = try self.transmitter_state.beginPacketization(payload.len, reliability, channel);
         const sent = try self.sendAvailable(&packetization, payload, scratch, std.math.maxInt(usize), now_ms, context, emit);
@@ -468,6 +478,30 @@ test "queued send cancellation is explicit and ownership safe" {
     try std.testing.expectEqual(CancelResult.in_progress, core.cancelOutbound(active));
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
 }
+
+test "immediate application sends cannot bypass queued progress" {
+    const Collector = struct {
+        count: usize = 0,
+        fn emit(raw: *anyopaque, _: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    core.congestion_state.window = 576;
+    var scratch: [576]u8 = undefined;
+    var payload: [1200]u8 = @splat(1);
+    _ = try core.enqueueOutbound(.application, &payload, .reliable_ordered, 0);
+    var collector: Collector = .{};
+
+    _ = try core.sendControl("control", .unreliable, 0, &scratch, 0, &collector, Collector.emit);
+    _ = try core.flushOutbound(.application, &scratch, 1, 0, &collector, Collector.emit);
+    const order_index = core.transmitter_state.order_indices[0];
+    try std.testing.expectError(error.OutboundQueuePending, core.send("later", .reliable_ordered, 0, &scratch, 0, &collector, Collector.emit));
+    try std.testing.expectEqual(order_index, core.transmitter_state.order_indices[0]);
+    try std.testing.expectEqual(@as(usize, 2), collector.count);
+}
 test "incoming failures keep their origin and commit safety" {
     const truncated = classifyIncomingError(error.Truncated);
     try std.testing.expectEqual(IncomingErrorClass.protocol, truncated.class);
@@ -502,6 +536,7 @@ test "transition policy distinguishes rejection, retry, and closure" {
     try std.testing.expectEqual(IncomingErrorDisposition.retry, pressure.disposition);
     try std.testing.expectEqual(IncomingErrorDisposition.retry, classifyTransitionError(.application_send, error.OutboundQueueFull).disposition);
     try std.testing.expectEqual(IncomingErrorDisposition.retry, classifyTransitionError(.application_send, error.OutboundQueueBytesExceeded).disposition);
+    try std.testing.expectEqual(IncomingErrorDisposition.retry, classifyTransitionError(.application_send, error.OutboundQueuePending).disposition);
 
     const allocation = classifyTransitionError(.application_send, error.OutOfMemory);
     try std.testing.expectEqual(IncomingErrorClass.resource, allocation.class);

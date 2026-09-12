@@ -106,7 +106,7 @@ pub const Session = struct {
     pub fn trySend(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
         if (self.state != .connected) return error.NotConnected;
         _ = self.sendAt(payload, reliability, channel, time.nowMilliseconds(self.socket.io)) catch |err| {
-            if (err == error.CongestionWindowFull) return false;
+            if (err == error.CongestionWindowFull or err == error.OutboundQueuePending) return false;
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.state = .closed;
                 self.deadlines.upsert(self.key, time.nowMilliseconds(self.socket.io)) catch {};
@@ -140,6 +140,9 @@ pub const Session = struct {
         };
     }
     fn sendAt(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64) !usize {
+        return self.sendAtLane(payload, reliability, channel, now_ms, false);
+    }
+    fn sendAtLane(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64, control: bool) !usize {
         const Emitter = struct {
             session: *Session,
             count: usize = 0,
@@ -150,12 +153,15 @@ pub const Session = struct {
             }
         };
         var emitter: Emitter = .{ .session = self };
-        _ = try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
+        _ = if (control)
+            try self.core.sendControl(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit)
+        else
+            try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
         try self.schedule();
         return emitter.count;
     }
     fn sendControl(self: *Session, payload: []const u8, reliability: frame.Reliability, now_ms: u64) !void {
-        _ = try self.sendAt(payload, reliability, 0, now_ms);
+        _ = try self.sendAtLane(payload, reliability, 0, now_ms, true);
     }
     fn flushQueuedAt(self: *Session, now_ms: u64) !core_mod.FlushResult {
         const Emitter = struct {
