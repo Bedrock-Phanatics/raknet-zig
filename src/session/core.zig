@@ -164,6 +164,7 @@ pub const Core = struct {
     receiver_state: receiver.Receiver,
     transmitter_state: transmitter.Transmitter,
     outbound_state: outbound_queue.Queue,
+    outbound_packetization: [2]?transmitter.Packetization = @splat(null),
     recovery_state: recovery.Recovery,
     congestion_state: congestion.Controller,
     rtt_state: rtt.Estimator,
@@ -212,7 +213,7 @@ pub const Core = struct {
         const wire_bytes = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
         if (wire_bytes > self.congestion_state.available()) return error.CongestionWindowFull;
         var packetization = try self.transmitter_state.beginPacketization(payload.len, reliability, channel);
-        const sent = try self.sendAvailable(&packetization, payload, scratch, now_ms, context, emit);
+        const sent = try self.sendAvailable(&packetization, payload, scratch, std.math.maxInt(usize), now_ms, context, emit);
         if (!packetization.complete()) return error.CongestionWindowFull;
         return sent;
     }
@@ -222,7 +223,7 @@ pub const Core = struct {
     }
 
     /// Advances a prepared message without exceeding the current congestion window.
-    pub fn sendAvailable(self: *Core, packetization: *transmitter.Packetization, payload: []const u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+    pub fn sendAvailable(self: *Core, packetization: *transmitter.Packetization, payload: []const u8, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         const Bridge = struct {
             core: *Core,
             user_context: *anyopaque,
@@ -236,7 +237,40 @@ pub const Core = struct {
         };
         var bridge: Bridge = .{ .core = self, .user_context = context, .user_emit = emit, .now_ms = now_ms };
         const available = std.math.cast(usize, self.congestion_state.available()) orelse std.math.maxInt(usize);
-        return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, &bridge, Bridge.forward);
+        return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, maximum_datagrams, &bridge, Bridge.forward);
+    }
+
+    pub fn enqueueOutbound(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
+        _ = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
+        try self.outbound_state.enqueue(lane, payload, reliability, channel);
+    }
+
+    /// Drains one FIFO lane while both congestion and work budgets permit.
+    pub fn flushOutbound(self: *Core, lane: outbound_queue.Lane, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        var total: transmitter.Sent = .{ .datagrams = 0, .wire_bytes = 0 };
+        const lane_index = @intFromEnum(lane);
+        while (total.datagrams < maximum_datagrams) {
+            const message = self.outbound_state.peek(lane) orelse break;
+            if (self.outbound_packetization[lane_index] == null) {
+                self.outbound_packetization[lane_index] = try self.transmitter_state.beginPacketization(message.payload.bytes.len, message.reliability, message.channel);
+            }
+            const sent = try self.sendAvailable(
+                &self.outbound_packetization[lane_index].?,
+                message.payload.bytes,
+                scratch,
+                maximum_datagrams - total.datagrams,
+                now_ms,
+                context,
+                emit,
+            );
+            total.datagrams = try std.math.add(usize, total.datagrams, sent.datagrams);
+            total.wire_bytes = try std.math.add(usize, total.wire_bytes, sent.wire_bytes);
+            if (!self.outbound_packetization[lane_index].?.complete()) break;
+            self.outbound_packetization[lane_index] = null;
+            const completed = self.outbound_state.pop(lane).?;
+            completed.payload.deinit();
+        }
+        return total;
     }
     /// Copies a reliable datagram into bounded recovery storage before it is handed to the socket.
     pub fn trackSent(self: *Core, sequence: u32, wire: []const u8, in_flight_bytes: usize, now_ms: u64) !void {
@@ -344,13 +378,49 @@ test "core packetization stops at the available congestion window" {
     var packetization = try core.beginPacketization(payload.len, .reliable_ordered, 0);
     var collector: Collector = .{};
 
-    const first = try core.sendAvailable(&packetization, &payload, &scratch, 0, &collector, Collector.emit);
+    const first = try core.sendAvailable(&packetization, &payload, &scratch, 1, 0, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 1), first.datagrams);
     try std.testing.expectEqual(@as(u64, 0), core.congestion_state.available());
-    const blocked = try core.sendAvailable(&packetization, &payload, &scratch, 0, &collector, Collector.emit);
+    const blocked = try core.sendAvailable(&packetization, &payload, &scratch, 1, 0, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 0), blocked.datagrams);
     try std.testing.expectEqual(@as(usize, 1), collector.count);
     try std.testing.expect(!packetization.complete());
+}
+
+test "queued split message resumes after congestion capacity returns" {
+    const Collector = struct {
+        count: usize = 0,
+        fn emit(raw: *anyopaque, _: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    const Discard = struct {
+        fn deliver(_: *anyopaque, _: receiver.BorrowedPayload) !void {}
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    core.congestion_state.window = 576;
+    var scratch: [576]u8 = undefined;
+    var payload: [1200]u8 = @splat(1);
+    var collector: Collector = .{};
+    try core.enqueueOutbound(.application, &payload, .reliable_ordered, 0);
+
+    const first = try core.flushOutbound(.application, &scratch, 8, 0, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 1), first.datagrams);
+    try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
+    const blocked = try core.flushOutbound(.application, &scratch, 8, 1, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 0), blocked.datagrams);
+
+    var ack_wire: [32]u8 = undefined;
+    const encoded_ack = try datagram.encodeControl(.ack, &.{.{ .first = 0, .last = 0 }}, &ack_wire);
+    var unused: u8 = 0;
+    _ = try core.processIncoming(encoded_ack, 2, &unused, Discard.deliver);
+    const completed = try core.flushOutbound(.application, &scratch, 8, 2, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 2), completed.datagrams);
+    try std.testing.expectEqual(@as(usize, 3), collector.count);
+    try std.testing.expectEqual(@as(usize, 0), core.outbound_state.count(.application));
+    try std.testing.expectEqual(@as(usize, 0), core.outbound_state.total_bytes);
 }
 test "incoming failures keep their origin and commit safety" {
     const truncated = classifyIncomingError(error.Truncated);

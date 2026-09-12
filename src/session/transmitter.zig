@@ -53,7 +53,7 @@ pub const Transmitter = struct {
     /// otherwise wait forever for the incomplete reliable-ordered message.
     pub fn send(self: *Transmitter, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, context: *anyopaque, emit: EmitFn) !Sent {
         var packetization = try self.beginPacketization(payload.len, reliability, channel);
-        return self.sendAvailable(&packetization, payload, scratch, std.math.maxInt(usize), context, emit);
+        return self.sendAvailable(&packetization, payload, scratch, std.math.maxInt(usize), std.math.maxInt(usize), context, emit);
     }
 
     pub fn beginPacketization(self: *Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !Packetization {
@@ -79,11 +79,20 @@ pub const Transmitter = struct {
     }
 
     /// Emits only complete datagrams that fit the supplied wire-byte budget.
-    pub fn sendAvailable(self: *Transmitter, packetization: *Packetization, payload: []const u8, scratch: []u8, maximum_wire_bytes: usize, context: *anyopaque, emit: EmitFn) !Sent {
+    pub fn sendAvailable(
+        self: *Transmitter,
+        packetization: *Packetization,
+        payload: []const u8,
+        scratch: []u8,
+        maximum_wire_bytes: usize,
+        maximum_datagrams: usize,
+        context: *anyopaque,
+        emit: EmitFn,
+    ) !Sent {
         if (payload.len != packetization.payload_len or packetization.offset > payload.len) return error.InvalidPacketizationState;
         if (scratch.len < self.mtu) return error.NoSpaceLeft;
         var sent: Sent = .{ .datagrams = 0, .wire_bytes = 0 };
-        while (!packetization.complete()) {
+        while (!packetization.complete() and sent.datagrams < maximum_datagrams) {
             const amount = @min(packetization.capacity, payload.len - packetization.offset);
             const reliable_index = if (packetization.reliability.hasReliableIndex()) self.reliable_index else null;
             const value: frame.Frame = .{
@@ -202,16 +211,16 @@ test "packetization resumes at datagram boundaries within a wire budget" {
     var collector: Collector = .{};
     var packetization = try transmitter.beginPacketization(payload.len, .reliable_ordered, 0);
 
-    const blocked = try transmitter.sendAvailable(&packetization, &payload, &scratch, 575, &collector, Collector.emit);
+    const blocked = try transmitter.sendAvailable(&packetization, &payload, &scratch, 575, 1, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 0), blocked.datagrams);
     try std.testing.expectEqual(@as(usize, 0), packetization.offset);
 
-    const first = try transmitter.sendAvailable(&packetization, &payload, &scratch, 576, &collector, Collector.emit);
+    const first = try transmitter.sendAvailable(&packetization, &payload, &scratch, 576, 1, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 1), first.datagrams);
     try std.testing.expectEqual(@as(usize, 576), first.wire_bytes);
     try std.testing.expect(!packetization.complete());
 
-    const rest = try transmitter.sendAvailable(&packetization, &payload, &scratch, std.math.maxInt(usize), &collector, Collector.emit);
+    const rest = try transmitter.sendAvailable(&packetization, &payload, &scratch, std.math.maxInt(usize), std.math.maxInt(usize), &collector, Collector.emit);
     try std.testing.expect(rest.datagrams > 0);
     try std.testing.expect(packetization.complete());
     try std.testing.expectEqual(packetization.fragment_count, collector.count);
