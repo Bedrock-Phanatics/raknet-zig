@@ -203,6 +203,9 @@ The most important controls are:
 | `maximum_datagram_size` | 2,048 B | Maximum accepted UDP datagram |
 | `maximum_frame_payload` | 8 KiB | Maximum decoded frame payload |
 | `maximum_retransmissions` | 4,096 | Recovery records per connection |
+| `maximum_recovery_bytes` | 16 MiB | Retained recovery bytes per connection |
+| `maximum_queued_outbound_packets` | 256 | Queued messages per connection |
+| `maximum_queued_outbound_bytes` | 16 MiB | Queued payload bytes per connection |
 | `maximum_ordered_bytes` | 16 MiB | Retained ordered payload bytes per connection |
 | `maximum_split_bytes` | 4 MiB | Maximum reassembled message size |
 | `maximum_split_bytes_per_connection` | 16 MiB | Aggregate split payload storage per connection |

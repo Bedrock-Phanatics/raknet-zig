@@ -7,6 +7,7 @@ const recovery = @import("../reliability/recovery.zig");
 const rtt = @import("../reliability/rtt.zig");
 const receiver = @import("receiver.zig");
 const transmitter = @import("transmitter.zig");
+const outbound_queue = @import("outbound_queue.zig");
 const frame = @import("../protocol/frame.zig");
 
 pub const Incoming = union(enum) {
@@ -162,6 +163,7 @@ pub const Core = struct {
     config: Config,
     receiver_state: receiver.Receiver,
     transmitter_state: transmitter.Transmitter,
+    outbound_state: outbound_queue.Queue,
     recovery_state: recovery.Recovery,
     congestion_state: congestion.Controller,
     rtt_state: rtt.Estimator,
@@ -173,14 +175,17 @@ pub const Core = struct {
         if (mtu < config.minimum_mtu or mtu > config.maximum_mtu) return error.InvalidMtu;
         var receiver_state = try receiver.Receiver.init(allocator, config);
         errdefer receiver_state.deinit();
-        var recovery_state = try recovery.Recovery.init(allocator, config.maximum_retransmissions, config.maximum_queued_outbound_bytes, 8);
+        var recovery_state = try recovery.Recovery.init(allocator, config.maximum_retransmissions, config.maximum_recovery_bytes, 8);
         errdefer recovery_state.deinit();
+        var outbound_state = try outbound_queue.Queue.init(allocator, config.maximum_queued_outbound_packets, config.maximum_queued_outbound_bytes);
+        errdefer outbound_state.deinit();
         const ack_records = try allocator.alloc(ack.Record, config.maximum_ack_records);
         return .{
             .allocator = allocator,
             .config = config,
             .receiver_state = receiver_state,
             .transmitter_state = try transmitter.Transmitter.init(mtu, config),
+            .outbound_state = outbound_state,
             .recovery_state = recovery_state,
             .congestion_state = try congestion.Controller.init(mtu),
             .rtt_state = try rtt.Estimator.init(config.minimum_rto_ms, config.maximum_rto_ms),
@@ -190,6 +195,7 @@ pub const Core = struct {
     pub fn deinit(self: *Core) void {
         self.receiver_state.deinit();
         self.recovery_state.deinit();
+        self.outbound_state.deinit();
         self.allocator.free(self.ack_records);
         self.* = undefined;
     }
@@ -285,6 +291,22 @@ test "core validates ACKs against actual send state" {
     try std.testing.expectEqual(@as(usize, 1), result.acknowledged.packets);
     try std.testing.expectEqual(@as(?u64, 50), result.acknowledged.rtt_sample_ms);
     try std.testing.expectEqual(@as(usize, 0), (try core.processIncoming(wire, 160, &unused, Collector.discard)).acknowledged.packets);
+}
+
+test "recovery and outbound queue byte limits are independent" {
+    var recovery_limited: Config = .{};
+    recovery_limited.maximum_recovery_bytes = 1;
+    recovery_limited.maximum_queued_outbound_bytes = 1024;
+    var first = try Core.init(std.testing.allocator, 1200, recovery_limited);
+    defer first.deinit();
+    try std.testing.expectError(error.RecoveryBytesExceeded, first.trackSent(1, "xx", 2, 0));
+
+    var queue_limited: Config = .{};
+    queue_limited.maximum_recovery_bytes = 2;
+    queue_limited.maximum_queued_outbound_bytes = 1;
+    var second = try Core.init(std.testing.allocator, 1200, queue_limited);
+    defer second.deinit();
+    try second.trackSent(1, "xx", 2, 0);
 }
 test "incoming failures keep their origin and commit safety" {
     const truncated = classifyIncomingError(error.Truncated);

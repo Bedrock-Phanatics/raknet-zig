@@ -11,6 +11,7 @@ pub const Config = struct {
     receive_window: usize = 4096,
     reliable_window: usize = 4096,
     maximum_retransmissions: usize = 4096,
+    maximum_recovery_bytes: usize = 16 * 1024 * 1024,
     maximum_order_channels: usize = 32,
     maximum_ordered_packets: usize = 4096,
     maximum_ordered_bytes: usize = 16 * 1024 * 1024,
@@ -21,6 +22,7 @@ pub const Config = struct {
     split_timeout_ms: u32 = 15_000,
     maximum_pending_handshakes: usize = 4096,
     maximum_connections: usize = 4096,
+    maximum_queued_outbound_packets: usize = 256,
     maximum_queued_outbound_bytes: usize = 16 * 1024 * 1024,
     maximum_packets_per_iteration: usize = 256,
     idle_timeout_ms: u32 = 10_000,
@@ -35,12 +37,13 @@ pub const Config = struct {
         if (self.maximum_acknowledged_datagrams == 0 or self.maximum_acknowledged_datagrams > 0x800000) return error.InvalidConfiguration;
         if (self.receive_window == 0 or self.receive_window > 0x7fffff) return error.InvalidConfiguration;
         if (self.reliable_window == 0 or self.reliable_window > 0x7fffff) return error.InvalidConfiguration;
-        if (self.maximum_retransmissions == 0 or self.maximum_order_channels == 0 or self.maximum_order_channels > 256) return error.InvalidConfiguration;
+        if (self.maximum_retransmissions == 0 or self.maximum_recovery_bytes == 0 or self.maximum_order_channels == 0 or self.maximum_order_channels > 256) return error.InvalidConfiguration;
         if (self.maximum_ordered_packets == 0 or self.maximum_ordered_bytes == 0 or self.maximum_split_parts < 2) return error.InvalidConfiguration;
         if (self.maximum_split_bytes == 0 or self.maximum_split_bytes_per_connection < self.maximum_split_bytes) return error.InvalidConfiguration;
         if (self.maximum_concurrent_splits == 0 or self.split_timeout_ms == 0) return error.InvalidConfiguration;
         if (self.maximum_pending_handshakes == 0 or self.maximum_connections == 0 or self.maximum_connections > 65_536) return error.InvalidConfiguration;
-        if (self.maximum_queued_outbound_bytes == 0 or self.maximum_packets_per_iteration == 0 or self.maximum_packets_per_iteration > 4096) return error.InvalidConfiguration;
+        if (self.maximum_queued_outbound_packets == 0 or self.maximum_queued_outbound_packets >= std.math.maxInt(u32) or self.maximum_queued_outbound_bytes == 0) return error.InvalidConfiguration;
+        if (self.maximum_packets_per_iteration == 0 or self.maximum_packets_per_iteration > 4096) return error.InvalidConfiguration;
         if (self.idle_timeout_ms == 0 or self.minimum_rto_ms == 0 or self.minimum_rto_ms > self.maximum_rto_ms) return error.InvalidConfiguration;
     }
 };
@@ -49,5 +52,14 @@ test "default configuration is internally consistent" {
     try Config.validate(.{});
     var bad: Config = .{};
     bad.receive_window = 0x800000;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.maximum_recovery_bytes = 0;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.maximum_queued_outbound_packets = 0;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.maximum_queued_outbound_bytes = 0;
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
 }

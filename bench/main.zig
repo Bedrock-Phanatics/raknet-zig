@@ -87,6 +87,13 @@ pub fn main(init: std.process.Init) !void {
     }
     const linear_scan_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
 
+    const due_turns: usize = 100_000;
+    const due_one_256 = try benchmarkDueBatch(io, 256, 1, due_turns);
+    const due_one_4096 = try benchmarkDueBatch(io, 4096, 1, due_turns);
+    const due_many_turns: usize = 10_000;
+    const due_64_4096 = try benchmarkDueBatch(io, 4096, 64, due_many_turns);
+    checksum +%= due_one_256.checksum +% due_one_4096.checksum +% due_64_4096.checksum;
+
     const wire_count = 64;
     const frames_per_datagram = 8;
     var datagram_storage: [wire_count][512]u8 = undefined;
@@ -139,6 +146,9 @@ pub fn main(init: std.process.Init) !void {
             "deadline_reschedule_4096: {d:.2} ns/op\n" ++
             "deadline_next_4096: {d:.2} ns/turn\n" ++
             "deadline_linear_scan_4096: {d:.2} ns/turn\n" ++
+            "timer_due_1_of_256: {d:.2} ns/turn\n" ++
+            "timer_due_1_of_4096: {d:.2} ns/turn\n" ++
+            "timer_due_64_of_4096: {d:.2} ns/turn\n" ++
             "datagram_parse_1pass_8_frames: {d:.2} ns/op\n" ++
             "datagram_parse_2pass_8_frames: {d:.2} ns/op\n" ++
             "datagram_parse_descriptors_8_frames: {d:.2} ns/op\n" ++
@@ -150,6 +160,9 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(scheduler_update_ns)) / @as(f64, @floatFromInt(scheduler_iterations)),
             @as(f64, @floatFromInt(scheduler_peek_ns)) / @as(f64, @floatFromInt(timer_turns)),
             @as(f64, @floatFromInt(linear_scan_ns)) / @as(f64, @floatFromInt(timer_turns)),
+            @as(f64, @floatFromInt(due_one_256.nanoseconds)) / @as(f64, @floatFromInt(due_turns)),
+            @as(f64, @floatFromInt(due_one_4096.nanoseconds)) / @as(f64, @floatFromInt(due_turns)),
+            @as(f64, @floatFromInt(due_64_4096.nanoseconds)) / @as(f64, @floatFromInt(due_many_turns)),
             @as(f64, @floatFromInt(one_pass_ns)) / @as(f64, @floatFromInt(parser_iterations)),
             @as(f64, @floatFromInt(two_pass_ns)) / @as(f64, @floatFromInt(parser_iterations)),
             @as(f64, @floatFromInt(descriptor_ns)) / @as(f64, @floatFromInt(parser_iterations)),
@@ -157,6 +170,36 @@ pub fn main(init: std.process.Init) !void {
             checksum,
         },
     );
+}
+
+const DueMeasurement = struct { nanoseconds: u64, checksum: usize };
+
+fn benchmarkDueBatch(io: std.Io, capacity: usize, due_per_turn: usize, turns: usize) !DueMeasurement {
+    std.debug.assert(due_per_turn > 0 and due_per_turn <= capacity);
+    var queue = try deadline_queue.Queue.init(std.heap.page_allocator, capacity);
+    defer queue.deinit();
+    const popped = try std.heap.page_allocator.alloc(deadline_queue.Entry, due_per_turn);
+    defer std.heap.page_allocator.free(popped);
+
+    for (0..capacity) |index| {
+        var key: deadline_queue.Key = @splat(0);
+        key[0] = @truncate(index);
+        key[1] = @truncate(index >> 8);
+        try queue.upsert(key, if (index < due_per_turn) 0 else std.math.maxInt(u64));
+    }
+
+    var checksum: usize = 0;
+    const start = std.Io.Clock.awake.now(io);
+    for (0..turns) |_| {
+        for (popped) |*entry| entry.* = queue.popDue(0).?;
+        for (popped) |entry| {
+            checksum +%= entry.key[0];
+            try queue.upsert(entry.key, 0);
+        }
+        std.mem.doNotOptimizeAway(queue.peek());
+    }
+    const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    return .{ .nanoseconds = nanoseconds, .checksum = checksum };
 }
 
 fn parseOnePass(wire: []const u8) !usize {

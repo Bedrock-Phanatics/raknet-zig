@@ -64,6 +64,7 @@ test {
     _ = @import("security/rate_limit.zig");
     _ = @import("session/offline_handshake.zig");
     _ = @import("session/deadline_queue.zig");
+    _ = @import("session/outbound_queue.zig");
     _ = @import("session/receiver.zig");
     _ = @import("session/transmitter.zig");
     _ = @import("session/core.zig");
