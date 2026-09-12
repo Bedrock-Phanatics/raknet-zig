@@ -136,7 +136,13 @@ pub const Client = struct {
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
-        const message = try receiveTimed(&self.socket.value, self.io, self.receive_buffer, wait);
+        const message = receiveTimed(&self.socket.value, self.io, self.receive_buffer, wait) catch |err| switch (err) {
+            error.Timeout => {
+                try self.processTimers(time.nowMilliseconds(self.io));
+                return error.Timeout;
+            },
+            else => return err,
+        };
         if (!std.meta.eql(message.from, self.server) or message.flags.trunc) return 0;
         const now_ms = time.nowMilliseconds(self.io);
         self.last_seen_ms = now_ms;
@@ -399,7 +405,7 @@ test "client and server complete a real loopback handshake" {
 
     const retransmission_deadline = client.core.nextRetransmissionDeadline().?;
     try std.testing.expectEqual(retransmission_deadline, client.nextDeadline().?);
-    try client.processTimers(retransmission_deadline);
+    try std.testing.expectError(error.Timeout, client.poll(.none, &collector, ClientCollector.collect));
     try std.testing.expect(client.core.nextRetransmissionDeadline().? > retransmission_deadline);
     try std.testing.expectError(error.ConnectionTimedOut, client.processTimers(std.math.maxInt(u64)));
     try std.testing.expect(client.nextDeadline() == null);
