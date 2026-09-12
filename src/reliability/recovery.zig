@@ -1,6 +1,7 @@
 const std = @import("std");
 const ack = @import("../protocol/ack.zig");
 const uint24 = @import("../util/uint24.zig");
+const time = @import("../util/time.zig");
 
 const Record = struct {
     data: []u8,
@@ -47,7 +48,7 @@ pub const Recovery = struct {
         if (data.len > self.maximum_bytes -| self.total_bytes) return error.RecoveryBytesExceeded;
         const copy = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(copy);
-        const deadline_ms = now_ms +| rto_ms;
+        const deadline_ms = time.deadline(now_ms, rto_ms);
         try self.records.put(self.allocator, sequence, .{ .data = copy, .sent_ms = now_ms, .deadline_ms = deadline_ms, .in_flight_bytes = in_flight_bytes });
         self.total_bytes += copy.len;
         self.deadline_rebuild_remaining = 0;
@@ -66,7 +67,7 @@ pub const Recovery = struct {
             needs_recompute = needs_recompute or self.next_deadline_ms == removed.value.deadline_ms;
             result.packets += 1;
             result.bytes +|= removed.value.in_flight_bytes;
-            if (removed.value.transmissions == 1) result.rtt_sample_ms = now_ms -| removed.value.sent_ms;
+            if (removed.value.transmissions == 1) result.rtt_sample_ms = time.elapsed(now_ms, removed.value.sent_ms);
             self.total_bytes -= removed.value.data.len;
             self.allocator.free(removed.value.data);
         }
@@ -127,7 +128,7 @@ pub const Recovery = struct {
             output[count] = .{ .sequence = entry.key_ptr.*, .data = record.data, .in_flight_bytes = record.in_flight_bytes, .timed_out = record.deadline_ms < now_ms };
             count += 1;
             record.transmissions += 1;
-            record.deadline_ms = now_ms +| rto_ms;
+            record.deadline_ms = time.deadline(now_ms, rto_ms);
             self.includeRebuiltDeadline(record.deadline_ms);
         }
         self.deadline_rebuild_remaining -= inspected;
@@ -191,4 +192,17 @@ test "bounded recovery scans resume fairly" {
     }
     for (seen) |present| try std.testing.expect(present);
     try std.testing.expectEqual(@as(?u64, 1011), recovery.nextDeadline());
+}
+
+test "recovery deadlines saturate on long clock advances" {
+    var recovery = try Recovery.init(std.testing.allocator, 1, 1, 3);
+    defer recovery.deinit();
+    try recovery.track(1, "x", 1, std.math.maxInt(u64) - 1, 50);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), recovery.nextDeadline());
+
+    var due: [1]Due = undefined;
+    const batch = recovery.collectDue(std.math.maxInt(u64), 50, &due, 1);
+    try std.testing.expectEqual(@as(usize, 1), batch.inspected);
+    try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), recovery.nextDeadline());
 }

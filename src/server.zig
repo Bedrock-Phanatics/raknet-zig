@@ -85,7 +85,7 @@ pub const Session = struct {
         const scratch = try allocator.alloc(u8, mtu);
         errdefer allocator.free(scratch);
         const pending_acks = try allocator.alloc(u32, ack_capacity);
-        self.* = .{ .allocator = allocator, .socket = socket, .address = address, .key = key, .core = core, .scratch = scratch, .pending_acks = pending_acks, .deadlines = deadlines, .client_guid = client_guid, .mtu = mtu, .last_seen_ms = now_ms, .handshake_deadline_ms = now_ms +| handshake_timeout_ms, .idle_timeout_ms = config.idle_timeout_ms };
+        self.* = .{ .allocator = allocator, .socket = socket, .address = address, .key = key, .core = core, .scratch = scratch, .pending_acks = pending_acks, .deadlines = deadlines, .client_guid = client_guid, .mtu = mtu, .last_seen_ms = now_ms, .handshake_deadline_ms = time.deadline(now_ms, handshake_timeout_ms), .idle_timeout_ms = config.idle_timeout_ms };
         return self;
     }
     fn destroy(self: *Session) void {
@@ -170,7 +170,7 @@ pub const Session = struct {
         return sent;
     }
     fn schedule(self: *Session) !void {
-        var deadline = self.last_seen_ms +| self.idle_timeout_ms;
+        var deadline = time.deadline(self.last_seen_ms, self.idle_timeout_ms);
         if (self.state == .connecting) deadline = @min(deadline, self.handshake_deadline_ms);
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
@@ -488,8 +488,8 @@ pub const Listener = struct {
                 self.removeSession(entry.key, callbacks);
                 continue;
             }
-            if ((session.state == .connecting and now_ms >= session.handshake_deadline_ms) or
-                now_ms -| session.last_seen_ms >= session.idle_timeout_ms)
+            if ((session.state == .connecting and time.reached(now_ms, session.handshake_deadline_ms)) or
+                time.reached(now_ms, time.deadline(session.last_seen_ms, session.idle_timeout_ms)))
             {
                 stats.sessions_expired += 1;
                 self.removeSession(entry.key, callbacks);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const time = @import("../util/time.zig");
 
 pub const Entry = struct { key: u64 = 0, tokens: u64 = 0, updated_ms: u64 = 0, occupied: bool = false };
 pub const Options = struct {
@@ -43,9 +44,9 @@ fn scaled(value: u32) u64 {
     return @as(u64, value) * scale;
 }
 fn refill(tokens: *u64, updated_ms: *u64, now_ms: u64, per_second: u32, burst: u32) void {
-    const elapsed = now_ms -| updated_ms.*;
-    if (elapsed == 0) return;
-    tokens.* = @min(scaled(burst), tokens.* +| (elapsed *| per_second));
+    const elapsed_ms = time.elapsed(now_ms, updated_ms.*);
+    if (elapsed_ms == 0) return;
+    tokens.* = @min(scaled(burst), tokens.* +| (elapsed_ms *| per_second));
     updated_ms.* = now_ms;
 }
 
@@ -58,4 +59,11 @@ test "per-source and global buckets are bounded" {
     try std.testing.expect(limiter.allow(2, 1, 0));
     try std.testing.expect(!limiter.allow(3, 1, 0));
     try std.testing.expect(limiter.allow(1, 1, 500));
+}
+
+test "long clock advances saturate token refill" {
+    var entries: [1]Entry = undefined;
+    var limiter = try Limiter.init(&entries, .{ .tokens_per_second = 1, .burst = 1, .global_tokens_per_second = 1, .global_burst = 1 }, 0);
+    try std.testing.expect(limiter.allow(1, 1, 0));
+    try std.testing.expect(limiter.allow(1, 1, std.math.maxInt(u64)));
 }

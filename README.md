@@ -20,12 +20,9 @@ is constrained by explicit connection, memory, packet, window, and work limits.
 - Reliable, ordered, and sequenced delivery modes
 - ACK/NACK handling, RTT estimation, retransmission, and congestion control
 - Bounded split-packet reassembly and ordered-packet storage
-- IPv4 and IPv6 address codecs
-- Batched listener reads where supported by the Zig I/O backend
-- Deadline-driven server maintenance without listener-wide session scans
-- Stateless HMAC handshake cookies and per-source/global rate limiting
-- Aggregate memory quotas for remotely created session state
-- Unit, integration, adversarial, deterministic fuzz, and microbenchmark targets
+- Batched reads and deadline-driven maintenance
+- Stateless handshake cookies, rate limiting, and session memory quotas
+- IPv4 and IPv6 support
 
 ## Requirements
 
@@ -107,21 +104,16 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`Server.listen` binds the UDP socket and owns all listener resources.
-`Server.poll` processes one available receive batch and any due session work.
-`Server.destroy` closes the socket, destroys every session, and releases all
-listener allocations.
-
-`Server.poll` returns `PollStats` counters for received datagrams, dropped or
-malformed traffic, expired/failed sessions, and failure classes suitable for
-operational metrics.
+`Server.listen` binds the UDP socket and owns the listener resources.
+`Server.poll` processes an available receive batch, dispatches callbacks, runs
+due timers, and returns `PollStats`. `Server.destroy` closes all sessions and
+releases the listener.
 
 Custom event loops can call `Server.nextDeadline` to read the earliest protocol
 deadline and `Server.processTimers` to run due work without receiving a packet.
-Deadlines and the `now_ms` argument use monotonic milliseconds from the same
-`std.Io.Clock.awake` clock. `Server.poll` already processes due timers.
-Both `poll` methods treat the caller timeout as an upper bound and shorten it to
-the next protocol deadline automatically.
+Deadlines and `now_ms` use monotonic milliseconds from `std.Io.Clock.awake`.
+Both `poll` methods treat their timeout as an upper bound and shorten it to the
+next protocol deadline.
 
 A `Session` is owned by its listener. Use `Session.send`, `Session.isConnected`,
 and `Session.rttMs` only while the session is live. Do not retain a session
@@ -153,13 +145,11 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`Client.connect` completes the offline and connected handshakes before returning.
-`Client.poll` processes one incoming datagram. `Client.close` closes the transport;
-`Client.destroy` also releases all client resources.
-
-`Client.nextDeadline` reports its earliest idle, split-expiry, or retransmission
-deadline. `Client.processTimers` advances due work directly and uses the same
-monotonic-millisecond clock contract as the server.
+`Client.connect` completes both handshakes before returning. `Client.poll`
+processes one datagram and due timer work. `Client.close` closes the transport;
+`Client.destroy` also releases its resources. Custom loops can use
+`Client.nextDeadline` and `Client.processTimers` with the same clock contract as
+the server.
 
 ## Payload ownership
 
@@ -201,9 +191,9 @@ the listener reports it separately from malformed traffic.
 ## Configuration
 
 `raknet.Config` contains client/server protocol limits. `raknet.ServerOptions`
-and `raknet.ClientOptions` contain endpoint-specific settings. Defaults are safe
-general-purpose starting points, but production deployments should set limits
-from expected traffic, concurrency, and available memory.
+and `raknet.ClientOptions` contain endpoint settings. Defaults are bounded
+starting points. Production deployments should tune them for expected traffic,
+concurrency, and available memory.
 
 The most important controls are:
 
@@ -227,14 +217,12 @@ See [`src/config.zig`](src/config.zig), [`src/server.zig`](src/server.zig), and
 
 Operational guidance:
 
-- Size `maximum_connections` and `maximum_session_memory_bytes` together. The
-  lower effective limit wins.
+- Size `maximum_connections` and `maximum_session_memory_bytes` together.
 - Poll timeouts are upper bounds. Use `.none` to wait until traffic or the next
   protocol deadline, or pass a shorter timeout for application work.
 - Keep `maximum_datagram_size` at or above `maximum_mtu`. Negotiated MTU controls
   emitted datagram size.
-- Split-part, split-byte, concurrent-assembly, recovery, and ordered-storage
-  limits should be reviewed as one memory budget.
+- Review split, recovery, and ordered-storage limits as one memory budget.
 - `Listener`, `Session`, and `Client` are single-owner objects. Call them from one
   event-loop context; the packet path intentionally uses no locks.
 
@@ -264,11 +252,8 @@ zig build test -Doptimize=ReleaseSafe
 zig build bench
 ```
 
-Unit tests stay beside their modules; repository-level adversarial and fuzz
-coverage lives in `tests/`. The default test run includes both. Increase the fuzz
-workload with
-`-Dfuzz-iterations=<count>`. Benchmarks are isolated in-memory regression tools,
-not network-throughput claims.
+The default test run includes unit, integration, adversarial, and deterministic
+fuzz coverage. Increase the workload with `-Dfuzz-iterations=<count>`.
 
 ## License
 

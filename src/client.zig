@@ -109,7 +109,7 @@ pub const Client = struct {
     /// Returns the next absolute deadline in monotonic milliseconds.
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
-        var deadline = self.last_seen_ms +| self.core.config.idle_timeout_ms;
+        var deadline = time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
         return deadline;
@@ -118,7 +118,7 @@ pub const Client = struct {
     /// Processes due timers without waiting for socket traffic.
     pub fn processTimers(self: *Client, now_ms: u64) !void {
         if (self.closed) return error.ConnectionClosed;
-        if (now_ms -| self.last_seen_ms >= self.core.config.idle_timeout_ms) {
+        if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms))) {
             self.abort();
             return error.ConnectionTimedOut;
         }

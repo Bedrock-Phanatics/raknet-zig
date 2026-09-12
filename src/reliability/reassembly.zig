@@ -1,6 +1,7 @@
 const std = @import("std");
 const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 const OwnedPayload = @import("../payload.zig").OwnedPayload;
+const time = @import("../util/time.zig");
 
 const Fragment = struct { data: ?[]u8 = null };
 const Assembly = struct {
@@ -138,8 +139,9 @@ pub const Reassembler = struct {
             };
             self.scan_index = if (iterator.index == capacity) 0 else iterator.index;
             inspected += 1;
-            if (now_ms -| entry.value_ptr.updated_ms < self.limits.timeout_ms) {
-                self.includeRebuiltDeadline(entry.value_ptr.updated_ms +| self.limits.timeout_ms);
+            const deadline_ms = time.deadline(entry.value_ptr.updated_ms, self.limits.timeout_ms);
+            if (!time.reached(now_ms, deadline_ms)) {
+                self.includeRebuiltDeadline(deadline_ms);
                 continue;
             }
             self.freeAssembly(entry.value_ptr);
@@ -168,7 +170,7 @@ pub const Reassembler = struct {
         self.next_deadline_ms = null;
         var iterator = self.assemblies.valueIterator();
         while (iterator.next()) |assembly| {
-            const deadline = assembly.updated_ms +| self.limits.timeout_ms;
+            const deadline = time.deadline(assembly.updated_ms, self.limits.timeout_ms);
             self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, deadline) else deadline;
         }
     }
@@ -304,4 +306,19 @@ test "bounded split expiry resumes fairly" {
     try std.testing.expectEqual(@as(usize, 1), expired);
     try std.testing.expectEqual(@as(usize, count - 1), value.assemblies.count());
     try std.testing.expectEqual(@as(?u64, 110), value.nextDeadline());
+}
+
+test "split expiry honors a saturated deadline" {
+    var value = try Reassembler.init(std.testing.allocator, .{
+        .maximum_parts = 2,
+        .maximum_bytes = 1,
+        .maximum_concurrent = 1,
+        .maximum_total_bytes = 1,
+        .timeout_ms = 10,
+    });
+    defer value.deinit();
+    try std.testing.expect((try value.push(1, 2, 0, "x", std.math.maxInt(u64) - 5)) == null);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), value.nextDeadline());
+    try std.testing.expectEqual(@as(usize, 1), value.expire(std.math.maxInt(u64), 1).expired);
+    try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
 }
