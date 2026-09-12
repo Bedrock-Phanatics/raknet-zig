@@ -56,6 +56,16 @@ pub const Recovery = struct {
         self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, deadline_ms) else deadline_ms;
     }
 
+    /// Removes a datagram whose socket send did not commit.
+    pub fn untrack(self: *Recovery, raw_sequence: u32) ?usize {
+        const removed = self.records.fetchRemove(uint24.normalize(raw_sequence)) orelse return null;
+        const rebuild = self.deadline_rebuild_remaining != 0 or self.next_deadline_ms == removed.value.deadline_ms;
+        self.total_bytes -= removed.value.data.len;
+        self.allocator.free(removed.value.data);
+        if (rebuild) self.recomputeNextDeadline();
+        return removed.value.in_flight_bytes;
+    }
+
     /// Unknown and duplicate ACKs are ignored, and iteration is bounded independently of the wire ranges.
     pub fn acknowledge(self: *Recovery, ranges: []const ack.Record, now_ms: u64, maximum_work: usize) !Acknowledged {
         var iterator = ack.SequenceIterator.init(ranges, maximum_work);
@@ -172,6 +182,17 @@ test "recovery owns once, ignores duplicate ACKs, and bounds retransmits" {
     try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(61, 50, &due, 2).items.len);
     try std.testing.expectEqualStrings("two", due[0].data);
     try std.testing.expectEqual(@as(?u64, 111), recovery.nextDeadline());
+}
+
+test "untrack releases failed-send ownership and repairs the deadline" {
+    var recovery = try Recovery.init(std.testing.allocator, 2, 16, 3);
+    defer recovery.deinit();
+    try recovery.track(1, "one", 4, 0, 10);
+    try recovery.track(2, "two", 5, 0, 20);
+    try std.testing.expectEqual(@as(?usize, 4), recovery.untrack(1));
+    try std.testing.expectEqual(@as(usize, 3), recovery.total_bytes);
+    try std.testing.expectEqual(@as(?u64, 20), recovery.nextDeadline());
+    try std.testing.expectEqual(@as(?usize, null), recovery.untrack(1));
 }
 
 test "bounded recovery scans resume fairly" {

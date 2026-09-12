@@ -110,10 +110,10 @@ pub const Transmitter = struct {
             };
             const wire_size = try std.math.add(usize, 4, try frame.encodedSize(value));
             if (wire_size > maximum_wire_bytes -| sent.wire_bytes) break;
-            if (packetization.reliability.hasReliableIndex()) _ = self.reserveReliable();
             const sequence = self.datagram_sequence;
             const wire = try datagram.encodeData(sequence, &.{value}, scratch[0..self.mtu]);
             try emit(context, sequence, packetization.reliability.hasReliableIndex(), wire);
+            if (packetization.reliability.hasReliableIndex()) _ = self.reserveReliable();
             self.datagram_sequence = uint24.add(sequence, 1);
             packetization.offset += amount;
             packetization.next_fragment += 1;

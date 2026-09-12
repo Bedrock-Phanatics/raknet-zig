@@ -252,8 +252,12 @@ pub const Core = struct {
             now_ms: u64,
             fn forward(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) transmitter.EmitError!void {
                 const bridge: *@This() = @ptrCast(@alignCast(raw));
+                const previous_newest = bridge.core.newest_sent;
                 if (reliable) try bridge.core.trackSent(sequence, wire, wire.len, bridge.now_ms);
-                try bridge.user_emit(bridge.user_context, wire);
+                bridge.user_emit(bridge.user_context, wire) catch |err| {
+                    if (reliable) bridge.core.rollbackSent(sequence, previous_newest);
+                    return err;
+                };
             }
         };
         var bridge: Bridge = .{ .core = self, .user_context = context, .user_emit = emit, .now_ms = now_ms };
@@ -314,6 +318,12 @@ pub const Core = struct {
         errdefer self.congestion_state.cancel(in_flight_bytes);
         try self.recovery_state.track(sequence, wire, in_flight_bytes, now_ms, self.rtt_state.rto());
         self.newest_sent = sequence;
+    }
+
+    fn rollbackSent(self: *Core, sequence: u32, previous_newest: u32) void {
+        const in_flight_bytes = self.recovery_state.untrack(sequence) orelse return;
+        self.congestion_state.cancel(in_flight_bytes);
+        self.newest_sent = previous_newest;
     }
 
     pub fn processIncoming(self: *Core, wire: []const u8, now_ms: u64, context: *anyopaque, deliver: receiver.DeliverFn) !Incoming {
@@ -501,6 +511,47 @@ test "immediate application sends cannot bypass queued progress" {
     try std.testing.expectError(error.OutboundQueuePending, core.send("later", .reliable_ordered, 0, &scratch, 0, &collector, Collector.emit));
     try std.testing.expectEqual(order_index, core.transmitter_state.order_indices[0]);
     try std.testing.expectEqual(@as(usize, 2), collector.count);
+}
+
+test "partial send failure rolls back only the failed datagram" {
+    const FailingEmitter = struct {
+        successful: usize = 0,
+        fn emit(raw: *anyopaque, _: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.successful == 1) return error.TransportFailure;
+            self.successful += 1;
+        }
+    };
+    const Collector = struct {
+        count: usize = 0,
+        fn emit(raw: *anyopaque, _: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    var scratch: [576]u8 = undefined;
+    var payload: [1200]u8 = @splat(1);
+    _ = try core.enqueueOutbound(.application, &payload, .reliable_ordered, 0);
+    var failing: FailingEmitter = .{};
+
+    try std.testing.expectError(error.TransportFailure, core.flushOutbound(.application, &scratch, 8, 0, &failing, FailingEmitter.emit));
+    try std.testing.expectEqual(@as(usize, 1), failing.successful);
+    try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.datagram_sequence);
+    try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.reliable_index);
+    try std.testing.expectEqual(@as(usize, 1), core.recovery_state.records.count());
+    try std.testing.expectEqual(@as(u64, 576), core.congestion_state.in_flight);
+    try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
+    const progress = core.outbound_packetization[@intFromEnum(outbound_queue.Lane.application)].?;
+    try std.testing.expectEqual(progress.capacity, progress.offset);
+
+    var collector: Collector = .{};
+    const completed = try core.flushOutbound(.application, &scratch, 8, 1, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 2), completed.datagrams);
+    try std.testing.expectEqual(@as(usize, 0), core.outbound_state.count(.application));
+    try std.testing.expectEqual(@as(usize, 3), core.recovery_state.records.count());
+    try std.testing.expectEqual(core.recovery_state.total_bytes, core.congestion_state.in_flight);
 }
 test "incoming failures keep their origin and commit safety" {
     const truncated = classifyIncomingError(error.Truncated);
