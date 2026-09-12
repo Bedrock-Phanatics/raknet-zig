@@ -211,6 +211,18 @@ pub const Core = struct {
     pub fn send(self: *Core, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         const wire_bytes = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
         if (wire_bytes > self.congestion_state.available()) return error.CongestionWindowFull;
+        var packetization = try self.transmitter_state.beginPacketization(payload.len, reliability, channel);
+        const sent = try self.sendAvailable(&packetization, payload, scratch, now_ms, context, emit);
+        if (!packetization.complete()) return error.CongestionWindowFull;
+        return sent;
+    }
+
+    pub fn beginPacketization(self: *Core, payload_len: usize, reliability: frame.Reliability, channel: u8) !transmitter.Packetization {
+        return self.transmitter_state.beginPacketization(payload_len, reliability, channel);
+    }
+
+    /// Advances a prepared message without exceeding the current congestion window.
+    pub fn sendAvailable(self: *Core, packetization: *transmitter.Packetization, payload: []const u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         const Bridge = struct {
             core: *Core,
             user_context: *anyopaque,
@@ -223,7 +235,8 @@ pub const Core = struct {
             }
         };
         var bridge: Bridge = .{ .core = self, .user_context = context, .user_emit = emit, .now_ms = now_ms };
-        return self.transmitter_state.send(payload, reliability, channel, scratch, &bridge, Bridge.forward);
+        const available = std.math.cast(usize, self.congestion_state.available()) orelse std.math.maxInt(usize);
+        return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, &bridge, Bridge.forward);
     }
     /// Copies a reliable datagram into bounded recovery storage before it is handed to the socket.
     pub fn trackSent(self: *Core, sequence: u32, wire: []const u8, in_flight_bytes: usize, now_ms: u64) !void {
@@ -313,6 +326,31 @@ test "recovery and outbound queue byte limits are independent" {
     var second = try Core.init(std.testing.allocator, 1200, queue_limited);
     defer second.deinit();
     try second.trackSent(1, "xx", 2, 0);
+}
+
+test "core packetization stops at the available congestion window" {
+    const Collector = struct {
+        count: usize = 0,
+        fn emit(raw: *anyopaque, _: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    core.congestion_state.window = 576;
+    var scratch: [576]u8 = undefined;
+    var payload: [1200]u8 = @splat(1);
+    var packetization = try core.beginPacketization(payload.len, .reliable_ordered, 0);
+    var collector: Collector = .{};
+
+    const first = try core.sendAvailable(&packetization, &payload, &scratch, 0, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 1), first.datagrams);
+    try std.testing.expectEqual(@as(u64, 0), core.congestion_state.available());
+    const blocked = try core.sendAvailable(&packetization, &payload, &scratch, 0, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 0), blocked.datagrams);
+    try std.testing.expectEqual(@as(usize, 1), collector.count);
+    try std.testing.expect(!packetization.complete());
 }
 test "incoming failures keep their origin and commit safety" {
     const truncated = classifyIncomingError(error.Truncated);
