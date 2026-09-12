@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
     var app: App = .{};
     while (true) {
         const stats = try listener.poll(
-            .{ .duration = .fromMilliseconds(10) },
+            .none,
             .{
                 .context = &app,
                 .connected = onConnected,
@@ -120,6 +120,8 @@ Custom event loops can call `Server.nextDeadline` to read the earliest protocol
 deadline and `Server.processTimers` to run due work without receiving a packet.
 Deadlines and the `now_ms` argument use monotonic milliseconds from the same
 `std.Io.Clock.awake` clock. `Server.poll` already processes due timers.
+Both `poll` methods treat the caller timeout as an upper bound and shorten it to
+the next protocol deadline automatically.
 
 A `Session` is owned by its listener. Use `Session.send`, `Session.isConnected`,
 and `Session.rttMs` only while the session is live. Do not retain a session
@@ -144,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
 
     var context: u8 = 0;
     _ = try client.poll(
-        .{ .duration = .fromMilliseconds(10) },
+        .none,
         &context,
         onMessage,
     );
@@ -227,8 +229,8 @@ Operational guidance:
 
 - Size `maximum_connections` and `maximum_session_memory_bytes` together. The
   lower effective limit wins.
-- Use a short finite poll timeout so protocol deadlines continue to advance when
-  the socket is idle.
+- Poll timeouts are upper bounds. Use `.none` to wait until traffic or the next
+  protocol deadline, or pass a shorter timeout for application work.
 - Keep `maximum_datagram_size` at or above `maximum_mtu`. Negotiated MTU controls
   emitted datagram size.
 - Split-part, split-byte, concurrent-assembly, recovery, and ordered-storage

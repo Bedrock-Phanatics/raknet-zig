@@ -46,6 +46,7 @@ test {
     _ = @import("net/backend.zig");
     _ = @import("util/uint24.zig");
     _ = @import("util/quota_allocator.zig");
+    _ = @import("util/time.zig");
     _ = @import("protocol/cursor.zig");
     _ = @import("protocol/connected.zig");
     _ = @import("protocol/datagram.zig");

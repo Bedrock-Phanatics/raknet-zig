@@ -41,6 +41,7 @@ pub const Socket = struct {
         var actual_failure = failure;
         if (actual_received == 0) if (actual_failure) |err| switch (err) {
             error.ConcurrencyUnavailable => {
+                if (timeout != .none) return err;
                 messages[0] = try self.value.receive(self.io, data_storage[0..self.maximum_datagram_size]);
                 actual_received = 1;
                 actual_failure = null;

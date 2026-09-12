@@ -14,6 +14,7 @@ const handshake = @import("session/offline_handshake.zig");
 const deadline_queue = @import("session/deadline_queue.zig");
 const receiver = @import("session/receiver.zig");
 const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
+const time = @import("util/time.zig");
 
 const EndpointKey = deadline_queue.Key;
 const State = enum { connecting, connected, closed };
@@ -99,10 +100,10 @@ pub const Session = struct {
     }
     pub fn send(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
         if (self.state != .connected) return error.NotConnected;
-        _ = self.sendAt(payload, reliability, channel, nowMilliseconds(self.socket.io)) catch |err| {
+        _ = self.sendAt(payload, reliability, channel, time.nowMilliseconds(self.socket.io)) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.state = .closed;
-                self.deadlines.upsert(self.key, nowMilliseconds(self.socket.io)) catch {};
+                self.deadlines.upsert(self.key, time.nowMilliseconds(self.socket.io)) catch {};
             }
             return err;
         };
@@ -204,7 +205,7 @@ pub const Listener = struct {
         const limiter_count = @min(options.config.maximum_pending_handshakes, 65_536);
         const rate_entries = try allocator.alloc(rate.Entry, limiter_count);
         errdefer allocator.free(rate_entries);
-        const limiter = try rate.Limiter.init(rate_entries, .{ .tokens_per_second = options.offline_rate_per_second, .burst = options.offline_burst, .global_tokens_per_second = options.global_offline_rate_per_second, .global_burst = options.global_offline_burst }, nowMilliseconds(io));
+        const limiter = try rate.Limiter.init(rate_entries, .{ .tokens_per_second = options.offline_rate_per_second, .burst = options.offline_burst, .global_tokens_per_second = options.global_offline_rate_per_second, .global_burst = options.global_offline_burst }, time.nowMilliseconds(io));
         const messages = try allocator.alloc(std.Io.net.IncomingMessage, options.receive_batch_size);
         errdefer allocator.free(messages);
         const receive_size = try std.math.mul(usize, options.receive_batch_size, options.config.maximum_datagram_size);
@@ -281,9 +282,10 @@ pub const Listener = struct {
     pub fn poll(self: *Listener, timeout: std.Io.Timeout, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         var stats: PollStats = .{};
-        const batch = self.socket.receiveMany(self.messages, self.receive_storage, timeout) catch |err| switch (err) {
+        const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
+        const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
             error.Timeout => {
-                self.processTimersInto(nowMilliseconds(self.io), callbacks, &stats);
+                self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats);
                 return stats;
             },
             else => return err,
@@ -292,7 +294,7 @@ pub const Listener = struct {
         for (batch.messages) |message| {
             stats.datagrams += 1;
             const key = endpointKey(message.from);
-            const now_ms = nowMilliseconds(self.io);
+            const now_ms = time.nowMilliseconds(self.io);
             if (self.sessions.get(key)) |session| {
                 if (message.data.len != 0 and switch (message.data[0]) {
                     @intFromEnum(offline.Id.unconnected_ping), @intFromEnum(offline.Id.unconnected_ping_open_connections), @intFromEnum(offline.Id.open_connection_request_1), @intFromEnum(offline.Id.open_connection_request_2) => true,
@@ -423,7 +425,7 @@ pub const Listener = struct {
                 },
             }
         }
-        self.processTimersInto(nowMilliseconds(self.io), callbacks, &stats);
+        self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats);
         return stats;
     }
 
@@ -510,10 +512,6 @@ fn toRakAddress(address: std.Io.net.IpAddress) offline.Address {
         .ip6 => |value| .{ .ipv6 = .{ .octets = value.bytes, .port = value.port, .flow = value.flow, .scope = value.interface.index } },
     };
 }
-fn nowMilliseconds(io: std.Io) u64 {
-    return @intCast(@max(@as(i96, 0), @divTrunc(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms)));
-}
-
 test "listener answers an offline ping over loopback" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");

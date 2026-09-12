@@ -9,6 +9,7 @@ const offline = @import("protocol/offline.zig");
 const recovery = @import("reliability/recovery.zig");
 const core_mod = @import("session/core.zig");
 const receiver = @import("session/receiver.zig");
+const time = @import("util/time.zig");
 
 pub const Options = struct {
     config: Config = .{},
@@ -53,7 +54,7 @@ pub const Client = struct {
         var random: [8]u8 = undefined;
         io.random(&random);
         const guid = if (options.client_guid != 0) options.client_guid else (std.mem.readInt(u64, &random, .little) | 0x8000_0000_0000_0000);
-        const deadline = deadlineAfter(io, options.handshake_timeout_ms);
+        const deadline = time.after(io, options.handshake_timeout_ms);
 
         const request1 = try offline.encodeOpenConnectionRequest1(options.protocol_version, options.mtu, scratch);
         const reply1_wire = try exchangeExpected(&socket, server, request1, receive_buffer, offline.Id.open_connection_reply_1, deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
@@ -68,9 +69,9 @@ pub const Client = struct {
 
         var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
         errdefer core.deinit();
-        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .frame_scratch = frame_scratch, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu, .last_seen_ms = nowMilliseconds(io) };
+        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .frame_scratch = frame_scratch, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu, .last_seen_ms = time.nowMilliseconds(io) };
         try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
-        self.last_seen_ms = nowMilliseconds(io);
+        self.last_seen_ms = time.nowMilliseconds(io);
         return self;
     }
 
@@ -78,7 +79,7 @@ pub const Client = struct {
         if (self.closed) return;
         self.closed = true;
         var payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
-        _ = self.sendWire(&payload, .reliable_ordered, 0, nowMilliseconds(self.io)) catch {};
+        _ = self.sendWire(&payload, .reliable_ordered, 0, time.nowMilliseconds(self.io)) catch {};
         self.socket.close();
     }
     fn abort(self: *Client) void {
@@ -96,7 +97,7 @@ pub const Client = struct {
     }
     pub fn send(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
         if (self.closed) return error.ConnectionClosed;
-        _ = self.sendWire(payload, reliability, channel, nowMilliseconds(self.io)) catch |err| {
+        _ = self.sendWire(payload, reliability, channel, time.nowMilliseconds(self.io)) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.abort();
             }
@@ -134,9 +135,10 @@ pub const Client = struct {
     /// The callback payload expires when the callback returns.
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
-        const message = try receiveTimed(&self.socket.value, self.io, self.receive_buffer, timeout);
+        const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
+        const message = try receiveTimed(&self.socket.value, self.io, self.receive_buffer, wait);
         if (!std.meta.eql(message.from, self.server) or message.flags.trunc) return 0;
-        const now_ms = nowMilliseconds(self.io);
+        const now_ms = time.nowMilliseconds(self.io);
         self.last_seen_ms = now_ms;
         _ = self.core.expireSplits(now_ms);
         const Bridge = struct {
@@ -190,13 +192,13 @@ pub const Client = struct {
 
     fn finishConnectedHandshake(self: *Client, deadline: std.Io.Timeout, retry_ms: u32, maximum_work: usize) !void {
         var control: [18]u8 = undefined;
-        _ = try self.sendWire(try connected.encodeConnectionRequest(self.client_guid, nowMilliseconds(self.io), &control), .reliable_ordered, 0, nowMilliseconds(self.io));
+        _ = try self.sendWire(try connected.encodeConnectionRequest(self.client_guid, time.nowMilliseconds(self.io), &control), .reliable_ordered, 0, time.nowMilliseconds(self.io));
         var work: usize = 0;
         while (work < maximum_work) : (work += 1) {
-            const attempt = earliest(deadline, deadlineAfter(self.io, retry_ms));
+            const attempt = time.earliest(self.io, deadline, time.after(self.io, retry_ms));
             const message = receiveTimed(&self.socket.value, self.io, self.receive_buffer, attempt) catch |err| switch (err) {
                 error.Timeout => {
-                    try self.flushRetransmissions(nowMilliseconds(self.io));
+                    try self.flushRetransmissions(time.nowMilliseconds(self.io));
                     continue;
                 },
                 else => return err,
@@ -216,7 +218,7 @@ pub const Client = struct {
                     value.accepted = true;
                 }
             };
-            const now_ms = nowMilliseconds(self.io);
+            const now_ms = time.nowMilliseconds(self.io);
             var state: Handshake = .{ .client = self, .now_ms = now_ms };
             const incoming = try self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &state, Handshake.deliver);
             if (incoming == .data) try self.flushReceipt(incoming.data);
@@ -269,7 +271,7 @@ pub const Client = struct {
 fn exchangeExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, request: []const u8, buffer: []u8, id: offline.Id, overall: std.Io.Timeout, retry_ms: u32, maximum_work: usize) ![]const u8 {
     while (std.Io.Clock.awake.now(socket.io).nanoseconds < overall.deadline.raw.nanoseconds) {
         try socket.send(server, request);
-        const attempt = earliest(overall, deadlineAfter(socket.io, retry_ms));
+        const attempt = time.earliest(socket.io, overall, time.after(socket.io, retry_ms));
         return receiveExpected(socket, server, buffer, id, attempt, maximum_work) catch |err| switch (err) {
             error.Timeout, error.HandshakeWorkLimitExceeded => continue,
             else => return err,
@@ -278,14 +280,9 @@ fn exchangeExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, reque
     return error.Timeout;
 }
 
-fn earliest(a: std.Io.Timeout, b: std.Io.Timeout) std.Io.Timeout {
-    if (a == .none) return b;
-    if (b == .none) return a;
-    return if (a.deadline.raw.nanoseconds < b.deadline.raw.nanoseconds) a else b;
-}
 fn receiveTimed(socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, timeout: std.Io.Timeout) !std.Io.net.IncomingMessage {
     return socket.receiveTimeout(io, buffer, timeout) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => try socket.receive(io, buffer),
+        error.ConcurrencyUnavailable => if (timeout == .none) try socket.receive(io, buffer) else return err,
         else => return err,
     };
 }
@@ -298,19 +295,12 @@ fn receiveExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, buffer
     }
     return error.HandshakeWorkLimitExceeded;
 }
-fn deadlineAfter(io: std.Io, milliseconds: u32) std.Io.Timeout {
-    return .{ .deadline = .{ .raw = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(milliseconds)), .clock = .awake } };
-}
 fn toRakAddress(address: std.Io.net.IpAddress) offline.Address {
     return switch (address) {
         .ip4 => |v| .{ .ipv4 = .{ .octets = v.bytes, .port = v.port } },
         .ip6 => |v| .{ .ipv6 = .{ .octets = v.bytes, .port = v.port, .flow = v.flow, .scope = v.interface.index } },
     };
 }
-fn nowMilliseconds(io: std.Io) u64 {
-    return @intCast(@max(@as(i96, 0), @divTrunc(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms)));
-}
-
 test "client and server complete a real loopback handshake" {
     const server_mod = @import("server.zig");
     const io = std.testing.io;
