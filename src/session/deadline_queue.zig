@@ -5,12 +5,14 @@ pub const Key = [23]u8;
 pub const Entry = struct {
     key: Key,
     deadline_ms: u64,
+    order: u64,
 };
 
 pub const Queue = struct {
     allocator: std.mem.Allocator,
     items: []Entry,
     len: usize = 0,
+    next_order: u64 = 0,
     indices: std.AutoHashMapUnmanaged(Key, usize) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Queue {
@@ -47,7 +49,7 @@ pub const Queue = struct {
         if (self.len == self.items.len) return error.DeadlineQueueFull;
         const index = self.len;
         self.len += 1;
-        self.items[index] = .{ .key = key, .deadline_ms = deadline_ms };
+        self.items[index] = .{ .key = key, .deadline_ms = deadline_ms, .order = self.takeOrder() };
         self.indices.putAssumeCapacityNoClobber(key, index);
         self.siftUp(index);
     }
@@ -116,7 +118,14 @@ pub const Queue = struct {
 
     fn less(a: Entry, b: Entry) bool {
         if (a.deadline_ms != b.deadline_ms) return a.deadline_ms < b.deadline_ms;
+        if (a.order != b.order) return a.order < b.order;
         return std.mem.order(u8, &a.key, &b.key) == .lt;
+    }
+
+    fn takeOrder(self: *Queue) u64 {
+        const order = self.next_order;
+        self.next_order +%= 1;
+        return order;
     }
 };
 
@@ -186,4 +195,26 @@ test "rescheduling never accumulates stale entries" {
     try std.testing.expectEqual(@as(usize, 0), queue.count());
     try std.testing.expectEqual(@as(u32, 0), queue.indices.count());
     for (seen) |present| try std.testing.expect(present);
+}
+
+test "equal due deadlines rotate after rescheduling" {
+    var queue = try Queue.init(std.testing.allocator, 3);
+    defer queue.deinit();
+
+    var first: Key = @splat(0);
+    var second: Key = @splat(0);
+    var third: Key = @splat(0);
+    first[0] = 1;
+    second[0] = 2;
+    third[0] = 3;
+    try queue.upsert(first, 10);
+    try queue.upsert(second, 10);
+    try queue.upsert(third, 10);
+
+    const popped = queue.popDue(10).?;
+    try std.testing.expectEqual(first, popped.key);
+    try queue.upsert(popped.key, popped.deadline_ms);
+    try std.testing.expectEqual(second, queue.popDue(10).?.key);
+    try std.testing.expectEqual(third, queue.popDue(10).?.key);
+    try std.testing.expectEqual(first, queue.popDue(10).?.key);
 }

@@ -69,8 +69,8 @@ pub const Receiver = struct {
         return self.splits.nextDeadline();
     }
 
-    pub fn expireSplits(self: *Receiver, now_ms: u64) usize {
-        return self.splits.expire(now_ms, self.config.maximum_packets_per_iteration);
+    pub fn expireSplits(self: *Receiver, now_ms: u64, maximum_work: usize) reassembly.ExpiryBatch {
+        return self.splits.expire(now_ms, maximum_work);
     }
 
     pub fn process(self: *Receiver, data: []const u8, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !Receipt {

@@ -12,7 +12,7 @@ const Record = struct {
 
 pub const Acknowledged = struct { packets: usize = 0, bytes: usize = 0, rtt_sample_ms: ?u64 = null };
 pub const Due = struct { sequence: u32, data: []const u8, in_flight_bytes: usize, timed_out: bool };
-pub const DueBatch = struct { items: []Due, exhausted: usize };
+pub const DueBatch = struct { items: []Due, exhausted: usize, inspected: usize };
 
 /// Owns one copy of each unacknowledged datagram. Capacity and total bytes are fixed by configuration.
 pub const Recovery = struct {
@@ -24,6 +24,8 @@ pub const Recovery = struct {
     total_bytes: usize = 0,
     next_deadline_ms: ?u64 = null,
     scan_index: u32 = 0,
+    deadline_rebuild_remaining: usize = 0,
+    deadline_rebuild_min: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, maximum_entries: usize, maximum_bytes: usize, maximum_transmissions: u8) !Recovery {
         if (maximum_entries == 0 or maximum_bytes == 0 or maximum_transmissions < 2 or maximum_entries > std.math.maxInt(u32)) return error.InvalidConfiguration;
@@ -48,6 +50,8 @@ pub const Recovery = struct {
         const deadline_ms = now_ms +| rto_ms;
         try self.records.put(self.allocator, sequence, .{ .data = copy, .sent_ms = now_ms, .deadline_ms = deadline_ms, .in_flight_bytes = in_flight_bytes });
         self.total_bytes += copy.len;
+        self.deadline_rebuild_remaining = 0;
+        self.deadline_rebuild_min = null;
         self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, deadline_ms) else deadline_ms;
     }
 
@@ -55,18 +59,18 @@ pub const Recovery = struct {
     pub fn acknowledge(self: *Recovery, ranges: []const ack.Record, now_ms: u64, maximum_work: usize) !Acknowledged {
         var iterator = ack.SequenceIterator.init(ranges, maximum_work);
         var result: Acknowledged = .{};
-        var removed_earliest = false;
-        errdefer if (removed_earliest) self.recomputeNextDeadline();
+        var needs_recompute = self.deadline_rebuild_remaining != 0;
+        errdefer if (result.packets != 0 and needs_recompute) self.recomputeNextDeadline();
         while (try iterator.next()) |sequence| {
             const removed = self.records.fetchRemove(sequence) orelse continue;
-            removed_earliest = removed_earliest or self.next_deadline_ms == removed.value.deadline_ms;
+            needs_recompute = needs_recompute or self.next_deadline_ms == removed.value.deadline_ms;
             result.packets += 1;
             result.bytes +|= removed.value.in_flight_bytes;
             if (removed.value.transmissions == 1) result.rtt_sample_ms = now_ms -| removed.value.sent_ms;
             self.total_bytes -= removed.value.data.len;
             self.allocator.free(removed.value.data);
         }
-        if (removed_earliest) self.recomputeNextDeadline();
+        if (result.packets != 0 and needs_recompute) self.recomputeNextDeadline();
         return result;
     }
 
@@ -78,16 +82,24 @@ pub const Recovery = struct {
             self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, record.deadline_ms) else record.deadline_ms;
             marked += 1;
         };
+        if (marked != 0) {
+            self.deadline_rebuild_remaining = 0;
+            self.deadline_rebuild_min = null;
+        }
         return marked;
     }
 
     /// Scans at most `maximum_work` records and borrows payloads until the next mutation.
     /// Each call resumes where the previous scan stopped.
     pub fn collectDue(self: *Recovery, now_ms: u64, rto_ms: u32, output: []Due, maximum_work: usize) DueBatch {
+        if (self.deadline_rebuild_remaining == 0) {
+            self.deadline_rebuild_remaining = self.records.count();
+            self.deadline_rebuild_min = null;
+        }
         var count: usize = 0;
         var inspected: usize = 0;
         var exhausted: usize = 0;
-        const visit_limit = @min(maximum_work, @as(usize, self.records.count()));
+        const visit_limit = @min(maximum_work, self.deadline_rebuild_remaining);
         const capacity = self.records.capacity();
         const start_index = if (self.scan_index < capacity) self.scan_index else 0;
         var iterator = self.records.iterator();
@@ -103,18 +115,24 @@ pub const Recovery = struct {
             self.scan_index = if (iterator.index == capacity) 0 else iterator.index;
             inspected += 1;
             const record = entry.value_ptr;
-            if (record.deadline_ms > now_ms) continue;
+            if (record.deadline_ms > now_ms) {
+                self.includeRebuiltDeadline(record.deadline_ms);
+                continue;
+            }
             if (record.transmissions >= self.maximum_transmissions) {
                 exhausted += 1;
+                self.includeRebuiltDeadline(record.deadline_ms);
                 continue;
             }
             output[count] = .{ .sequence = entry.key_ptr.*, .data = record.data, .in_flight_bytes = record.in_flight_bytes, .timed_out = record.deadline_ms < now_ms };
             count += 1;
             record.transmissions += 1;
             record.deadline_ms = now_ms +| rto_ms;
+            self.includeRebuiltDeadline(record.deadline_ms);
         }
-        self.recomputeNextDeadline();
-        return .{ .items = output[0..count], .exhausted = exhausted };
+        self.deadline_rebuild_remaining -= inspected;
+        if (self.deadline_rebuild_remaining == 0) self.next_deadline_ms = self.deadline_rebuild_min;
+        return .{ .items = output[0..count], .exhausted = exhausted, .inspected = inspected };
     }
 
     pub fn nextDeadline(self: Recovery) ?u64 {
@@ -122,11 +140,17 @@ pub const Recovery = struct {
     }
 
     fn recomputeNextDeadline(self: *Recovery) void {
+        self.deadline_rebuild_remaining = 0;
+        self.deadline_rebuild_min = null;
         self.next_deadline_ms = null;
         var iterator = self.records.valueIterator();
         while (iterator.next()) |record| {
             self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, record.deadline_ms) else record.deadline_ms;
         }
+    }
+
+    fn includeRebuiltDeadline(self: *Recovery, deadline_ms: u64) void {
+        self.deadline_rebuild_min = if (self.deadline_rebuild_min) |current| @min(current, deadline_ms) else deadline_ms;
     }
 };
 
@@ -159,10 +183,12 @@ test "bounded recovery scans resume fairly" {
     var due: [1]Due = undefined;
     for (0..count) |_| {
         const batch = recovery.collectDue(11, 1_000, &due, 1);
+        try std.testing.expectEqual(@as(usize, 1), batch.inspected);
         try std.testing.expectEqual(@as(usize, 1), batch.items.len);
         const sequence = batch.items[0].sequence;
         try std.testing.expect(!seen[sequence]);
         seen[sequence] = true;
     }
     for (seen) |present| try std.testing.expect(present);
+    try std.testing.expectEqual(@as(?u64, 1011), recovery.nextDeadline());
 }

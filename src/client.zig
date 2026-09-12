@@ -34,6 +34,7 @@ pub const Client = struct {
     server_guid: u64,
     mtu: u16,
     last_seen_ms: u64,
+    timer_cursor: u8 = 0,
     closed: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
@@ -121,14 +122,9 @@ pub const Client = struct {
             self.abort();
             return error.ConnectionTimedOut;
         }
-        if (self.core.nextSplitDeadline()) |deadline| if (deadline <= now_ms) {
-            _ = self.core.expireSplits(now_ms);
-        };
-        if (self.core.nextRetransmissionDeadline()) |deadline| if (deadline <= now_ms) {
-            self.flushRetransmissions(now_ms) catch |err| {
-                self.abort();
-                return err;
-            };
+        self.processDueTimers(now_ms) catch |err| {
+            self.abort();
+            return err;
         };
     }
 
@@ -146,7 +142,6 @@ pub const Client = struct {
         if (!std.meta.eql(message.from, self.server) or message.flags.trunc) return 0;
         const now_ms = time.nowMilliseconds(self.io);
         self.last_seen_ms = now_ms;
-        _ = self.core.expireSplits(now_ms);
         const Bridge = struct {
             client: *Client,
             context: *anyopaque,
@@ -189,7 +184,7 @@ pub const Client = struct {
             self.abort();
             return if (incoming == .data) incoming.data.delivered else 0;
         }
-        self.flushRetransmissions(now_ms) catch |err| {
+        self.processDueTimers(now_ms) catch |err| {
             if (core_mod.classifyTransitionError(.retransmission, err).disposition == .close_session) self.abort();
             return err;
         };
@@ -204,7 +199,7 @@ pub const Client = struct {
             const attempt = time.earliest(self.io, deadline, time.after(self.io, retry_ms));
             const message = receiveTimed(&self.socket.value, self.io, self.receive_buffer, attempt) catch |err| switch (err) {
                 error.Timeout => {
-                    try self.flushRetransmissions(time.nowMilliseconds(self.io));
+                    _ = try self.flushRetransmissions(time.nowMilliseconds(self.io), self.core.config.maximum_packets_per_iteration);
                     continue;
                 },
                 else => return err,
@@ -266,11 +261,36 @@ pub const Client = struct {
             self.socket.send(self.server, wire) catch return error.TransportFailure;
         }
     }
-    fn flushRetransmissions(self: *Client, now_ms: u64) !void {
+    fn processDueTimers(self: *Client, now_ms: u64) !void {
+        var remaining = self.core.config.maximum_packets_per_iteration;
+        var active: usize = @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
+            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
+        const start = self.timer_cursor;
+        var visited: usize = 0;
+        while (visited < 2 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 2;
+            const due = switch (timer) {
+                0 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
+                else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+            };
+            if (!due) continue;
+            const quota = @max(@as(usize, 1), remaining / active);
+            const used = switch (timer) {
+                0 => self.core.expireSplits(now_ms, quota).inspected,
+                else => try self.flushRetransmissions(now_ms, quota),
+            };
+            remaining -= @min(remaining, used);
+            active -= 1;
+            self.timer_cursor = @intCast((timer + 1) % 2);
+        }
+    }
+
+    fn flushRetransmissions(self: *Client, now_ms: u64, maximum_work: usize) !usize {
         var due: [256]recovery.Due = undefined;
-        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, self.core.config.maximum_packets_per_iteration)]);
+        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, maximum_work)], maximum_work);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
         for (batch.items) |item| self.socket.send(self.server, item.data) catch return error.TransportFailure;
+        return batch.inspected;
     }
 };
 

@@ -65,8 +65,10 @@ pub const Session = struct {
     core: core_mod.Core,
     scratch: []u8,
     pending_acks: []u32,
+    pending_ack_head: usize = 0,
     pending_ack_count: usize = 0,
     ack_deadline_ms: ?u64 = null,
+    timer_cursor: u8 = 0,
     deadlines: *deadline_queue.Queue,
     client_guid: u64,
     mtu: u16,
@@ -129,7 +131,8 @@ pub const Session = struct {
     fn queueReceipt(self: *Session, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
         if (receipt.acknowledge) |sequence| {
             if (self.pending_ack_count == self.pending_acks.len) try self.flushAcks();
-            self.pending_acks[self.pending_ack_count] = sequence;
+            const tail = (self.pending_ack_head + self.pending_ack_count) % self.pending_acks.len;
+            self.pending_acks[tail] = sequence;
             self.pending_ack_count += 1;
             self.ack_deadline_ms = if (self.ack_deadline_ms) |deadline| @min(deadline, now_ms) else now_ms;
             try self.schedule();
@@ -149,12 +152,22 @@ pub const Session = struct {
         }
     }
     fn flushAcks(self: *Session) !void {
-        for (self.pending_acks[0..self.pending_ack_count]) |sequence| {
+        _ = try self.flushAcksUpTo(self.pending_ack_count);
+    }
+    fn flushAcksUpTo(self: *Session, maximum_work: usize) !usize {
+        var sent: usize = 0;
+        while (sent < maximum_work and self.pending_ack_count != 0) : (sent += 1) {
+            const sequence = self.pending_acks[self.pending_ack_head];
             const wire = datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch) catch return error.InternalFailure;
             self.socket.send(self.address, wire) catch return error.TransportFailure;
+            self.pending_ack_head = (self.pending_ack_head + 1) % self.pending_acks.len;
+            self.pending_ack_count -= 1;
         }
-        self.pending_ack_count = 0;
-        self.ack_deadline_ms = null;
+        if (self.pending_ack_count == 0) {
+            self.pending_ack_head = 0;
+            self.ack_deadline_ms = null;
+        }
+        return sent;
     }
     fn schedule(self: *Session) !void {
         var deadline = self.last_seen_ms +| self.idle_timeout_ms;
@@ -164,11 +177,39 @@ pub const Session = struct {
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
         try self.deadlines.upsert(self.key, deadline);
     }
-    fn flushRetransmissions(self: *Session, now_ms: u64) !void {
+    fn processDueTimers(self: *Session, now_ms: u64, maximum_work: usize) !usize {
+        var remaining = maximum_work;
+        var active: usize = @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms) +
+            @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
+            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
+        const start = self.timer_cursor;
+        var visited: usize = 0;
+        while (visited < 3 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 3;
+            const due = switch (timer) {
+                0 => self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms,
+                1 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
+                else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+            };
+            if (!due) continue;
+            const quota = @max(@as(usize, 1), remaining / active);
+            const used = switch (timer) {
+                0 => try self.flushAcksUpTo(quota),
+                1 => self.core.expireSplits(now_ms, quota).inspected,
+                else => try self.flushRetransmissions(now_ms, quota),
+            };
+            remaining -= @min(remaining, used);
+            active -= 1;
+            self.timer_cursor = @intCast((timer + 1) % 3);
+        }
+        return maximum_work - remaining;
+    }
+    fn flushRetransmissions(self: *Session, now_ms: u64, maximum_work: usize) !usize {
         var due: [256]recovery.Due = undefined;
-        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, self.core.config.maximum_packets_per_iteration)]);
+        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, maximum_work)], maximum_work);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
         for (batch.items) |item| self.socket.send(self.address, item.data) catch return error.TransportFailure;
+        return batch.inspected;
     }
 };
 
@@ -188,6 +229,7 @@ pub const Listener = struct {
     messages: []std.Io.net.IncomingMessage,
     receive_storage: []u8,
     frame_scratch: []frame.Frame,
+    timer_entries: []deadline_queue.Entry,
     handshake_output: []u8,
     closed: bool = false,
     handshake_timeout_ms: u32,
@@ -215,6 +257,8 @@ pub const Listener = struct {
         errdefer allocator.free(handshake_output);
         const frame_scratch = try allocator.alloc(frame.Frame, options.config.maximum_packets_per_iteration);
         errdefer allocator.free(frame_scratch);
+        const timer_entries = try allocator.alloc(deadline_queue.Entry, options.config.maximum_packets_per_iteration);
+        errdefer allocator.free(timer_entries);
         var deadlines = try deadline_queue.Queue.init(allocator, options.config.maximum_connections);
         errdefer deadlines.deinit();
         var random: [80]u8 = undefined;
@@ -235,6 +279,7 @@ pub const Listener = struct {
             .messages = messages,
             .receive_storage = receive_storage,
             .frame_scratch = frame_scratch,
+            .timer_entries = timer_entries,
             .handshake_output = handshake_output,
             .handshake_timeout_ms = options.handshake_timeout_ms,
             .ack_capacity = options.receive_batch_size,
@@ -255,6 +300,7 @@ pub const Listener = struct {
         std.debug.assert(self.session_quota.used_bytes == 0);
         self.deadlines.deinit();
         self.close();
+        self.allocator.free(self.timer_entries);
         self.allocator.free(self.frame_scratch);
         self.allocator.free(self.handshake_output);
         self.allocator.free(self.receive_storage);
@@ -430,9 +476,13 @@ pub const Listener = struct {
     }
 
     fn processTimersInto(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats) void {
-        var work: usize = 0;
-        while (work < self.config.maximum_packets_per_iteration) : (work += 1) {
+        var due_count: usize = 0;
+        while (due_count < self.timer_entries.len) : (due_count += 1) {
             const entry = self.deadlines.popDue(now_ms) orelse break;
+            self.timer_entries[due_count] = entry;
+        }
+        var remaining = self.config.maximum_packets_per_iteration;
+        for (self.timer_entries[0..due_count], 0..) |entry, index| {
             const session = self.sessions.get(entry.key) orelse continue;
             if (session.state == .closed) {
                 self.removeSession(entry.key, callbacks);
@@ -445,25 +495,15 @@ pub const Listener = struct {
                 self.removeSession(entry.key, callbacks);
                 continue;
             }
-            if (session.ack_deadline_ms) |deadline| if (deadline <= now_ms) {
-                session.flushAcks() catch |err| {
-                    recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
-                    session.state = .closed;
-                    self.removeSession(entry.key, callbacks);
-                    continue;
-                };
+            const sessions_left = due_count - index;
+            const quota = @max(@as(usize, 1), remaining / sessions_left);
+            const used = session.processDueTimers(now_ms, quota) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.retransmission, err).class);
+                session.state = .closed;
+                self.removeSession(entry.key, callbacks);
+                continue;
             };
-            if (session.core.nextSplitDeadline()) |deadline| if (deadline <= now_ms) {
-                _ = session.core.expireSplits(now_ms);
-            };
-            if (session.core.nextRetransmissionDeadline()) |deadline| if (deadline <= now_ms) {
-                session.flushRetransmissions(now_ms) catch |err| {
-                    recordSessionFailure(stats, core_mod.classifyTransitionError(.retransmission, err).class);
-                    session.state = .closed;
-                    self.removeSession(entry.key, callbacks);
-                    continue;
-                };
-            };
+            remaining -= @min(remaining, used);
             session.schedule() catch {
                 recordSessionFailure(stats, .internal);
                 session.state = .closed;

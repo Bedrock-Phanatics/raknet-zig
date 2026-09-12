@@ -24,6 +24,8 @@ pub const Limits = struct {
     }
 };
 
+pub const ExpiryBatch = struct { expired: usize, inspected: usize };
+
 /// Reassembles fragments with bounded count, payload bytes, concurrency, metadata, and lifetime.
 pub const Reassembler = struct {
     allocator: std.mem.Allocator,
@@ -32,6 +34,8 @@ pub const Reassembler = struct {
     total_bytes: usize = 0,
     next_deadline_ms: ?u64 = null,
     scan_index: u32 = 0,
+    deadline_rebuild_remaining: usize = 0,
+    deadline_rebuild_min: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Reassembler {
         try limits.validate();
@@ -112,10 +116,14 @@ pub const Reassembler = struct {
         return .{ .allocator = self.allocator, .bytes = output };
     }
 
-    pub fn expire(self: *Reassembler, now_ms: u64, maximum_work: usize) usize {
+    pub fn expire(self: *Reassembler, now_ms: u64, maximum_work: usize) ExpiryBatch {
+        if (self.deadline_rebuild_remaining == 0) {
+            self.deadline_rebuild_remaining = self.assemblies.count();
+            self.deadline_rebuild_min = null;
+        }
         var expired: usize = 0;
         var inspected: usize = 0;
-        const visit_limit = @min(maximum_work, @as(usize, self.assemblies.count()));
+        const visit_limit = @min(maximum_work, self.deadline_rebuild_remaining);
         const capacity = self.assemblies.capacity();
         const start_index = if (self.scan_index < capacity) self.scan_index else 0;
         var iterator = self.assemblies.iterator();
@@ -130,13 +138,17 @@ pub const Reassembler = struct {
             };
             self.scan_index = if (iterator.index == capacity) 0 else iterator.index;
             inspected += 1;
-            if (now_ms -| entry.value_ptr.updated_ms < self.limits.timeout_ms) continue;
+            if (now_ms -| entry.value_ptr.updated_ms < self.limits.timeout_ms) {
+                self.includeRebuiltDeadline(entry.value_ptr.updated_ms +| self.limits.timeout_ms);
+                continue;
+            }
             self.freeAssembly(entry.value_ptr);
             _ = self.assemblies.remove(entry.key_ptr.*);
             expired += 1;
         }
-        self.recomputeNextDeadline();
-        return expired;
+        self.deadline_rebuild_remaining -= inspected;
+        if (self.deadline_rebuild_remaining == 0) self.next_deadline_ms = self.deadline_rebuild_min;
+        return .{ .expired = expired, .inspected = inspected };
     }
 
     pub fn nextDeadline(self: Reassembler) ?u64 {
@@ -151,12 +163,18 @@ pub const Reassembler = struct {
     }
 
     fn recomputeNextDeadline(self: *Reassembler) void {
+        self.deadline_rebuild_remaining = 0;
+        self.deadline_rebuild_min = null;
         self.next_deadline_ms = null;
         var iterator = self.assemblies.valueIterator();
         while (iterator.next()) |assembly| {
             const deadline = assembly.updated_ms +| self.limits.timeout_ms;
             self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, deadline) else deadline;
         }
+    }
+
+    fn includeRebuiltDeadline(self: *Reassembler, deadline_ms: u64) void {
+        self.deadline_rebuild_min = if (self.deadline_rebuild_min) |current| @min(current, deadline_ms) else deadline_ms;
     }
 
     fn freeAssembly(self: *Reassembler, assembly: *Assembly) void {
@@ -181,7 +199,7 @@ test "split assembly handles duplicates, conflicts, collision, and expiry" {
     try std.testing.expectError(error.SplitIdCollision, value.push(3, 3, 1, "y", 6));
     try std.testing.expect((try value.push(4, 2, 0, "z", 7)) == null);
     try std.testing.expectEqual(@as(?u64, 17), value.nextDeadline());
-    try std.testing.expectEqual(@as(usize, 1), value.expire(100, 2));
+    try std.testing.expectEqual(@as(usize, 1), value.expire(100, 2).expired);
     try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
 }
 
@@ -278,7 +296,12 @@ test "bounded split expiry resumes fairly" {
     value.recomputeNextDeadline();
 
     var expired: usize = 0;
-    for (0..count) |_| expired += value.expire(11, 1);
+    for (0..count) |_| {
+        const batch = value.expire(11, 1);
+        try std.testing.expect(batch.inspected <= 1);
+        expired += batch.expired;
+    }
     try std.testing.expectEqual(@as(usize, 1), expired);
     try std.testing.expectEqual(@as(usize, count - 1), value.assemblies.count());
+    try std.testing.expectEqual(@as(?u64, 110), value.nextDeadline());
 }
