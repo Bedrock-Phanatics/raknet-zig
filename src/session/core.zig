@@ -51,6 +51,19 @@ pub const SendHandle = struct { id: outbound_queue.Id, owner: u64 };
 pub const CancelResult = enum { canceled, not_found, in_progress };
 pub const FlushResult = transmitter.Sent;
 
+const QueuedMessages = struct {
+    iterator: outbound_queue.Iterator,
+
+    fn next(self: *@This()) ?transmitter.PackedMessage {
+        const message = self.iterator.next() orelse return null;
+        return .{
+            .payload = message.payload.bytes,
+            .reliability = message.reliability,
+            .channel = message.channel,
+        };
+    }
+};
+
 pub fn classifyIncomingError(err: anyerror) IncomingFailure {
     return switch (err) {
         error.DatagramTooLarge,
@@ -277,6 +290,33 @@ pub const Core = struct {
         };
     }
 
+    fn packQueued(self: *Core, lane: outbound_queue.Lane, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.PackResult {
+        const Bridge = struct {
+            core: *Core,
+            user_context: *anyopaque,
+            user_emit: SendFn,
+            now_ms: u64,
+            fn forward(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) transmitter.EmitError!void {
+                const bridge: *@This() = @ptrCast(@alignCast(raw));
+                const previous_newest = bridge.core.newest_sent;
+                if (reliable) try bridge.core.trackSent(sequence, wire, wire.len, bridge.now_ms);
+                bridge.user_emit(bridge.user_context, wire) catch |err| {
+                    if (reliable) bridge.core.rollbackSent(sequence, previous_newest);
+                    return err;
+                };
+            }
+        };
+        var bridge: Bridge = .{ .core = self, .user_context = context, .user_emit = emit, .now_ms = now_ms };
+        const available = std.math.cast(usize, self.congestion_state.available()) orelse std.math.maxInt(usize);
+        return self.transmitter_state.pack(
+            QueuedMessages{ .iterator = self.outbound_state.iterator(lane) },
+            scratch,
+            available,
+            &bridge,
+            Bridge.forward,
+        );
+    }
+
     pub fn enqueueOutbound(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !SendHandle {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         _ = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
@@ -306,6 +346,22 @@ pub const Core = struct {
         while (total.datagrams < maximum_datagrams) {
             const message = self.outbound_state.peek(lane) orelse break;
             if (self.outbound_packetization[lane_index] == null) {
+                const batch = self.packQueued(lane, scratch, now_ms, context, emit) catch |err| {
+                    if (total.datagrams != 0) {
+                        self.terminal_send_failure = true;
+                        return error.PartialSendFailure;
+                    }
+                    return err;
+                };
+                if (batch.messages != 0) {
+                    total.datagrams = try std.math.add(usize, total.datagrams, batch.sent.datagrams);
+                    total.wire_bytes = try std.math.add(usize, total.wire_bytes, batch.sent.wire_bytes);
+                    for (0..batch.messages) |_| {
+                        const completed = self.outbound_state.pop(lane).?;
+                        completed.payload.deinit();
+                    }
+                    continue;
+                }
                 self.outbound_packetization[lane_index] = try self.transmitter_state.beginPacketization(message.payload.bytes.len, message.reliability, message.channel);
             }
             const sent = self.sendAvailable(
@@ -452,6 +508,62 @@ test "core packetization stops at the available congestion window" {
     try std.testing.expectEqual(@as(usize, 0), blocked.datagrams);
     try std.testing.expectEqual(@as(usize, 1), collector.count);
     try std.testing.expect(!packetization.complete());
+}
+
+test "queued compatible messages share one datagram" {
+    const Collector = struct {
+        frames: usize = 0,
+        wire_bytes: usize = 0,
+        fn emit(raw: *anyopaque, wire: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.wire_bytes = wire.len;
+            var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
+            while (decoded.frames.remaining() != 0) {
+                _ = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
+                self.frames += 1;
+            }
+        }
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    core.congestion_state.window = 576;
+    var scratch: [576]u8 = undefined;
+    var first: [276]u8 = @splat(1);
+    var second: [276]u8 = @splat(2);
+    _ = try core.enqueueOutbound(.application, &first, .reliable_ordered, 3);
+    _ = try core.enqueueOutbound(.application, &second, .reliable_ordered, 3);
+    _ = try core.enqueueOutbound(.application, "later", .reliable_ordered, 3);
+    var collector: Collector = .{};
+
+    const sent = try core.flushOutbound(.application, &scratch, 1, 0, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 1), sent.datagrams);
+    try std.testing.expectEqual(@as(usize, 576), sent.wire_bytes);
+    try std.testing.expectEqual(@as(usize, 2), collector.frames);
+    try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
+    try std.testing.expectEqual(@as(u32, 2), core.transmitter_state.reliable_index);
+    try std.testing.expectEqual(@as(u32, 2), core.transmitter_state.order_indices[3]);
+}
+
+test "failed packed send keeps the queue and protocol indices" {
+    const Failing = struct {
+        fn emit(_: *anyopaque, _: []const u8) SendError!void {
+            return error.TransportFailure;
+        }
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    var scratch: [576]u8 = undefined;
+    _ = try core.enqueueOutbound(.application, "first", .reliable_ordered, 1);
+    _ = try core.enqueueOutbound(.application, "second", .reliable_ordered, 1);
+    const available = core.congestion_state.available();
+    var unused: u8 = 0;
+
+    try std.testing.expectError(error.TransportFailure, core.flushOutbound(.application, &scratch, 1, 0, &unused, Failing.emit));
+    try std.testing.expectEqual(@as(usize, 2), core.outbound_state.count(.application));
+    try std.testing.expectEqual(@as(u32, 0), core.transmitter_state.datagram_sequence);
+    try std.testing.expectEqual(@as(u32, 0), core.transmitter_state.reliable_index);
+    try std.testing.expectEqual(@as(u32, 0), core.transmitter_state.order_indices[1]);
+    try std.testing.expectEqual(available, core.congestion_state.available());
 }
 
 test "queued split message resumes after congestion capacity returns" {

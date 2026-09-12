@@ -1,5 +1,6 @@
 const std = @import("std");
 const Config = @import("../config.zig").Config;
+const cursor = @import("../protocol/cursor.zig");
 const datagram = @import("../protocol/datagram.zig");
 const frame = @import("../protocol/frame.zig");
 const uint24 = @import("../util/uint24.zig");
@@ -15,6 +16,8 @@ pub const EmitError = error{
 };
 pub const EmitFn = *const fn (context: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void;
 pub const Sent = struct { datagrams: usize, wire_bytes: usize };
+pub const PackedMessage = struct { payload: []const u8, reliability: frame.Reliability, channel: u8 };
+pub const PackResult = struct { messages: usize = 0, sent: Sent = .{ .datagrams = 0, .wire_bytes = 0 } };
 
 pub const Packetization = struct {
     payload_len: usize,
@@ -127,6 +130,64 @@ pub const Transmitter = struct {
         return sent;
     }
 
+    /// Packs compatible unsplit messages into one datagram.
+    pub fn pack(self: *Transmitter, source: anytype, scratch: []u8, maximum_wire_bytes: usize, context: *anyopaque, emit: EmitFn) !PackResult {
+        if (maximum_wire_bytes < 4) return .{};
+        if (scratch.len < self.mtu) return error.NoSpaceLeft;
+        var messages = source;
+        const first = messages.next() orelse return .{};
+        try self.validateMessage(first);
+        const first_capacity = try payloadCapacity(self.mtu, first.reliability, false);
+        if (first.payload.len > first_capacity) return .{};
+
+        const limit = @min(@as(usize, self.mtu), maximum_wire_bytes);
+        var writer: cursor.Writer = .{ .data = scratch[0..limit] };
+        try writer.byte(0x84);
+        try writer.u24le(self.datagram_sequence);
+        var next_reliable = self.reliable_index;
+        var next_order = if (first.reliability.hasOrderIndex()) self.order_indices[first.channel] else 0;
+        var next_sequence = if (first.reliability.hasSequenceIndex()) self.sequence_indices[first.channel] else 0;
+        var count: usize = 0;
+
+        var pending: ?PackedMessage = first;
+        while (pending) |message| : (pending = messages.next()) {
+            if (!compatible(first, message)) break;
+            try self.validateMessage(message);
+            if (message.payload.len > first_capacity) break;
+            const value: frame.Frame = .{
+                .reliability = message.reliability,
+                .reliable_index = if (message.reliability.hasReliableIndex()) next_reliable else null,
+                .sequence_index = if (message.reliability.hasSequenceIndex()) next_sequence else null,
+                .order_index = if (message.reliability.hasOrderIndex()) next_order else null,
+                .order_channel = if (message.reliability.hasOrderIndex()) message.channel else null,
+                .payload = message.payload,
+            };
+            const encoded_size = try frame.encodedSize(value);
+            if (encoded_size > writer.remaining()) break;
+            try frame.encode(value, &writer);
+            if (message.reliability.hasReliableIndex()) next_reliable = uint24.add(next_reliable, 1);
+            if (message.reliability.hasOrderIndex()) next_order = uint24.add(next_order, 1);
+            if (message.reliability.hasSequenceIndex()) next_sequence = uint24.add(next_sequence, 1);
+            count += 1;
+        }
+        if (count == 0) return .{};
+
+        const wire = writer.written();
+        try emit(context, self.datagram_sequence, first.reliability.hasReliableIndex(), wire);
+        self.datagram_sequence = uint24.add(self.datagram_sequence, 1);
+        self.reliable_index = next_reliable;
+        if (first.reliability.hasOrderIndex()) self.order_indices[first.channel] = next_order;
+        if (first.reliability.hasSequenceIndex()) self.sequence_indices[first.channel] = next_sequence;
+        return .{ .messages = count, .sent = .{ .datagrams = 1, .wire_bytes = wire.len } };
+    }
+
+    fn validateMessage(self: *const Transmitter, message: PackedMessage) !void {
+        if (message.payload.len == 0) return error.EmptyPayload;
+        if (message.payload.len > self.config.maximum_split_bytes) return error.MessageTooLarge;
+        if (message.channel >= self.config.maximum_order_channels and message.reliability.hasOrderIndex()) return error.InvalidOrderChannel;
+        if (message.payload.len > try payloadCapacity(self.mtu, message.reliability, false) and !message.reliability.hasReliableIndex()) return error.UnreliableMessageTooLarge;
+    }
+
     pub fn estimateWireBytes(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !usize {
         if (payload_len == 0) return error.EmptyPayload;
         if (payload_len > self.config.maximum_split_bytes) return error.MessageTooLarge;
@@ -161,6 +222,11 @@ pub const Transmitter = struct {
         return value;
     }
 };
+
+fn compatible(first: PackedMessage, next: PackedMessage) bool {
+    if (first.reliability != next.reliability) return false;
+    return !first.reliability.hasOrderIndex() or first.channel == next.channel;
+}
 
 fn payloadCapacity(mtu: u16, reliability: frame.Reliability, split: bool) !usize {
     const probe: frame.Frame = .{
@@ -228,4 +294,100 @@ test "packetization resumes at datagram boundaries within a wire budget" {
     try std.testing.expect(rest.datagrams > 0);
     try std.testing.expect(packetization.complete());
     try std.testing.expectEqual(packetization.fragment_count, collector.count);
+}
+
+test "packer fills one datagram with exact frame accounting" {
+    const MessageIterator = struct {
+        messages: []const PackedMessage,
+        index: usize = 0,
+        fn next(self: *@This()) ?PackedMessage {
+            if (self.index == self.messages.len) return null;
+            defer self.index += 1;
+            return self.messages[self.index];
+        }
+    };
+    const Collector = struct {
+        frames: usize = 0,
+        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!reliable or sequence != 0 or wire.len != 576) return error.TransportFailure;
+            var decoded = try frame.decodeDatagram(wire);
+            while (decoded.frames.remaining() != 0) {
+                const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
+                if (value.reliable_index != self.frames or value.order_index != self.frames or value.order_channel != 3) return error.TransportFailure;
+                self.frames += 1;
+            }
+        }
+    };
+    var transmitter = try Transmitter.init(576, .{});
+    var scratch: [576]u8 = undefined;
+    var first: [276]u8 = @splat(1);
+    var second: [276]u8 = @splat(2);
+    const messages = [_]PackedMessage{
+        .{ .payload = &first, .reliability = .reliable_ordered, .channel = 3 },
+        .{ .payload = &second, .reliability = .reliable_ordered, .channel = 3 },
+        .{ .payload = "x", .reliability = .reliable_ordered, .channel = 3 },
+    };
+    var collector: Collector = .{};
+    const result = try transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, scratch.len, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 2), result.messages);
+    try std.testing.expectEqual(@as(usize, 1), result.sent.datagrams);
+    try std.testing.expectEqual(@as(usize, 576), result.sent.wire_bytes);
+    try std.testing.expectEqual(@as(usize, 2), collector.frames);
+    try std.testing.expectEqual(@as(u32, 2), transmitter.reliable_index);
+    try std.testing.expectEqual(@as(u32, 2), transmitter.order_indices[3]);
+}
+
+test "packer stops before incompatible traffic without mutating it" {
+    const MessageIterator = struct {
+        messages: []const PackedMessage,
+        index: usize = 0,
+        fn next(self: *@This()) ?PackedMessage {
+            if (self.index == self.messages.len) return null;
+            defer self.index += 1;
+            return self.messages[self.index];
+        }
+    };
+    const Collector = struct {
+        fn emit(_: *anyopaque, _: u32, _: bool, _: []const u8) !void {}
+    };
+    var transmitter = try Transmitter.init(576, .{});
+    var scratch: [576]u8 = undefined;
+    const messages = [_]PackedMessage{
+        .{ .payload = "a", .reliability = .reliable_ordered, .channel = 0 },
+        .{ .payload = "b", .reliability = .reliable_ordered, .channel = 1 },
+    };
+    var unused: u8 = 0;
+    const result = try transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, scratch.len, &unused, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 1), result.messages);
+    try std.testing.expectEqual(@as(u32, 1), transmitter.order_indices[0]);
+    try std.testing.expectEqual(@as(u32, 0), transmitter.order_indices[1]);
+}
+
+test "packer keeps indices when emit fails" {
+    const MessageIterator = struct {
+        messages: []const PackedMessage,
+        index: usize = 0,
+        fn next(self: *@This()) ?PackedMessage {
+            if (self.index == self.messages.len) return null;
+            defer self.index += 1;
+            return self.messages[self.index];
+        }
+    };
+    const Failing = struct {
+        fn emit(_: *anyopaque, _: u32, _: bool, _: []const u8) !void {
+            return error.TransportFailure;
+        }
+    };
+    var transmitter = try Transmitter.init(576, .{});
+    var scratch: [576]u8 = undefined;
+    const messages = [_]PackedMessage{
+        .{ .payload = "a", .reliability = .reliable_ordered, .channel = 2 },
+        .{ .payload = "b", .reliability = .reliable_ordered, .channel = 2 },
+    };
+    var unused: u8 = 0;
+    try std.testing.expectError(error.TransportFailure, transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, scratch.len, &unused, Failing.emit));
+    try std.testing.expectEqual(@as(u32, 0), transmitter.datagram_sequence);
+    try std.testing.expectEqual(@as(u32, 0), transmitter.reliable_index);
+    try std.testing.expectEqual(@as(u32, 0), transmitter.order_indices[2]);
 }

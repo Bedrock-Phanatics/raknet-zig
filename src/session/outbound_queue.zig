@@ -14,6 +14,18 @@ pub const Message = struct {
     channel: u8,
 };
 
+pub const Iterator = struct {
+    queue: *const Queue,
+    next_index: u32,
+
+    pub fn next(self: *Iterator) ?*const Message {
+        if (self.next_index == none) return null;
+        const slot = &self.queue.slots[self.next_index];
+        self.next_index = slot.next;
+        return &slot.message;
+    }
+};
+
 const Slot = struct {
     message: Message = undefined,
     next: u32 = none,
@@ -124,6 +136,10 @@ pub const Queue = struct {
     pub fn peek(self: *const Queue, lane: Lane) ?*const Message {
         const index = self.heads[@intFromEnum(lane)];
         return if (index == none) null else &self.slots[index].message;
+    }
+
+    pub fn iterator(self: *const Queue, lane: Lane) Iterator {
+        return .{ .queue = self, .next_index = self.heads[@intFromEnum(lane)] };
     }
 
     /// Removes one queued message without disturbing the lane's FIFO order.
