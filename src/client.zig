@@ -34,6 +34,7 @@ pub const Client = struct {
     server_guid: u64,
     mtu: u16,
     last_seen_ms: u64,
+    outbound_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
     closed: bool = false,
 
@@ -113,18 +114,29 @@ pub const Client = struct {
         return true;
     }
 
-    /// Copies a message into the bounded application queue. Call flush to start it immediately.
+    /// Copies a message into the bounded application queue.
     pub fn queueSend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
         if (self.closed) return error.ConnectionClosed;
-        return self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
+        const handle = self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
             return err;
         };
+        const now_ms = time.nowMilliseconds(self.io);
+        self.outbound_deadline_ms = now_ms;
+        if (try self.core.outboundReady(.application)) {
+            _ = self.flushQueuedAt(now_ms) catch |err| {
+                if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
+                return err;
+            };
+        }
+        return handle;
     }
 
     pub fn cancelSend(self: *Client, handle: core_mod.SendHandle) core_mod.CancelResult {
         if (self.closed) return .not_found;
-        return self.core.cancelOutbound(handle);
+        const result = self.core.cancelOutbound(handle);
+        if (result == .canceled and self.core.outboundCount(.application) == 0) self.outbound_deadline_ms = null;
+        return result;
     }
 
     /// Sends queued application data until congestion or the per-turn work limit stops progress.
@@ -140,6 +152,7 @@ pub const Client = struct {
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
         var deadline = time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms);
+        if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
         return deadline;
@@ -286,6 +299,9 @@ pub const Client = struct {
         return emitter.count;
     }
     fn flushQueuedAt(self: *Client, now_ms: u64) !core_mod.FlushResult {
+        return self.flushQueuedAtLimit(now_ms, self.core.config.maximum_packets_per_iteration);
+    }
+    fn flushQueuedAtLimit(self: *Client, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
         const Emitter = struct {
             client: *Client,
             fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
@@ -294,7 +310,10 @@ pub const Client = struct {
             }
         };
         var emitter: Emitter = .{ .client = self };
-        return self.core.flushOutbound(.application, self.scratch, self.core.config.maximum_packets_per_iteration, now_ms, &emitter, Emitter.emit);
+        self.outbound_deadline_ms = null;
+        const sent = try self.core.flushOutbound(.application, self.scratch, maximum_datagrams, now_ms, &emitter, Emitter.emit);
+        if (sent.datagrams == maximum_datagrams and self.core.outboundCount(.application) != 0) self.outbound_deadline_ms = now_ms;
+        return sent;
     }
     fn flushReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt) !void {
         if (receipt.acknowledge) |sequence| {
@@ -317,25 +336,28 @@ pub const Client = struct {
     }
     fn processDueTimers(self: *Client, now_ms: u64) !void {
         var remaining = self.core.config.maximum_packets_per_iteration;
-        var active: usize = @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
+        var active: usize = @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
+            @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
             @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
         const start = self.timer_cursor;
         var visited: usize = 0;
-        while (visited < 2 and remaining != 0 and active != 0) : (visited += 1) {
-            const timer = (start + visited) % 2;
+        while (visited < 3 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 3;
             const due = switch (timer) {
-                0 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
+                0 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
+                1 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
                 else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
             };
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
             const used = switch (timer) {
-                0 => self.core.expireSplits(now_ms, quota).inspected,
+                0 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
+                1 => self.core.expireSplits(now_ms, quota).inspected,
                 else => try self.flushRetransmissions(now_ms, quota),
             };
             remaining -= @min(remaining, used);
             active -= 1;
-            self.timer_cursor = @intCast((timer + 1) % 2);
+            self.timer_cursor = @intCast((timer + 1) % 3);
         }
     }
 
@@ -437,8 +459,10 @@ test "client and server complete a real loopback handshake" {
     const canceled = try client.queueSend("\xfecanceled", .reliable_ordered, 0);
     try std.testing.expectEqual(core_mod.CancelResult.canceled, client.cancelSend(canceled));
     _ = try client.queueSend("\xfequeued", .reliable_ordered, 0);
-    const flushed = try client.flush();
-    try std.testing.expect(flushed.datagrams != 0);
+    const outbound_deadline = client.outbound_deadline_ms.?;
+    try std.testing.expectEqual(outbound_deadline, client.nextDeadline().?);
+    try client.processTimers(outbound_deadline);
+    try std.testing.expectEqual(@as(usize, 0), client.core.outboundCount(.application));
     harness.message_len = 0;
     for (0..4) |_| {
         _ = try listener.poll(.none, .{ .context = &harness, .connected = Harness.onConnect, .message = Harness.onMessage });
@@ -448,7 +472,11 @@ test "client and server complete a real loopback handshake" {
 
     var session_iterator = listener.sessions.valueIterator();
     const session = session_iterator.next().?.*;
-    try session.send("\xfeworld", .reliable_ordered, 0);
+    _ = try session.queueSend("\xfeworld", .reliable_ordered, 0);
+    const server_outbound_deadline = session.outbound_deadline_ms.?;
+    try std.testing.expectEqual(server_outbound_deadline, listener.nextDeadline().?);
+    _ = try listener.processTimers(server_outbound_deadline, .{ .context = &harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+    try std.testing.expectEqual(@as(usize, 0), session.core.outboundCount(.application));
     const ClientCollector = struct {
         data: [32]u8 = undefined,
         len: usize = 0,

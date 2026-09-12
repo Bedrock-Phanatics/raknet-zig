@@ -141,6 +141,12 @@ pub fn main(init: std.process.Init) !void {
     }
     const descriptor_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
 
+    const send_iterations: usize = 100_000;
+    const single_send = try benchmarkFramePacking(io, send_iterations, false);
+    const packed_send = try benchmarkFramePacking(io, send_iterations, true);
+    checksum +%= single_send.checksum +% packed_send.checksum;
+    const send_messages = send_iterations * bedrock_payload_sizes.len;
+
     std.debug.print(
         "ack_decode: {d:.2} ns/op\nframe_decode: {d:.2} ns/op\nwindow_add: {d:.2} ns/op\n" ++
             "deadline_reschedule_4096: {d:.2} ns/op\n" ++
@@ -152,7 +158,10 @@ pub fn main(init: std.process.Init) !void {
             "datagram_parse_1pass_8_frames: {d:.2} ns/op\n" ++
             "datagram_parse_2pass_8_frames: {d:.2} ns/op\n" ++
             "datagram_parse_descriptors_8_frames: {d:.2} ns/op\n" ++
-            "descriptor_scratch_256_frames: {d} bytes\nchecksum: {d}\n",
+            "descriptor_scratch_256_frames: {d} bytes\n" ++
+            "bedrock_send_single: {d:.2} ns/message, {d:.2} bytes/message, {d} datagrams\n" ++
+            "bedrock_send_packed: {d:.2} ns/message, {d:.2} bytes/message, {d} datagrams\n" ++
+            "checksum: {d}\n",
         .{
             @as(f64, @floatFromInt(ack_ns)) / @as(f64, @floatFromInt(iterations)),
             @as(f64, @floatFromInt(frame_ns)) / @as(f64, @floatFromInt(iterations)),
@@ -167,12 +176,72 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(two_pass_ns)) / @as(f64, @floatFromInt(parser_iterations)),
             @as(f64, @floatFromInt(descriptor_ns)) / @as(f64, @floatFromInt(parser_iterations)),
             @sizeOf(frame.Frame) * 256,
+            @as(f64, @floatFromInt(single_send.nanoseconds)) / @as(f64, @floatFromInt(send_messages)),
+            @as(f64, @floatFromInt(single_send.wire_bytes)) / @as(f64, @floatFromInt(send_messages)),
+            single_send.datagrams,
+            @as(f64, @floatFromInt(packed_send.nanoseconds)) / @as(f64, @floatFromInt(send_messages)),
+            @as(f64, @floatFromInt(packed_send.wire_bytes)) / @as(f64, @floatFromInt(send_messages)),
+            packed_send.datagrams,
             checksum,
         },
     );
 }
 
 const DueMeasurement = struct { nanoseconds: u64, checksum: usize };
+const PackingMeasurement = struct { nanoseconds: u64, wire_bytes: usize, datagrams: usize, checksum: usize };
+const bedrock_payload_sizes = [_]usize{ 5, 7, 9, 12, 16, 20, 24, 32, 40, 52, 68, 96, 140, 220, 360, 700 };
+
+fn benchmarkFramePacking(io: std.Io, iterations: usize, pack: bool) !PackingMeasurement {
+    const mtu = 1492;
+    var payloads: [bedrock_payload_sizes.len][700]u8 = undefined;
+    for (&payloads, 0..) |*payload, index| {
+        for (payload, 0..) |*byte, byte_index| byte.* = @truncate(index *% 31 +% byte_index);
+    }
+    var frames: [bedrock_payload_sizes.len]frame.Frame = undefined;
+    var wire_storage: [mtu]u8 = undefined;
+    var sequence: u32 = 0;
+    var reliable_index: u32 = 0;
+    var order_index: u32 = 0;
+    var wire_bytes: usize = 0;
+    var datagrams: usize = 0;
+    var checksum: usize = 0;
+
+    const start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |iteration| {
+        var message_index: usize = 0;
+        while (message_index < bedrock_payload_sizes.len) {
+            var frame_count: usize = 0;
+            var encoded_bytes: usize = 4;
+            while (message_index < bedrock_payload_sizes.len) {
+                const payload_len = bedrock_payload_sizes[message_index];
+                payloads[message_index][0] = @truncate(iteration +% message_index);
+                const value: frame.Frame = .{
+                    .reliability = .reliable_ordered,
+                    .reliable_index = reliable_index,
+                    .order_index = order_index,
+                    .order_channel = 0,
+                    .payload = payloads[message_index][0..payload_len],
+                };
+                const encoded_size = try frame.encodedSize(value);
+                if (frame_count != 0 and (encoded_bytes + encoded_size > mtu or !pack)) break;
+                frames[frame_count] = value;
+                frame_count += 1;
+                encoded_bytes += encoded_size;
+                reliable_index = (reliable_index + 1) & 0xffffff;
+                order_index = (order_index + 1) & 0xffffff;
+                message_index += 1;
+            }
+            const wire = try datagram.encodeData(sequence, frames[0..frame_count], &wire_storage);
+            sequence = (sequence + 1) & 0xffffff;
+            datagrams += 1;
+            wire_bytes += wire.len;
+            checksum +%= wire.len + wire[wire.len - 1] + frame_count;
+            std.mem.doNotOptimizeAway(wire.ptr);
+        }
+    }
+    const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    return .{ .nanoseconds = nanoseconds, .wire_bytes = wire_bytes, .datagrams = datagrams, .checksum = checksum };
+}
 
 fn benchmarkDueBatch(io: std.Io, capacity: usize, due_per_turn: usize, turns: usize) !DueMeasurement {
     std.debug.assert(due_per_turn > 0 and due_per_turn <= capacity);

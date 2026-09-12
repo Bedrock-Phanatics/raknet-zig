@@ -68,6 +68,7 @@ pub const Session = struct {
     pending_ack_head: usize = 0,
     pending_ack_count: usize = 0,
     ack_deadline_ms: ?u64 = null,
+    outbound_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
     deadlines: *deadline_queue.Queue,
     client_guid: u64,
@@ -117,17 +118,33 @@ pub const Session = struct {
     }
     pub fn queueSend(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
         if (self.state != .connected) return error.NotConnected;
-        return self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
+        const handle = self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
                 self.state = .closed;
                 self.deadlines.upsert(self.key, time.nowMilliseconds(self.socket.io)) catch {};
             }
             return err;
         };
+        const now_ms = time.nowMilliseconds(self.socket.io);
+        self.outbound_deadline_ms = now_ms;
+        if (try self.core.outboundReady(.application)) {
+            _ = self.flushQueuedAt(now_ms) catch |err| {
+                if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
+                    self.state = .closed;
+                    self.deadlines.upsert(self.key, now_ms) catch {};
+                }
+                return err;
+            };
+        } else {
+            try self.schedule();
+        }
+        return handle;
     }
     pub fn cancelSend(self: *Session, handle: core_mod.SendHandle) core_mod.CancelResult {
         if (self.state != .connected) return .not_found;
-        return self.core.cancelOutbound(handle);
+        const result = self.core.cancelOutbound(handle);
+        if (result == .canceled and self.core.outboundCount(.application) == 0) self.outbound_deadline_ms = null;
+        return result;
     }
     pub fn flush(self: *Session) !core_mod.FlushResult {
         if (self.state != .connected) return error.NotConnected;
@@ -164,6 +181,9 @@ pub const Session = struct {
         _ = try self.sendAtLane(payload, reliability, 0, now_ms, true);
     }
     fn flushQueuedAt(self: *Session, now_ms: u64) !core_mod.FlushResult {
+        return self.flushQueuedAtLimit(now_ms, self.core.config.maximum_packets_per_iteration);
+    }
+    fn flushQueuedAtLimit(self: *Session, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
         const Emitter = struct {
             session: *Session,
             fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
@@ -172,7 +192,9 @@ pub const Session = struct {
             }
         };
         var emitter: Emitter = .{ .session = self };
-        const sent = try self.core.flushOutbound(.application, self.scratch, self.core.config.maximum_packets_per_iteration, now_ms, &emitter, Emitter.emit);
+        self.outbound_deadline_ms = null;
+        const sent = try self.core.flushOutbound(.application, self.scratch, maximum_datagrams, now_ms, &emitter, Emitter.emit);
+        if (sent.datagrams == maximum_datagrams and self.core.outboundCount(.application) != 0) self.outbound_deadline_ms = now_ms;
         if (sent.datagrams != 0) try self.schedule();
         return sent;
     }
@@ -221,6 +243,7 @@ pub const Session = struct {
         var deadline = time.deadline(self.last_seen_ms, self.idle_timeout_ms);
         if (self.state == .connecting) deadline = @min(deadline, self.handshake_deadline_ms);
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
+        if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
         try self.deadlines.upsert(self.key, deadline);
@@ -228,27 +251,30 @@ pub const Session = struct {
     fn processDueTimers(self: *Session, now_ms: u64, maximum_work: usize) !usize {
         var remaining = maximum_work;
         var active: usize = @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms) +
+            @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
             @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
         const start = self.timer_cursor;
         var visited: usize = 0;
-        while (visited < 3 and remaining != 0 and active != 0) : (visited += 1) {
-            const timer = (start + visited) % 3;
+        while (visited < 4 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 4;
             const due = switch (timer) {
                 0 => self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms,
-                1 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
+                1 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
+                2 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
                 else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
             };
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
             const used = switch (timer) {
                 0 => try self.flushAcksUpTo(quota),
-                1 => self.core.expireSplits(now_ms, quota).inspected,
+                1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
+                2 => self.core.expireSplits(now_ms, quota).inspected,
                 else => try self.flushRetransmissions(now_ms, quota),
             };
             remaining -= @min(remaining, used);
             active -= 1;
-            self.timer_cursor = @intCast((timer + 1) % 3);
+            self.timer_cursor = @intCast((timer + 1) % 4);
         }
         return maximum_work - remaining;
     }

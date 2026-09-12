@@ -323,6 +323,14 @@ pub const Core = struct {
         return .{ .id = try self.outbound_state.enqueue(lane, payload, reliability, channel), .owner = self.send_owner };
     }
 
+    pub fn outboundReady(self: *const Core, lane: outbound_queue.Lane) !bool {
+        return self.transmitter_state.packReady(QueuedMessages{ .iterator = self.outbound_state.iterator(lane) });
+    }
+
+    pub fn outboundCount(self: *const Core, lane: outbound_queue.Lane) usize {
+        return self.outbound_state.count(lane);
+    }
+
     pub fn cancelOutbound(self: *Core, handle: SendHandle) CancelResult {
         if (handle.owner != self.send_owner) return .not_found;
         inline for (.{ outbound_queue.Lane.control, outbound_queue.Lane.application }) |lane| {
