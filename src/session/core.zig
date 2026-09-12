@@ -108,7 +108,9 @@ pub fn deliverySendFailure(err: anyerror) receiver.DeliveryError {
         error.RecoveryBytesExceeded,
         error.CongestionWindowFull,
         => error.ResourceLimitFailure,
-        error.TransportFailure => error.TransportFailure,
+        error.TransportFailure,
+        error.PartialSendFailure,
+        => error.TransportFailure,
         else => error.InternalFailure,
     };
 }
@@ -137,7 +139,9 @@ pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) Inc
             error.RecoveryBytesExceeded,
             => .{ .class = .resource, .disposition = .close_session },
 
-            error.TransportFailure => .{ .class = .transport, .disposition = .close_session },
+            error.TransportFailure,
+            error.PartialSendFailure,
+            => .{ .class = .transport, .disposition = .close_session },
             else => .{ .class = .internal, .disposition = .close_session },
         },
         .receipt => switch (err) {
@@ -159,6 +163,7 @@ pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) Inc
             error.Timeout,
             error.HandshakeWorkLimitExceeded,
             error.TransportFailure,
+            error.PartialSendFailure,
             => .{ .class = .transport, .disposition = .close_session },
             error.OutOfMemory,
             error.ResourceLimitFailure,
@@ -180,6 +185,7 @@ pub const Core = struct {
     rtt_state: rtt.Estimator,
     ack_records: []ack.Record,
     send_owner: u64,
+    terminal_send_failure: bool = false,
     newest_sent: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, mtu: u16, config: Config) !Core {
@@ -230,6 +236,7 @@ pub const Core = struct {
     }
 
     fn sendImmediate(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        if (self.terminal_send_failure) return error.ConnectionClosed;
         const wire_bytes = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
         if (self.outbound_state.count(lane) != 0) return error.OutboundQueuePending;
         if (wire_bytes > self.congestion_state.available()) return error.CongestionWindowFull;
@@ -240,11 +247,13 @@ pub const Core = struct {
     }
 
     pub fn beginPacketization(self: *Core, payload_len: usize, reliability: frame.Reliability, channel: u8) !transmitter.Packetization {
+        if (self.terminal_send_failure) return error.ConnectionClosed;
         return self.transmitter_state.beginPacketization(payload_len, reliability, channel);
     }
 
     /// Advances a prepared message without exceeding the current congestion window.
     pub fn sendAvailable(self: *Core, packetization: *transmitter.Packetization, payload: []const u8, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        if (self.terminal_send_failure) return error.ConnectionClosed;
         const Bridge = struct {
             core: *Core,
             user_context: *anyopaque,
@@ -262,10 +271,14 @@ pub const Core = struct {
         };
         var bridge: Bridge = .{ .core = self, .user_context = context, .user_emit = emit, .now_ms = now_ms };
         const available = std.math.cast(usize, self.congestion_state.available()) orelse std.math.maxInt(usize);
-        return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, maximum_datagrams, &bridge, Bridge.forward);
+        return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, maximum_datagrams, &bridge, Bridge.forward) catch |err| {
+            if (err == error.PartialSendFailure) self.terminal_send_failure = true;
+            return err;
+        };
     }
 
     pub fn enqueueOutbound(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !SendHandle {
+        if (self.terminal_send_failure) return error.ConnectionClosed;
         _ = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
         return .{ .id = try self.outbound_state.enqueue(lane, payload, reliability, channel), .owner = self.send_owner };
     }
@@ -287,6 +300,7 @@ pub const Core = struct {
 
     /// Drains one FIFO lane while both congestion and work budgets permit.
     pub fn flushOutbound(self: *Core, lane: outbound_queue.Lane, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        if (self.terminal_send_failure) return error.ConnectionClosed;
         var total: transmitter.Sent = .{ .datagrams = 0, .wire_bytes = 0 };
         const lane_index = @intFromEnum(lane);
         while (total.datagrams < maximum_datagrams) {
@@ -294,7 +308,7 @@ pub const Core = struct {
             if (self.outbound_packetization[lane_index] == null) {
                 self.outbound_packetization[lane_index] = try self.transmitter_state.beginPacketization(message.payload.bytes.len, message.reliability, message.channel);
             }
-            const sent = try self.sendAvailable(
+            const sent = self.sendAvailable(
                 &self.outbound_packetization[lane_index].?,
                 message.payload.bytes,
                 scratch,
@@ -302,7 +316,13 @@ pub const Core = struct {
                 now_ms,
                 context,
                 emit,
-            );
+            ) catch |err| {
+                if (total.datagrams != 0 and err != error.PartialSendFailure) {
+                    self.terminal_send_failure = true;
+                    return error.PartialSendFailure;
+                }
+                return err;
+            };
             total.datagrams = try std.math.add(usize, total.datagrams, sent.datagrams);
             total.wire_bytes = try std.math.add(usize, total.wire_bytes, sent.wire_bytes);
             if (!self.outbound_packetization[lane_index].?.complete()) break;
@@ -314,6 +334,7 @@ pub const Core = struct {
     }
     /// Copies a reliable datagram into bounded recovery storage before it is handed to the socket.
     pub fn trackSent(self: *Core, sequence: u32, wire: []const u8, in_flight_bytes: usize, now_ms: u64) !void {
+        if (self.terminal_send_failure) return error.ConnectionClosed;
         try self.congestion_state.sent(in_flight_bytes);
         errdefer self.congestion_state.cancel(in_flight_bytes);
         try self.recovery_state.track(sequence, wire, in_flight_bytes, now_ms, self.rtt_state.rto());
@@ -536,7 +557,7 @@ test "partial send failure rolls back only the failed datagram" {
     _ = try core.enqueueOutbound(.application, &payload, .reliable_ordered, 0);
     var failing: FailingEmitter = .{};
 
-    try std.testing.expectError(error.TransportFailure, core.flushOutbound(.application, &scratch, 8, 0, &failing, FailingEmitter.emit));
+    try std.testing.expectError(error.PartialSendFailure, core.flushOutbound(.application, &scratch, 8, 0, &failing, FailingEmitter.emit));
     try std.testing.expectEqual(@as(usize, 1), failing.successful);
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.datagram_sequence);
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.reliable_index);
@@ -545,13 +566,14 @@ test "partial send failure rolls back only the failed datagram" {
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
     const progress = core.outbound_packetization[@intFromEnum(outbound_queue.Lane.application)].?;
     try std.testing.expectEqual(progress.capacity, progress.offset);
+    try std.testing.expect(core.terminal_send_failure);
 
     var collector: Collector = .{};
-    const completed = try core.flushOutbound(.application, &scratch, 8, 1, &collector, Collector.emit);
-    try std.testing.expectEqual(@as(usize, 2), completed.datagrams);
-    try std.testing.expectEqual(@as(usize, 0), core.outbound_state.count(.application));
-    try std.testing.expectEqual(@as(usize, 3), core.recovery_state.records.count());
-    try std.testing.expectEqual(core.recovery_state.total_bytes, core.congestion_state.in_flight);
+    try std.testing.expectError(error.ConnectionClosed, core.flushOutbound(.application, &scratch, 8, 1, &collector, Collector.emit));
+    try std.testing.expectError(error.ConnectionClosed, core.enqueueOutbound(.application, "later", .reliable, 0));
+    try std.testing.expectError(error.ConnectionClosed, core.beginPacketization(1, .reliable, 0));
+    try std.testing.expectError(error.ConnectionClosed, core.trackSent(2, "wire", 4, 1));
+    try std.testing.expectEqual(@as(usize, 0), collector.count);
 }
 test "incoming failures keep their origin and commit safety" {
     const truncated = classifyIncomingError(error.Truncated);
@@ -596,6 +618,9 @@ test "transition policy distinguishes rejection, retry, and closure" {
     const send_transport = classifyTransitionError(.application_send, error.TransportFailure);
     try std.testing.expectEqual(IncomingErrorDisposition.close_session, send_transport.disposition);
     try std.testing.expectEqual(IncomingErrorClass.transport, send_transport.class);
+    const partial_send = classifyTransitionError(.application_send, error.PartialSendFailure);
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, partial_send.disposition);
+    try std.testing.expectEqual(IncomingErrorClass.transport, partial_send.class);
 
     try std.testing.expectEqual(IncomingErrorClass.internal, classifyTransitionError(.receipt, error.NoSpaceLeft).class);
     try std.testing.expectEqual(IncomingErrorClass.transport, classifyTransitionError(.retransmission, error.RetransmissionLimitExceeded).class);

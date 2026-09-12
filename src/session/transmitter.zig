@@ -91,6 +91,7 @@ pub const Transmitter = struct {
     ) !Sent {
         if (payload.len != packetization.payload_len or packetization.offset > payload.len) return error.InvalidPacketizationState;
         if (scratch.len < self.mtu) return error.NoSpaceLeft;
+        const had_progress = packetization.offset != 0;
         var sent: Sent = .{ .datagrams = 0, .wire_bytes = 0 };
         while (!packetization.complete() and sent.datagrams < maximum_datagrams) {
             const amount = @min(packetization.capacity, payload.len - packetization.offset);
@@ -112,7 +113,10 @@ pub const Transmitter = struct {
             if (wire_size > maximum_wire_bytes -| sent.wire_bytes) break;
             const sequence = self.datagram_sequence;
             const wire = try datagram.encodeData(sequence, &.{value}, scratch[0..self.mtu]);
-            try emit(context, sequence, packetization.reliability.hasReliableIndex(), wire);
+            emit(context, sequence, packetization.reliability.hasReliableIndex(), wire) catch |err| {
+                if (had_progress or sent.datagrams != 0) return error.PartialSendFailure;
+                return err;
+            };
             if (packetization.reliability.hasReliableIndex()) _ = self.reserveReliable();
             self.datagram_sequence = uint24.add(sequence, 1);
             packetization.offset += amount;
