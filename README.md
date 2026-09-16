@@ -5,6 +5,10 @@ It provides a client, a UDP listener, offline and connected handshakes,
 reliability, ordering, retransmission, congestion control, and split-packet
 reassembly.
 
+<p align="center">
+    Join our <a href="https://discord.gg/Yv9qPRQNc3">Discord</a>!
+</p>
+
 The implementation is designed for hostile network input. Attacker-controlled
 counts do not directly create unbounded allocations or loops, and protocol state
 is constrained by explicit connection, memory, packet, window, and work limits.
