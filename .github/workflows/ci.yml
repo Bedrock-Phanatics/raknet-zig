@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check build.zig build.zig.zon src tests
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: format
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+          cache-key: tests
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Run tests
+        run: zig build test -Doptimize=Debug -Dfuzz-iterations=20000
+
+  release-safe:
+    name: ReleaseSafe + Bench Smoke
+    needs: format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+          cache-key: release-safe
+
+      - name: Run ReleaseSafe tests
+        run: zig build test -Doptimize=ReleaseSafe -Dfuzz-iterations=20000
+
+      - name: Run benchmark smoke test
+        run: zig build bench
