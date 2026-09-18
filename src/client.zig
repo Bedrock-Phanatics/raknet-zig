@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const Config = @import("config.zig").Config;
 const net_address = @import("net/address.zig");
 const backend = @import("net/backend.zig");
@@ -7,8 +8,8 @@ const frame = @import("protocol/frame.zig");
 const offline = @import("protocol/offline.zig");
 const recovery = @import("reliability/recovery.zig");
 const core_mod = @import("session/core.zig");
-const receiver = @import("session/receiver.zig");
 const receipt_batch = @import("session/receipt_batch.zig");
+const receiver = @import("session/receiver.zig");
 const socket_emitter = @import("session/socket_emitter.zig");
 const time = @import("util/time.zig");
 

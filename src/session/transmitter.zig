@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const Config = @import("../config.zig").Config;
 const cursor = @import("../protocol/cursor.zig");
 const datagram = @import("../protocol/datagram.zig");

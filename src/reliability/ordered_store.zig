@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const uint24 = @import("../util/uint24.zig");
+
 const empty_ref = std.math.maxInt(u32);
 const class_count = 4;
 const class_sizes = [class_count]usize{ 64, 256, 576, 1200 };

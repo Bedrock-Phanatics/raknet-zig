@@ -1,7 +1,8 @@
 const std = @import("std");
-const uint24 = @import("../util/uint24.zig");
+
 const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
+const uint24 = @import("../util/uint24.zig");
 
 pub const OrderedQueue = struct {
     allocator: std.mem.Allocator,

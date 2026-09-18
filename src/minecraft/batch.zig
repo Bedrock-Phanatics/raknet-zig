@@ -17,12 +17,12 @@ pub const Algorithm = enum(u8) {
 };
 
 pub const Options = struct {
-    /// Includes the declared algorithm byte.
+    /// Includes the declared algorithm byte
     maximum_compressed_bytes: usize = default_maximum_decompressed_bytes,
     maximum_decompressed_bytes: usize = default_maximum_decompressed_bytes,
     maximum_packets: usize = default_maximum_packets,
     maximum_retained_capacity: usize = default_retained_capacity,
-    /// Compressed and decompressed bytes allowed per window.
+    /// Compressed and decompressed bytes allowed per window
     maximum_work_bytes_per_window: usize = 64 * 1024 * 1024,
     work_window_ms: u64 = 1000,
 };

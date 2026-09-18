@@ -1,6 +1,7 @@
 const std = @import("std");
-const frame = @import("../protocol/frame.zig");
+
 const payload_mod = @import("../payload.zig");
+const frame = @import("../protocol/frame.zig");
 
 const none = std.math.maxInt(u32);
 

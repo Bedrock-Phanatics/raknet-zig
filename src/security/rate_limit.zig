@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const time = @import("../util/time.zig");
 
 pub const Entry = struct { key: u64 = 0, tokens: u64 = 0, updated_ms: u64 = 0, occupied: bool = false };

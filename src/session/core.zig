@@ -1,15 +1,17 @@
 const std = @import("std");
+
 const Config = @import("../config.zig").Config;
 const ack = @import("../protocol/ack.zig");
 const datagram = @import("../protocol/datagram.zig");
+const frame = @import("../protocol/frame.zig");
 const congestion = @import("../reliability/congestion.zig");
 const reassembly = @import("../reliability/reassembly.zig");
 const recovery = @import("../reliability/recovery.zig");
 const rtt = @import("../reliability/rtt.zig");
+const outbound_queue = @import("outbound_queue.zig");
 const receiver = @import("receiver.zig");
 const transmitter = @import("transmitter.zig");
-const outbound_queue = @import("outbound_queue.zig");
-const frame = @import("../protocol/frame.zig");
+pub const FlushResult = transmitter.Sent;
 
 var next_send_owner: std.atomic.Value(u64) = .init(1);
 
@@ -55,8 +57,6 @@ pub const ApplicationCallbackError = error{ApplicationFailure};
 pub const SendError = error{TransportFailure};
 pub const SendHandle = struct { id: outbound_queue.Id, owner: u64 };
 pub const CancelResult = enum { canceled, not_found, in_progress };
-pub const FlushResult = transmitter.Sent;
-
 const QueuedMessages = struct {
     iterator: outbound_queue.Iterator,
 

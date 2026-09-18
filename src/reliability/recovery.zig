@@ -1,7 +1,8 @@
 const std = @import("std");
+
 const ack = @import("../protocol/ack.zig");
-const uint24 = @import("../util/uint24.zig");
 const time = @import("../util/time.zig");
+const uint24 = @import("../util/uint24.zig");
 
 const none = std.math.maxInt(u32);
 const class_count = 5;

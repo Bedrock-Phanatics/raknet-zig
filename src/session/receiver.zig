@@ -1,13 +1,13 @@
 const std = @import("std");
-const Config = @import("../config.zig").Config;
-const frame = @import("../protocol/frame.zig");
-const receive_window = @import("../reliability/receive_window.zig");
-const reassembly = @import("../reliability/reassembly.zig");
-const ordering = @import("../reliability/ordering.zig");
-const ordered_store = @import("../reliability/ordered_store.zig");
 
+const Config = @import("../config.zig").Config;
 pub const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
+const frame = @import("../protocol/frame.zig");
+const ordered_store = @import("../reliability/ordered_store.zig");
+const ordering = @import("../reliability/ordering.zig");
+const reassembly = @import("../reliability/reassembly.zig");
+const receive_window = @import("../reliability/receive_window.zig");
 
 pub const Receipt = struct {
     acknowledge: ?u32 = null,

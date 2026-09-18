@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const uint24 = @import("../util/uint24.zig");
 
 pub const Result = union(enum) {

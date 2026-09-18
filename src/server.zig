@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const Config = @import("config.zig").Config;
 const net_address = @import("net/address.zig");
 const backend = @import("net/backend.zig");
@@ -9,16 +10,16 @@ const recovery = @import("reliability/recovery.zig");
 const cookie = @import("security/cookie.zig");
 const rate = @import("security/rate_limit.zig");
 const core_mod = @import("session/core.zig");
-const handshake = @import("session/offline_handshake.zig");
 const deadline_queue = @import("session/deadline_queue.zig");
-const receiver = @import("session/receiver.zig");
+const EndpointKey = deadline_queue.Key;
+const handshake = @import("session/offline_handshake.zig");
 const receipt_batch = @import("session/receipt_batch.zig");
+const receiver = @import("session/receiver.zig");
 const socket_emitter = @import("session/socket_emitter.zig");
 const transmitter_mod = @import("session/transmitter.zig");
 const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
 const time = @import("util/time.zig");
 
-const EndpointKey = deadline_queue.Key;
 const State = enum { connecting, connected, closed };
 
 pub const Options = struct {

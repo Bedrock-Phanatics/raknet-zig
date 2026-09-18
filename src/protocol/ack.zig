@@ -1,6 +1,7 @@
 const std = @import("std");
-const cursor = @import("cursor.zig");
+
 const uint24 = @import("../util/uint24.zig");
+const cursor = @import("cursor.zig");
 
 pub const Record = struct {
     first: u32,

@@ -1,5 +1,4 @@
 const std = @import("std");
-
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const Jar = struct {
