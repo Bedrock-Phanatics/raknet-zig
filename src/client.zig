@@ -1,14 +1,13 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const backend = @import("net/backend.zig");
-const ack = @import("protocol/ack.zig");
 const connected = @import("protocol/connected.zig");
-const datagram = @import("protocol/datagram.zig");
 const frame = @import("protocol/frame.zig");
 const offline = @import("protocol/offline.zig");
 const recovery = @import("reliability/recovery.zig");
 const core_mod = @import("session/core.zig");
 const receiver = @import("session/receiver.zig");
+const receipt_batch = @import("session/receipt_batch.zig");
 const time = @import("util/time.zig");
 
 pub const Options = struct {
@@ -18,6 +17,7 @@ pub const Options = struct {
     client_guid: u64 = 0,
     handshake_timeout_ms: u32 = 5_000,
     handshake_retry_ms: u32 = 500,
+    receive_batch_size: usize = 32,
 };
 pub const MessageFn = *const fn (context: *anyopaque, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void;
 
@@ -29,18 +29,22 @@ pub const Client = struct {
     core: core_mod.Core,
     scratch: []u8,
     receive_buffer: []u8,
+    messages: []std.Io.net.IncomingMessage,
+    receive_storage: []u8,
     frame_scratch: []frame.Frame,
+    receipts: receipt_batch.Batch,
     client_guid: u64,
     server_guid: u64,
     mtu: u16,
     last_seen_ms: u64,
     outbound_deadline_ms: ?u64 = null,
+    ack_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
     closed: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
         try options.config.validate();
-        if (options.mtu < options.config.minimum_mtu or options.mtu > options.config.maximum_mtu or options.handshake_timeout_ms == 0 or options.handshake_retry_ms == 0 or options.handshake_retry_ms > options.handshake_timeout_ms) return error.InvalidConfiguration;
+        if (options.mtu < options.config.minimum_mtu or options.mtu > options.config.maximum_mtu or options.handshake_timeout_ms == 0 or options.handshake_retry_ms == 0 or options.handshake_retry_ms > options.handshake_timeout_ms or options.receive_batch_size == 0 or options.receive_batch_size > 256) return error.InvalidConfiguration;
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
         const local: std.Io.net.IpAddress = switch (server) {
@@ -68,10 +72,16 @@ pub const Client = struct {
 
         const frame_scratch = try allocator.alloc(frame.Frame, options.config.maximum_packets_per_iteration);
         errdefer allocator.free(frame_scratch);
+        const messages = try allocator.alloc(std.Io.net.IncomingMessage, options.receive_batch_size);
+        errdefer allocator.free(messages);
+        const receive_storage = try allocator.alloc(u8, try std.math.mul(usize, options.receive_batch_size, options.config.maximum_datagram_size));
+        errdefer allocator.free(receive_storage);
 
         var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
         errdefer core.deinit();
-        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .frame_scratch = frame_scratch, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu, .last_seen_ms = time.nowMilliseconds(io) };
+        var receipts = try receipt_batch.Batch.init(allocator, options.config.maximum_ack_records, reply2.mtu, options.config.maximum_acknowledged_datagrams);
+        errdefer receipts.deinit();
+        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .messages = messages, .receive_storage = receive_storage, .frame_scratch = frame_scratch, .receipts = receipts, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu, .last_seen_ms = time.nowMilliseconds(io) };
         try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
         self.last_seen_ms = time.nowMilliseconds(io);
         return self;
@@ -91,7 +101,10 @@ pub const Client = struct {
     }
     pub fn destroy(self: *Client) void {
         self.close();
+        self.receipts.deinit();
         self.core.deinit();
+        self.allocator.free(self.receive_storage);
+        self.allocator.free(self.messages);
         self.allocator.free(self.frame_scratch);
         self.allocator.free(self.receive_buffer);
         self.allocator.free(self.scratch);
@@ -152,6 +165,7 @@ pub const Client = struct {
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
         var deadline = time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms);
+        if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
@@ -175,16 +189,13 @@ pub const Client = struct {
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
-        const message = receiveTimed(&self.socket.value, self.io, self.receive_buffer, wait) catch |err| switch (err) {
+        const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
             error.Timeout => {
                 try self.processTimers(time.nowMilliseconds(self.io));
                 return error.Timeout;
             },
             else => return err,
         };
-        if (!std.meta.eql(message.from, self.server) or message.flags.trunc) return 0;
-        const now_ms = time.nowMilliseconds(self.io);
-        self.last_seen_ms = now_ms;
         const Bridge = struct {
             client: *Client,
             context: *anyopaque,
@@ -211,31 +222,41 @@ pub const Client = struct {
                 }
             }
         };
-        var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
-        const incoming = self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
-            const failure = core_mod.classifyIncomingError(err);
-            if (failure.disposition == .close_session) self.abort();
-            return err;
-        };
-        if (incoming == .data) {
-            self.flushReceipt(incoming.data) catch |err| {
-                if (core_mod.classifyTransitionError(.receipt, err).disposition == .close_session) self.abort();
+        var delivered: usize = 0;
+        var latest_ms = time.nowMilliseconds(self.io);
+        for (batch.messages) |message| {
+            if (!std.meta.eql(message.from, self.server)) continue;
+            const now_ms = time.nowMilliseconds(self.io);
+            latest_ms = now_ms;
+            self.last_seen_ms = now_ms;
+            var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
+            const incoming = self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
+                const failure = core_mod.classifyIncomingError(err);
+                if (failure.disposition == .close_session) self.abort();
                 return err;
             };
+            if (incoming == .data) {
+                delivered += incoming.data.delivered;
+                self.queueReceipt(incoming.data, now_ms) catch |err| {
+                    if (core_mod.classifyTransitionError(.receipt, err).disposition == .close_session) self.abort();
+                    return err;
+                };
+            }
+            if (bridge.remote_disconnect) {
+                self.flushReceipts() catch {};
+                self.abort();
+                return delivered;
+            }
         }
-        if (bridge.remote_disconnect) {
-            self.abort();
-            return if (incoming == .data) incoming.data.delivered else 0;
-        }
-        _ = self.flushQueuedAt(now_ms) catch |err| {
+        _ = self.flushQueuedAt(latest_ms) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
             return err;
         };
-        self.processDueTimers(now_ms) catch |err| {
+        self.processDueTimers(latest_ms) catch |err| {
             if (core_mod.classifyTransitionError(.retransmission, err).disposition == .close_session) self.abort();
             return err;
         };
-        return if (incoming == .data) incoming.data.delivered else 0;
+        return delivered;
     }
 
     fn finishConnectedHandshake(self: *Client, deadline: std.Io.Timeout, retry_ms: u32, maximum_work: usize) !void {
@@ -269,7 +290,10 @@ pub const Client = struct {
             const now_ms = time.nowMilliseconds(self.io);
             var state: Handshake = .{ .client = self, .now_ms = now_ms };
             const incoming = try self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &state, Handshake.deliver);
-            if (incoming == .data) try self.flushReceipt(incoming.data);
+            if (incoming == .data) {
+                try self.queueReceipt(incoming.data, now_ms);
+                try self.flushReceipts();
+            }
             if (state.accepted) return;
         }
         return error.HandshakeWorkLimitExceeded;
@@ -282,6 +306,7 @@ pub const Client = struct {
         return self.sendWireAs(payload, reliability, channel, now_ms, true);
     }
     fn sendWireAs(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64, control: bool) !usize {
+        if (control) try self.flushReceipts();
         const Emitter = struct {
             client: *Client,
             count: usize = 0,
@@ -315,53 +340,59 @@ pub const Client = struct {
         if (sent.datagrams == maximum_datagrams and self.core.outboundCount(.application) != 0) self.outbound_deadline_ms = now_ms;
         return sent;
     }
-    fn flushReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt) !void {
-        if (receipt.acknowledge) |sequence| {
-            const wire = datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch) catch return error.InternalFailure;
-            self.socket.send(self.server, wire) catch return error.TransportFailure;
-        }
-        if (receipt.missing) |gap| {
-            var ranges: [2]ack.Record = undefined;
-            const count: usize = if (gap.first <= gap.last) blk: {
-                ranges[0] = .{ .first = gap.first, .last = gap.last };
-                break :blk 1;
-            } else blk: {
-                ranges[0] = .{ .first = 0, .last = gap.last };
-                ranges[1] = .{ .first = gap.first, .last = 0xffffff };
-                break :blk 2;
-            };
-            const wire = datagram.encodeControl(.nack, ranges[0..count], self.scratch) catch return error.InternalFailure;
-            self.socket.send(self.server, wire) catch return error.TransportFailure;
-        }
+    fn queueReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
+        self.receipts.append(receipt) catch |err| switch (err) {
+            error.ReceiptBatchFull => {
+                try self.flushReceipts();
+                try self.receipts.append(receipt);
+            },
+            else => return err,
+        };
+        if (self.receipts.isEmpty()) return;
+        const delay = if (receipt.missing != null) 0 else self.core.config.maximum_ack_delay_ms;
+        const deadline = time.deadline(now_ms, delay);
+        self.ack_deadline_ms = if (self.ack_deadline_ms) |current| @min(current, deadline) else deadline;
+    }
+    fn flushReceipts(self: *Client) !void {
+        _ = try self.flushReceiptsUpTo(self.receipts.count());
+    }
+    fn flushReceiptsUpTo(self: *Client, maximum_work: usize) !usize {
+        const sent = try self.receipts.flush(&self.socket, &self.server, maximum_work);
+        if (self.receipts.isEmpty()) self.ack_deadline_ms = null;
+        return sent;
     }
     fn processDueTimers(self: *Client, now_ms: u64) !void {
         var remaining = self.core.config.maximum_packets_per_iteration;
-        var active: usize = @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
+        var active: usize = @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms) +
+            @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
             @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
         const start = self.timer_cursor;
         var visited: usize = 0;
-        while (visited < 3 and remaining != 0 and active != 0) : (visited += 1) {
-            const timer = (start + visited) % 3;
+        while (visited < 4 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 4;
             const due = switch (timer) {
-                0 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
-                1 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
+                0 => self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms,
+                1 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
+                2 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
                 else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
             };
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
             const used = switch (timer) {
-                0 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
-                1 => self.core.expireSplits(now_ms, quota).inspected,
+                0 => try self.flushReceiptsUpTo(quota),
+                1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
+                2 => self.core.expireSplits(now_ms, quota).inspected,
                 else => try self.flushRetransmissions(now_ms, quota),
             };
             remaining -= @min(remaining, used);
             active -= 1;
-            self.timer_cursor = @intCast((timer + 1) % 3);
+            self.timer_cursor = @intCast((timer + 1) % 4);
         }
     }
 
     fn flushRetransmissions(self: *Client, now_ms: u64, maximum_work: usize) !usize {
+        try self.flushReceipts();
         var due: [256]recovery.Due = undefined;
         const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, maximum_work)], maximum_work);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;

@@ -1,9 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const backend = @import("net/backend.zig");
-const ack = @import("protocol/ack.zig");
 const connected = @import("protocol/connected.zig");
-const datagram = @import("protocol/datagram.zig");
 const frame = @import("protocol/frame.zig");
 const offline = @import("protocol/offline.zig");
 const recovery = @import("reliability/recovery.zig");
@@ -13,6 +11,7 @@ const core_mod = @import("session/core.zig");
 const handshake = @import("session/offline_handshake.zig");
 const deadline_queue = @import("session/deadline_queue.zig");
 const receiver = @import("session/receiver.zig");
+const receipt_batch = @import("session/receipt_batch.zig");
 const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
 const time = @import("util/time.zig");
 
@@ -64,9 +63,7 @@ pub const Session = struct {
     key: EndpointKey,
     core: core_mod.Core,
     scratch: []u8,
-    pending_acks: []u32,
-    pending_ack_head: usize = 0,
-    pending_ack_count: usize = 0,
+    receipts: receipt_batch.Batch,
     ack_deadline_ms: ?u64 = null,
     outbound_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
@@ -85,13 +82,14 @@ pub const Session = struct {
         errdefer core.deinit();
         const scratch = try allocator.alloc(u8, mtu);
         errdefer allocator.free(scratch);
-        const pending_acks = try allocator.alloc(u32, ack_capacity);
-        self.* = .{ .allocator = allocator, .socket = socket, .address = address, .key = key, .core = core, .scratch = scratch, .pending_acks = pending_acks, .deadlines = deadlines, .client_guid = client_guid, .mtu = mtu, .last_seen_ms = now_ms, .handshake_deadline_ms = time.deadline(now_ms, handshake_timeout_ms), .idle_timeout_ms = config.idle_timeout_ms };
+        var receipts = try receipt_batch.Batch.init(allocator, @min(ack_capacity, config.maximum_ack_records), mtu, config.maximum_acknowledged_datagrams);
+        errdefer receipts.deinit();
+        self.* = .{ .allocator = allocator, .socket = socket, .address = address, .key = key, .core = core, .scratch = scratch, .receipts = receipts, .deadlines = deadlines, .client_guid = client_guid, .mtu = mtu, .last_seen_ms = now_ms, .handshake_deadline_ms = time.deadline(now_ms, handshake_timeout_ms), .idle_timeout_ms = config.idle_timeout_ms };
         return self;
     }
     fn destroy(self: *Session) void {
         self.core.deinit();
-        self.allocator.free(self.pending_acks);
+        self.receipts.deinit();
         self.allocator.free(self.scratch);
         self.allocator.destroy(self);
     }
@@ -160,6 +158,7 @@ pub const Session = struct {
         return self.sendAtLane(payload, reliability, channel, now_ms, false);
     }
     fn sendAtLane(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64, control: bool) !usize {
+        if (control) try self.flushReceipts();
         const Emitter = struct {
             session: *Session,
             count: usize = 0,
@@ -199,44 +198,25 @@ pub const Session = struct {
         return sent;
     }
     fn queueReceipt(self: *Session, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
-        if (receipt.acknowledge) |sequence| {
-            if (self.pending_ack_count == self.pending_acks.len) try self.flushAcks();
-            const tail = (self.pending_ack_head + self.pending_ack_count) % self.pending_acks.len;
-            self.pending_acks[tail] = sequence;
-            self.pending_ack_count += 1;
-            self.ack_deadline_ms = if (self.ack_deadline_ms) |deadline| @min(deadline, now_ms) else now_ms;
-            try self.schedule();
-        }
-        if (receipt.missing) |gap| {
-            var ranges: [2]ack.Record = undefined;
-            const count: usize = if (gap.first <= gap.last) blk: {
-                ranges[0] = .{ .first = gap.first, .last = gap.last };
-                break :blk 1;
-            } else blk: {
-                ranges[0] = .{ .first = 0, .last = gap.last };
-                ranges[1] = .{ .first = gap.first, .last = 0xffffff };
-                break :blk 2;
-            };
-            const wire = datagram.encodeControl(.nack, ranges[0..count], self.scratch) catch return error.InternalFailure;
-            self.socket.send(self.address, wire) catch return error.TransportFailure;
-        }
+        self.receipts.append(receipt) catch |err| switch (err) {
+            error.ReceiptBatchFull => {
+                try self.flushReceipts();
+                try self.receipts.append(receipt);
+            },
+            else => return err,
+        };
+        if (self.receipts.isEmpty()) return;
+        const delay = if (receipt.missing != null) 0 else self.core.config.maximum_ack_delay_ms;
+        const deadline = time.deadline(now_ms, delay);
+        self.ack_deadline_ms = if (self.ack_deadline_ms) |current| @min(current, deadline) else deadline;
+        try self.schedule();
     }
-    fn flushAcks(self: *Session) !void {
-        _ = try self.flushAcksUpTo(self.pending_ack_count);
+    fn flushReceipts(self: *Session) !void {
+        _ = try self.flushReceiptsUpTo(self.receipts.count());
     }
-    fn flushAcksUpTo(self: *Session, maximum_work: usize) !usize {
-        var sent: usize = 0;
-        while (sent < maximum_work and self.pending_ack_count != 0) : (sent += 1) {
-            const sequence = self.pending_acks[self.pending_ack_head];
-            const wire = datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, self.scratch) catch return error.InternalFailure;
-            self.socket.send(self.address, wire) catch return error.TransportFailure;
-            self.pending_ack_head = (self.pending_ack_head + 1) % self.pending_acks.len;
-            self.pending_ack_count -= 1;
-        }
-        if (self.pending_ack_count == 0) {
-            self.pending_ack_head = 0;
-            self.ack_deadline_ms = null;
-        }
+    fn flushReceiptsUpTo(self: *Session, maximum_work: usize) !usize {
+        const sent = try self.receipts.flush(self.socket, &self.address, maximum_work);
+        if (self.receipts.isEmpty()) self.ack_deadline_ms = null;
         return sent;
     }
     fn schedule(self: *Session) !void {
@@ -267,7 +247,7 @@ pub const Session = struct {
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
             const used = switch (timer) {
-                0 => try self.flushAcksUpTo(quota),
+                0 => try self.flushReceiptsUpTo(quota),
                 1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
                 2 => self.core.expireSplits(now_ms, quota).inspected,
                 else => try self.flushRetransmissions(now_ms, quota),
@@ -279,6 +259,7 @@ pub const Session = struct {
         return maximum_work - remaining;
     }
     fn flushRetransmissions(self: *Session, now_ms: u64, maximum_work: usize) !usize {
+        try self.flushReceipts();
         var due: [256]recovery.Due = undefined;
         const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, maximum_work)], maximum_work);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
@@ -356,7 +337,7 @@ pub const Listener = struct {
             .timer_entries = timer_entries,
             .handshake_output = handshake_output,
             .handshake_timeout_ms = options.handshake_timeout_ms,
-            .ack_capacity = options.receive_batch_size,
+            .ack_capacity = options.config.maximum_ack_records,
         };
         self.handshake_handler = try handshake.Handler.init(guid, options.protocol_version, options.config.minimum_mtu, options.config.maximum_mtu, self.advertisement, .{ .current_key = random[8..40].*, .previous_key = random[40..72].* }, &self.limiter);
         return self;
@@ -420,6 +401,12 @@ pub const Listener = struct {
                     @intFromEnum(offline.Id.unconnected_ping), @intFromEnum(offline.Id.unconnected_ping_open_connections), @intFromEnum(offline.Id.open_connection_request_1), @intFromEnum(offline.Id.open_connection_request_2) => true,
                     else => false,
                 }) {
+                    session.flushReceipts() catch |err| {
+                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.receipt, err).class);
+                        session.state = .closed;
+                        self.removeSession(key, callbacks);
+                        continue;
+                    };
                     const repeated = self.handshake_handler.handle(message.data, &key, std.hash.Wyhash.hash(self.source_secret, &key), now_ms / 30_000, now_ms, self.handshake_output);
                     switch (repeated) {
                         .drop => stats.rate_limited_or_dropped += 1,
@@ -507,7 +494,7 @@ pub const Listener = struct {
                     };
                 }
                 if (session.state == .closed) {
-                    session.flushAcks() catch |err| {
+                    session.flushReceipts() catch |err| {
                         recordSessionFailure(&stats, core_mod.classifyTransitionError(.receipt, err).class);
                     };
                     self.removeSession(key, callbacks);
@@ -713,7 +700,7 @@ test "listener answers an offline ping over loopback" {
     const connection_request = try connected.encodeConnectionRequest(0x8000_0000_0000_0001, 1000, &control);
     _ = try transmitter.send(connection_request, .reliable_ordered, 0, send_scratch[0..mtu], &sender, Sender.emit);
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
-    try std.testing.expectEqual(@as(usize, 0), scheduled.pending_ack_count);
+    try std.testing.expectEqual(@as(usize, 0), scheduled.receipts.count());
     const retransmission_deadline = scheduled.core.nextRetransmissionDeadline().?;
     try std.testing.expectEqual(retransmission_deadline, listener.nextDeadline().?);
     const accepted_datagram = try client.value.receive(io, &response);
@@ -729,4 +716,22 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expectEqual(@as(usize, 1), timer_stats.sessions_expired);
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
     try std.testing.expect(listener.nextDeadline() == null);
+}
+
+test "ACK delay schedules while NACK remains urgent" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var socket = try backend.Socket.bind(io, address, 576);
+    defer socket.close();
+    var deadlines = try deadline_queue.Queue.init(std.testing.allocator, 1);
+    defer deadlines.deinit();
+    var config: Config = .{};
+    config.maximum_ack_delay_ms = 5;
+    const key = endpointKey(socket.value.address);
+    const session = try Session.create(std.testing.allocator, &socket, &deadlines, socket.value.address, key, 1, 576, 100, 1000, 8, config);
+    defer session.destroy();
+    try session.queueReceipt(.{ .acknowledge = 1 }, 100);
+    try std.testing.expectEqual(@as(?u64, 105), session.ack_deadline_ms);
+    try session.queueReceipt(.{ .missing = .{ .first = 2, .last = 2, .count = 1 } }, 102);
+    try std.testing.expectEqual(@as(?u64, 102), session.ack_deadline_ms);
 }

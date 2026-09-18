@@ -8,6 +8,7 @@ const receive_window = raknet.reliability.receive_window;
 const recovery = raknet.reliability.recovery;
 const ordered_store = raknet.reliability.ordered_store;
 const deadline_queue = raknet.session.deadline_queue;
+const receipt_batch = raknet.session.receipt_batch;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -160,6 +161,15 @@ pub fn main(init: std.process.Init) !void {
     const retention_classes = try benchmarkRetention(io, ordered_iterations, true);
     checksum +%= ordered_ring.checksum +% ordered_hash.checksum +% retention_exact.checksum +% retention_classes.checksum;
     const ordered_messages = ordered_iterations * 256;
+    const ack_batch_messages: usize = 1_000_000;
+    const ack_singleton = benchmarkAckBatching(io, ack_batch_messages, 1);
+    const ack_input_batch = benchmarkAckBatching(io, ack_batch_messages, 32);
+    const ack_delay_0 = benchmarkAckBatching(io, ack_batch_messages, 1);
+    const ack_delay_1 = benchmarkAckBatching(io, ack_batch_messages, 2);
+    const ack_delay_2 = benchmarkAckBatching(io, ack_batch_messages, 3);
+    const ack_delay_5 = benchmarkAckBatching(io, ack_batch_messages, 6);
+    const ack_delay_10 = benchmarkAckBatching(io, ack_batch_messages, 11);
+    checksum +%= ack_singleton.checksum +% ack_input_batch.checksum +% ack_delay_0.checksum +% ack_delay_1.checksum +% ack_delay_2.checksum +% ack_delay_5.checksum +% ack_delay_10.checksum;
 
     std.debug.print(
         "ack_decode: {d:.2} ns/op\nframe_decode: {d:.2} ns/op\nwindow_add: {d:.2} ns/op\n" ++
@@ -217,12 +227,38 @@ pub fn main(init: std.process.Init) !void {
             checksum,
         },
     );
+    std.debug.print(
+        "ack_singleton: {d:.2} ns/message, {d} datagrams\n" ++
+            "ack_input_batch_32: {d:.2} ns/message, {d} datagrams\n" ++
+            "ack_timer_0ms: {d:.2} ns/message, {d} datagrams\n" ++
+            "ack_timer_1ms: {d:.2} ns/message, {d} datagrams\n" ++
+            "ack_timer_2ms: {d:.2} ns/message, {d} datagrams\n" ++
+            "ack_timer_5ms: {d:.2} ns/message, {d} datagrams\n" ++
+            "ack_timer_10ms: {d:.2} ns/message, {d} datagrams\n",
+        .{
+            @as(f64, @floatFromInt(ack_singleton.nanoseconds)) / @as(f64, @floatFromInt(ack_batch_messages)),
+            ack_singleton.datagrams,
+            @as(f64, @floatFromInt(ack_input_batch.nanoseconds)) / @as(f64, @floatFromInt(ack_batch_messages)),
+            ack_input_batch.datagrams,
+            @as(f64, @floatFromInt(ack_delay_0.nanoseconds)) / @as(f64, @floatFromInt(ack_batch_messages)),
+            ack_delay_0.datagrams,
+            @as(f64, @floatFromInt(ack_delay_1.nanoseconds)) / @as(f64, @floatFromInt(ack_batch_messages)),
+            ack_delay_1.datagrams,
+            @as(f64, @floatFromInt(ack_delay_2.nanoseconds)) / @as(f64, @floatFromInt(ack_batch_messages)),
+            ack_delay_2.datagrams,
+            @as(f64, @floatFromInt(ack_delay_5.nanoseconds)) / @as(f64, @floatFromInt(ack_batch_messages)),
+            ack_delay_5.datagrams,
+            @as(f64, @floatFromInt(ack_delay_10.nanoseconds)) / @as(f64, @floatFromInt(ack_batch_messages)),
+            ack_delay_10.datagrams,
+        },
+    );
 }
 
 const DueMeasurement = struct { nanoseconds: u64, checksum: usize };
 const PackingMeasurement = struct { nanoseconds: u64, wire_bytes: usize, datagrams: usize, checksum: usize };
 const RecoveryMeasurement = struct { nanoseconds: u64, retained_bytes: usize, checksum: usize };
 const StorageMeasurement = struct { nanoseconds: u64, retained_bytes: usize, checksum: usize };
+const AckBatchMeasurement = struct { nanoseconds: u64, datagrams: usize, checksum: usize };
 const bedrock_payload_sizes = [_]usize{ 5, 7, 9, 12, 16, 20, 24, 32, 40, 52, 68, 96, 140, 220, 360, 700 };
 
 fn benchmarkFramePacking(io: std.Io, iterations: usize, pack: bool) !PackingMeasurement {
@@ -383,6 +419,32 @@ fn retentionClass(size: usize) usize {
     const classes = [_]usize{ 64, 256, 576, 1200, 1492 };
     for (classes) |class| if (size <= class) return class;
     return size;
+}
+
+fn benchmarkAckBatching(io: std.Io, message_count: usize, group_size: usize) AckBatchMeasurement {
+    var values: [32]u32 = undefined;
+    var records: [32]ack.Record = undefined;
+    var wire: [1492]u8 = undefined;
+    var datagrams_count: usize = 0;
+    var checksum: usize = 0;
+    var sequence: u32 = 0;
+    const start = std.Io.Clock.awake.now(io);
+    var remaining = message_count;
+    while (remaining != 0) {
+        const count = @min(remaining, group_size);
+        for (values[0..count]) |*value| {
+            value.* = sequence;
+            sequence += 1;
+        }
+        const canonical = receipt_batch.canonicalizeValues(values[0..count], &records);
+        const encoded = datagram.encodeControl(.ack, canonical, &wire) catch unreachable;
+        checksum +%= encoded.len + encoded[encoded.len - 1];
+        datagrams_count += 1;
+        remaining -= count;
+        std.mem.doNotOptimizeAway(encoded.ptr);
+    }
+    const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    return .{ .nanoseconds = nanoseconds, .datagrams = datagrams_count, .checksum = checksum };
 }
 
 fn benchmarkDueBatch(io: std.Io, capacity: usize, due_per_turn: usize, turns: usize) !DueMeasurement {

@@ -33,6 +33,7 @@ pub const reliability = struct {
 };
 pub const session = struct {
     pub const deadline_queue = @import("session/deadline_queue.zig");
+    pub const receipt_batch = @import("session/receipt_batch.zig");
     pub const offline_handshake = @import("session/offline_handshake.zig");
     pub const Receiver = @import("session/receiver.zig").Receiver;
     pub const Transmitter = @import("session/transmitter.zig").Transmitter;
@@ -67,6 +68,7 @@ test {
     _ = @import("security/rate_limit.zig");
     _ = @import("session/offline_handshake.zig");
     _ = @import("session/deadline_queue.zig");
+    _ = @import("session/receipt_batch.zig");
     _ = @import("session/outbound_queue.zig");
     _ = @import("session/receiver.zig");
     _ = @import("session/transmitter.zig");

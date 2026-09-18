@@ -8,6 +8,8 @@ pub const Config = struct {
     maximum_frame_payload: usize = 8192,
     maximum_ack_records: usize = 256,
     maximum_acknowledged_datagrams: usize = 4096,
+    /// Zero flushes ACKs at the end of each input batch.
+    maximum_ack_delay_ms: u32 = 0,
     receive_window: usize = 4096,
     reliable_window: usize = 4096,
     maximum_retransmissions: usize = 4096,
@@ -35,8 +37,9 @@ pub const Config = struct {
         if (self.minimum_mtu < 400 or self.minimum_mtu > self.maximum_mtu) return error.InvalidConfiguration;
         if (self.maximum_datagram_size < self.maximum_mtu or self.maximum_datagram_size > 65_507) return error.InvalidConfiguration;
         if (self.maximum_frame_payload == 0 or self.maximum_frame_payload > self.maximum_split_bytes) return error.InvalidConfiguration;
-        if (self.maximum_ack_records == 0 or self.maximum_ack_records > 65_535) return error.InvalidConfiguration;
+        if (self.maximum_ack_records < 2 or self.maximum_ack_records > 65_535) return error.InvalidConfiguration;
         if (self.maximum_acknowledged_datagrams == 0 or self.maximum_acknowledged_datagrams > 0x800000) return error.InvalidConfiguration;
+        if (self.maximum_ack_delay_ms > 10) return error.InvalidConfiguration;
         if (self.receive_window == 0 or self.receive_window > 0x7fffff) return error.InvalidConfiguration;
         if (self.reliable_window == 0 or self.reliable_window > 0x7fffff) return error.InvalidConfiguration;
         if (self.maximum_retransmissions == 0 or self.maximum_recovery_bytes == 0 or self.maximum_order_channels == 0 or self.maximum_order_channels > 256) return error.InvalidConfiguration;
@@ -56,6 +59,12 @@ test "default configuration is internally consistent" {
     try Config.validate(.{});
     var bad: Config = .{};
     bad.receive_window = 0x800000;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.maximum_ack_records = 1;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.maximum_ack_delay_ms = 11;
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
     bad = .{};
     bad.maximum_recovery_bytes = 0;
