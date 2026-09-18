@@ -15,18 +15,13 @@ var next_send_owner: std.atomic.Value(u64) = .init(1);
 pub const Incoming = union(enum) {
     data: receiver.Receipt,
     acknowledged: recovery.Acknowledged,
-    nack_marked: NackMarked,
-
-    pub fn workUnits(self: Incoming) usize {
-        return switch (self) {
-            .data => |receipt| receipt.workUnits(),
-            .acknowledged => |result| 1 + result.work,
-            .nack_marked => |result| 1 + result.work,
-        };
-    }
+    nack_marked: usize,
 };
 
-pub const NackMarked = struct { marked: usize, work: usize };
+pub const ProcessedIncoming = struct {
+    incoming: Incoming,
+    work_units: usize,
+};
 
 pub const IncomingErrorClass = enum {
     protocol,
@@ -422,31 +417,37 @@ pub const Core = struct {
     }
 
     pub fn processIncoming(self: *Core, wire: []const u8, now_ms: u64, context: *anyopaque, deliver: receiver.DeliverFn) !Incoming {
-        return self.processIncomingImpl(wire, now_ms, null, context, deliver);
+        return (try self.processIncomingImpl(wire, now_ms, null, context, deliver)).incoming;
     }
 
     pub fn processIncomingWithScratch(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: []frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !Incoming {
+        return (try self.processIncomingImpl(wire, now_ms, frame_scratch, context, deliver)).incoming;
+    }
+
+    pub fn processIncomingCountedWithScratch(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: []frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !ProcessedIncoming {
         return self.processIncomingImpl(wire, now_ms, frame_scratch, context, deliver);
     }
 
-    fn processIncomingImpl(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: ?[]frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !Incoming {
+    fn processIncomingImpl(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: ?[]frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !ProcessedIncoming {
         if (wire.len > self.config.maximum_datagram_size) return error.DatagramTooLarge;
         return switch (try datagram.decode(wire, self.ack_records, self.config.maximum_ack_records, self.config.maximum_acknowledged_datagrams)) {
-            .data => .{ .data = if (frame_scratch) |scratch|
-                try self.receiver_state.processWithScratch(wire, now_ms, scratch, context, deliver)
-            else
-                try self.receiver_state.process(wire, now_ms, context, deliver) },
+            .data => blk: {
+                const receipt = if (frame_scratch) |scratch|
+                    try self.receiver_state.processWithScratch(wire, now_ms, scratch, context, deliver)
+                else
+                    try self.receiver_state.process(wire, now_ms, context, deliver);
+                break :blk .{ .incoming = .{ .data = receipt }, .work_units = receipt.workUnits() };
+            },
             .ack => |decoded| blk: {
-                var result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
-                result.work = decoded.acknowledged_count;
+                const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
                 if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes);
                 if (result.rtt_sample_ms) |sample| self.rtt_state.observe(sample);
-                break :blk .{ .acknowledged = result };
+                break :blk .{ .incoming = .{ .acknowledged = result }, .work_units = 1 + decoded.acknowledged_count };
             },
             .nack => |decoded| blk: {
                 const marked = try self.recovery_state.markNack(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
                 if (marked != 0) self.congestion_state.lost(self.newest_sent);
-                break :blk .{ .nack_marked = .{ .marked = marked, .work = decoded.acknowledged_count } };
+                break :blk .{ .incoming = .{ .nack_marked = marked }, .work_units = 1 + decoded.acknowledged_count };
             },
         };
     }
@@ -482,10 +483,10 @@ test "core validates ACKs against actual send state" {
     var bytes: [32]u8 = undefined;
     const wire = try datagram.encodeControl(.ack, &.{.{ .first = 2, .last = 4 }}, &bytes);
     var unused: u8 = 0;
-    const result = try core.processIncoming(wire, 150, &unused, Collector.discard);
-    try std.testing.expectEqual(@as(usize, 1), result.acknowledged.packets);
-    try std.testing.expectEqual(@as(?u64, 50), result.acknowledged.rtt_sample_ms);
-    try std.testing.expectEqual(@as(usize, 4), result.workUnits());
+    const counted = try core.processIncomingCountedWithScratch(wire, 150, &.{}, &unused, Collector.discard);
+    try std.testing.expectEqual(@as(usize, 1), counted.incoming.acknowledged.packets);
+    try std.testing.expectEqual(@as(?u64, 50), counted.incoming.acknowledged.rtt_sample_ms);
+    try std.testing.expectEqual(@as(usize, 4), counted.work_units);
     try std.testing.expectEqual(@as(usize, 0), (try core.processIncoming(wire, 160, &unused, Collector.discard)).acknowledged.packets);
 }
 

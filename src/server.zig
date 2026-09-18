@@ -479,7 +479,7 @@ pub const Listener = struct {
                     }
                 };
                 var bridge: Bridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
-                const incoming = session.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
+                const processed_incoming = session.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
                     remaining = 0;
                     const failure = core_mod.classifyIncomingError(err);
                     if (failure.disposition == .reject) {
@@ -492,7 +492,8 @@ pub const Listener = struct {
                     self.removeSession(key, callbacks);
                     continue;
                 };
-                const extra_work = incoming.workUnits() -| 1;
+                const incoming = processed_incoming.incoming;
+                const extra_work = processed_incoming.work_units -| 1;
                 remaining -= @min(remaining, extra_work);
                 if (incoming == .data) {
                     session.queueReceipt(incoming.data, now_ms) catch |err| {

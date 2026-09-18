@@ -242,12 +242,13 @@ pub const Client = struct {
             const now_ms = latest_ms;
             self.last_seen_ms = now_ms;
             var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
-            const incoming = self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
+            const processed_incoming = self.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
                 const failure = core_mod.classifyIncomingError(err);
                 if (failure.disposition == .close_session) self.abort();
                 return err;
             };
-            const extra_work = incoming.workUnits() -| 1;
+            const incoming = processed_incoming.incoming;
+            const extra_work = processed_incoming.work_units -| 1;
             remaining -= @min(remaining, extra_work);
             if (incoming == .data) {
                 delivered += incoming.data.delivered;
