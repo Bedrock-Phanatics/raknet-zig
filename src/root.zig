@@ -14,6 +14,9 @@ pub const ServerOptions = @import("server.zig").Options;
 pub const net = struct {
     pub const Socket = @import("net/backend.zig").Socket;
 };
+pub const minecraft = struct {
+    pub const batch = @import("minecraft/batch.zig");
+};
 pub const protocol = struct {
     pub const cursor = @import("protocol/cursor.zig");
     pub const connected = @import("protocol/connected.zig");
@@ -73,4 +76,5 @@ test {
     _ = @import("session/receiver.zig");
     _ = @import("session/transmitter.zig");
     _ = @import("session/core.zig");
+    _ = @import("minecraft/batch.zig");
 }

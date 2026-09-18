@@ -26,6 +26,7 @@ is constrained by explicit connection, memory, packet, window, and work limits.
 - Bounded split-packet reassembly and ordered-packet storage
 - Batched reads and deadline-driven maintenance
 - Stateless handshake cookies, rate limiting, and session memory quotas
+- Optional bounded Minecraft batch decoding for zlib and Snappy
 - IPv4 and IPv6 support
 
 ## Requirements
@@ -168,6 +169,21 @@ Callback payloads are borrowed:
 Callbacks execute inside `poll`. Keep them short and move expensive work to an
 application-owned queue after copying any required payload.
 
+## Optional Minecraft batch codec
+
+```zig
+var decoder = try raknet.minecraft.batch.Decoder.init(allocator, .{});
+defer decoder.deinit();
+
+_ = try decoder.decodeBorrowed(batch, .declared, now_ms, context, onPacket);
+var owned = try decoder.decodeOwned(batch, .declared, now_ms);
+defer owned.deinit();
+```
+
+Borrowed packet bytes expire when their callback returns. Pass `.disabled`
+before compression is negotiated. Encrypted batches must be authenticated and
+decrypted before decoding.
+
 ## Sending and backpressure
 
 ```zig
@@ -241,10 +257,10 @@ this transport as required.
 
 ## Scope
 
-This package implements RakNet transport. It does not implement Minecraft login,
-packet versions, encryption, compression, resource packs, or gameplay protocol.
-Applications remain responsible for those layers and for validating compatibility
-with the Bedrock versions and platforms they support.
+This package implements RakNet transport and an optional Minecraft packet-batch
+codec. It does not implement Minecraft login, packet versions, encryption,
+resource packs, or gameplay protocol. Applications remain responsible for those
+layers and for validating compatibility with supported Bedrock versions.
 
 ## Development
 
