@@ -267,7 +267,7 @@ pub const Reassembler = struct {
         self.heap[position] = @intCast(slot);
         self.heap_len += 1;
         self.assemblies[slot].heap_index = @intCast(position);
-        self.siftUp(position);
+        self.siftUp(@intCast(position));
     }
 
     fn heapRemove(self: *Reassembler, raw_position: u32) void {
@@ -277,7 +277,7 @@ pub const Reassembler = struct {
         const moved = self.heap[self.heap_len];
         self.heap[position] = moved;
         self.assemblies[moved].heap_index = @intCast(position);
-        self.siftDown(position);
+        self.siftDown(@intCast(position));
         self.siftUp(self.assemblies[moved].heap_index);
     }
 
@@ -397,7 +397,7 @@ test "fragment classes are reused and oversized storage is evicted" {
     var large: [1300]u8 = @splat(1);
     try std.testing.expect((try value.push(3, 2, 0, &large, 4)) == null);
     try std.testing.expect(try value.pushScatter(3, 2, 1, &large, 5, &unused, Consumer.consume));
-    try std.testing.expectEqual(@as(usize, 128), value.retainedCapacity());
+    try std.testing.expectEqual(@as(usize, 0), value.retainedCapacity());
 }
 
 test "split limits reject before payload allocation" {

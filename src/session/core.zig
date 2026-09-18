@@ -59,7 +59,7 @@ pub const FlushResult = transmitter.Sent;
 const QueuedMessages = struct {
     iterator: outbound_queue.Iterator,
 
-    fn next(self: *@This()) ?transmitter.PackedMessage {
+    pub fn next(self: *@This()) ?transmitter.PackedMessage {
         const message = self.iterator.next() orelse return null;
         return .{
             .payload = message.payload.bytes,
@@ -494,13 +494,15 @@ test "recovery and outbound queue byte limits are independent" {
     var recovery_limited: Config = .{};
     recovery_limited.maximum_recovery_bytes = 1;
     recovery_limited.maximum_queued_outbound_bytes = 1024;
+    recovery_limited.reserved_control_queue_bytes = 128;
     var first = try Core.init(std.testing.allocator, 1200, recovery_limited);
     defer first.deinit();
     try std.testing.expectError(error.RecoveryBytesExceeded, first.trackSent(1, "xx", 2, 0));
 
     var queue_limited: Config = .{};
     queue_limited.maximum_recovery_bytes = 2;
-    queue_limited.maximum_queued_outbound_bytes = 1;
+    queue_limited.maximum_queued_outbound_bytes = 2;
+    queue_limited.reserved_control_queue_bytes = 1;
     var second = try Core.init(std.testing.allocator, 1200, queue_limited);
     defer second.deinit();
     try second.trackSent(1, "xx", 2, 0);

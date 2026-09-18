@@ -99,6 +99,15 @@ pub const Session = struct {
     pub fn rttMs(self: Session) ?u64 {
         return if (self.core.rtt_state.initialized) self.core.rtt_state.smoothed_ms else null;
     }
+    pub fn close(self: *Session) void {
+        if (self.state == .closed) return;
+        if (self.state == .connected) {
+            const payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
+            self.sendControl(&payload, .reliable_ordered, time.nowMilliseconds(self.socket.io)) catch {};
+        }
+        self.state = .closed;
+        self.deadlines.upsert(self.key, time.nowMilliseconds(self.socket.io)) catch {};
+    }
     pub fn send(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
         if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
     }
@@ -198,12 +207,9 @@ pub const Session = struct {
         return sent;
     }
     fn queueReceipt(self: *Session, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
-        self.receipts.append(receipt) catch |err| switch (err) {
-            error.ReceiptBatchFull => {
-                try self.flushReceipts();
-                try self.receipts.append(receipt);
-            },
-            else => return err,
+        self.receipts.append(receipt) catch {
+            try self.flushReceipts();
+            try self.receipts.append(receipt);
         };
         if (self.receipts.isEmpty()) return;
         const delay = if (receipt.missing != null) 0 else self.core.config.maximum_ack_delay_ms;
@@ -349,16 +355,18 @@ pub const Listener = struct {
 
     pub fn close(self: *Listener) void {
         if (self.closed) return;
+        var iterator = self.sessions.valueIterator();
+        while (iterator.next()) |session| session.*.close();
         self.closed = true;
         self.socket.close();
     }
     pub fn destroy(self: *Listener) void {
+        self.close();
         var iterator = self.sessions.valueIterator();
         while (iterator.next()) |session| session.*.destroy();
         self.sessions.deinit(self.session_quota.allocator());
         std.debug.assert(self.session_quota.used_bytes == 0);
         self.deadlines.deinit();
-        self.close();
         self.allocator.free(self.timer_entries);
         self.allocator.free(self.frame_scratch);
         self.allocator.free(self.handshake_output);
@@ -535,6 +543,8 @@ pub const Listener = struct {
                 .accepted => |accepted| {
                     if (self.sessions.count() >= self.config.maximum_connections) {
                         stats.rate_limited_or_dropped += 1;
+                        const response = offline.encodeNoFreeIncomingConnections(self.handshake_handler.server_guid, self.handshake_output) catch continue;
+                        try self.socket.send(message.from, response);
                         continue;
                     }
                     const session_allocator = self.session_quota.allocator();
@@ -652,7 +662,10 @@ fn toRakAddress(address: std.Io.net.IpAddress) offline.Address {
     };
 }
 test "listener answers an offline ping over loopback" {
-    const io = std.testing.io;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
     var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;zig-raknet" });
     defer listener.destroy();
@@ -738,7 +751,18 @@ test "listener answers an offline ping over loopback" {
     const accepted_frame = try @import("protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
     try std.testing.expect((try connected.decode(accepted_frame.payload)) == .connection_request_accepted);
 
+    _ = try transmitter.send(connection_request, .reliable_ordered, 0, send_scratch[0..mtu], &sender, Sender.emit);
+    _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
+    const repeated_accepted = try client.value.receive(io, &response);
+    var repeated_datagram = try @import("protocol/frame.zig").decodeDatagram(repeated_accepted.data);
+    const repeated_frame = try @import("protocol/frame.zig").decodeOne(&repeated_datagram.frames, 8192, 2048);
+    try std.testing.expect((try connected.decode(repeated_frame.payload)) == .connection_request_accepted);
+    try std.testing.expectEqual(@as(usize, 0), context.connections);
+
     const new_incoming = try connected.encodeAddressList(.incoming, toRakAddress(listener.socket.value.address), 0, &.{}, 1000, 1001, &control);
+    _ = try transmitter.send(new_incoming, .reliable_ordered, 0, send_scratch[0..mtu], &sender, Sender.emit);
+    _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
+    try std.testing.expectEqual(@as(usize, 1), context.connections);
     _ = try transmitter.send(new_incoming, .reliable_ordered, 0, send_scratch[0..mtu], &sender, Sender.emit);
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
     try std.testing.expectEqual(@as(usize, 1), context.connections);
@@ -746,6 +770,31 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expectEqual(@as(usize, 1), timer_stats.sessions_expired);
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
     try std.testing.expect(listener.nextDeadline() == null);
+}
+
+test "closing a connected session sends a disconnect" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var socket = try backend.Socket.bind(io, address, 576);
+    defer socket.close();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var deadlines = try deadline_queue.Queue.init(std.testing.allocator, 1);
+    defer deadlines.deinit();
+    const key = endpointKey(peer.value.address);
+    const session = try Session.create(std.testing.allocator, &socket, &deadlines, peer.value.address, key, 1, 576, 100, 1000, 8, .{});
+    defer session.destroy();
+    session.state = .connected;
+
+    session.close();
+    try std.testing.expectEqual(State.closed, session.state);
+    try std.testing.expectEqual(@as(usize, 1), deadlines.count());
+
+    var storage: [576]u8 = undefined;
+    const message = try peer.value.receive(io, &storage);
+    var decoded = try @import("protocol/frame.zig").decodeDatagram(message.data);
+    const value = try @import("protocol/frame.zig").decodeOne(&decoded.frames, 8192, 2048);
+    try std.testing.expectEqual(@intFromEnum(offline.Id.disconnect_notification), value.payload[0]);
 }
 
 test "ACK delay schedules while NACK remains urgent" {

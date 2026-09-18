@@ -223,7 +223,7 @@ test "queue rejection leaves ownership and accounting unchanged" {
     try std.testing.expectEqual(@as(usize, 2), queue.total_bytes);
 
     _ = try queue.enqueue(.control, "c", .reliable, 0);
-    try std.testing.expectError(error.OutboundQueueFull, queue.enqueue(.control, "x", .reliable, 0));
+    try std.testing.expectError(error.OutboundQueueBytesExceeded, queue.enqueue(.control, "x", .reliable, 0));
     try std.testing.expectEqual(@as(usize, 2), queue.countAll());
     try std.testing.expectEqual(@as(usize, 3), queue.total_bytes);
 }

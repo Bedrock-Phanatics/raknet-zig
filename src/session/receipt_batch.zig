@@ -179,7 +179,7 @@ test "flush emits canonical ACK and NACK datagrams" {
     var batch = try Batch.init(std.testing.allocator, 8, 576, 32);
     defer batch.deinit();
     try batch.append(.{ .acknowledge = 3 });
-    try batch.append(.{ .acknowledge = 2, .missing = .{ .first = 8, .last = 10 } });
+    try batch.append(.{ .acknowledge = 2, .missing = .{ .first = 8, .last = 10, .count = 3 } });
     try std.testing.expectEqual(@as(usize, 3), try batch.flush(&sender, &receiver_socket.value.address, 8));
     try std.testing.expect(batch.isEmpty());
 

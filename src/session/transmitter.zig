@@ -11,6 +11,7 @@ pub const EmitError = error{
     RecoveryFull,
     RecoveryBytesExceeded,
     Overflow,
+    ConnectionClosed,
     InvalidDatagram,
     TransportFailure,
 };
@@ -60,6 +61,7 @@ pub const Transmitter = struct {
     }
 
     pub fn beginPacketization(self: *Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !Packetization {
+        if (!reliability.supportedForSend()) return error.UnsupportedReliability;
         if (payload_len == 0) return error.EmptyPayload;
         if (payload_len > self.config.maximum_split_bytes) return error.MessageTooLarge;
         if (channel >= self.config.maximum_order_channels and reliability.hasOrderIndex()) return error.InvalidOrderChannel;
@@ -212,6 +214,7 @@ pub const Transmitter = struct {
     }
 
     fn validateMessage(self: *const Transmitter, message: PackedMessage) !void {
+        if (!message.reliability.supportedForSend()) return error.UnsupportedReliability;
         if (message.payload.len == 0) return error.EmptyPayload;
         if (message.payload.len > self.config.maximum_split_bytes) return error.MessageTooLarge;
         if (message.channel >= self.config.maximum_order_channels and message.reliability.hasOrderIndex()) return error.InvalidOrderChannel;
@@ -219,6 +222,7 @@ pub const Transmitter = struct {
     }
 
     pub fn estimateWireBytes(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !usize {
+        if (!reliability.supportedForSend()) return error.UnsupportedReliability;
         if (payload_len == 0) return error.EmptyPayload;
         if (payload_len > self.config.maximum_split_bytes) return error.MessageTooLarge;
         if (channel >= self.config.maximum_order_channels and reliability.hasOrderIndex()) return error.InvalidOrderChannel;
@@ -276,7 +280,7 @@ fn payloadCapacity(mtu: u16, reliability: frame.Reliability, split: bool) !usize
 test "transmitter packetizes a split message within MTU" {
     const Collector = struct {
         count: usize = 0,
-        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) !void {
+        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!reliable or wire.len > 576 or sequence != self.count) return error.TransportFailure;
             self.count += 1;
@@ -294,11 +298,11 @@ test "transmitter packetizes a split message within MTU" {
 test "packetization resumes at datagram boundaries within a wire budget" {
     const Collector = struct {
         count: usize = 0,
-        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) !void {
+        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!reliable or sequence != self.count) return error.TransportFailure;
-            var decoded = try frame.decodeDatagram(wire);
-            const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
+            var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
+            const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
             if (decoded.frames.remaining() != 0 or value.order_index != 0) return error.TransportFailure;
             const split = value.split orelse return error.TransportFailure;
             if (split.id != 0 or split.index != self.count) return error.TransportFailure;
@@ -338,13 +342,14 @@ test "packer fills one datagram with exact frame accounting" {
     };
     const Collector = struct {
         frames: usize = 0,
-        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) !void {
+        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!reliable or sequence != 0 or wire.len != 576) return error.TransportFailure;
-            var decoded = try frame.decodeDatagram(wire);
+            var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
             while (decoded.frames.remaining() != 0) {
-                const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
-                if (value.reliable_index != self.frames or value.order_index != self.frames or value.order_channel != 3) return error.TransportFailure;
+                const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
+                const expected: u32 = @intCast(self.frames);
+                if (value.reliable_index != expected or value.order_index != expected or value.order_channel != 3) return error.TransportFailure;
                 self.frames += 1;
             }
         }
@@ -379,7 +384,7 @@ test "packer stops before incompatible traffic without mutating it" {
         }
     };
     const Collector = struct {
-        fn emit(_: *anyopaque, _: u32, _: bool, _: []const u8) !void {}
+        fn emit(_: *anyopaque, _: u32, _: bool, _: []const u8) EmitError!void {}
     };
     var transmitter = try Transmitter.init(576, .{});
     var scratch: [576]u8 = undefined;
@@ -405,7 +410,7 @@ test "packer keeps indices when emit fails" {
         }
     };
     const Failing = struct {
-        fn emit(_: *anyopaque, _: u32, _: bool, _: []const u8) !void {
+        fn emit(_: *anyopaque, _: u32, _: bool, _: []const u8) EmitError!void {
             return error.TransportFailure;
         }
     };
@@ -435,11 +440,11 @@ test "packer honors MTU boundaries for every reliability mode" {
     const Collector = struct {
         expected: frame.Reliability,
         calls: usize = 0,
-        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) !void {
+        fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (sequence != 0 or reliable != self.expected.hasReliableIndex() or wire.len != 576) return error.TransportFailure;
-            var decoded = try frame.decodeDatagram(wire);
-            const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
+            var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
+            const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
             if (decoded.frames.remaining() != 0 or value.reliability != self.expected) return error.TransportFailure;
             if ((value.reliable_index != null) != self.expected.hasReliableIndex()) return error.TransportFailure;
             if ((value.sequence_index != null) != self.expected.hasSequenceIndex()) return error.TransportFailure;
@@ -450,6 +455,12 @@ test "packer honors MTU boundaries for every reliability mode" {
     };
 
     for (std.enums.values(frame.Reliability)) |reliability| {
+        if (!reliability.supportedForSend()) {
+            const unsupported = [_]PackedMessage{.{ .payload = "x", .reliability = reliability, .channel = 5 }};
+            const unsupported_transmitter = try Transmitter.init(576, .{});
+            try std.testing.expectError(error.UnsupportedReliability, unsupported_transmitter.packReady(MessageIterator{ .messages = &unsupported }));
+            continue;
+        }
         const capacity = try payloadCapacity(576, reliability, false);
         var payload: [576]u8 = @splat(0xa5);
         const messages = [_]PackedMessage{.{ .payload = payload[0..capacity], .reliability = reliability, .channel = 5 }};
@@ -528,13 +539,14 @@ test "packed and split messages preserve protocol indices" {
     const Collector = struct {
         frames: usize = 0,
         split_frames: usize = 0,
-        fn emit(raw: *anyopaque, _: u32, reliable: bool, wire: []const u8) !void {
+        fn emit(raw: *anyopaque, _: u32, reliable: bool, wire: []const u8) EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (!reliable) return error.TransportFailure;
-            var decoded = try frame.decodeDatagram(wire);
+            var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
             while (decoded.frames.remaining() != 0) {
-                const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
-                if (value.reliable_index != self.frames or value.order_channel != 2) return error.TransportFailure;
+                const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
+                const expected_reliable: u32 = @intCast(self.frames);
+                if (value.reliable_index != expected_reliable or value.order_channel != 2) return error.TransportFailure;
                 const expected_order: u32 = if (self.frames < 2) @intCast(self.frames) else if (self.frames < 5) 2 else 3;
                 if (value.order_index != expected_order) return error.TransportFailure;
                 if (self.frames >= 2 and self.frames < 5) {

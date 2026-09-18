@@ -16,6 +16,7 @@ pub const Id = enum(u8) {
     connection_request = 0x09,
     connection_request_accepted = 0x10,
     new_incoming_connection = 0x13,
+    no_free_incoming_connections = 0x14,
     disconnect_notification = 0x15,
     incompatible_protocol_version = 0x19,
     unconnected_pong = 0x1c,
@@ -206,6 +207,13 @@ pub fn encodeIncompatibleProtocol(version: u8, server_guid: u64, output: []u8) !
     try w.u64be(server_guid);
     return w.written();
 }
+pub fn encodeNoFreeIncomingConnections(server_guid: u64, output: []u8) ![]u8 {
+    var w: cursor.Writer = .{ .data = output };
+    try w.byte(@intFromEnum(Id.no_free_incoming_connections));
+    try w.bytes(&magic);
+    try w.u64be(server_guid);
+    return w.written();
+}
 test "offline ping validates magic and exact structure" {
     var bytes: [64]u8 = undefined;
     var w: cursor.Writer = .{ .data = &bytes };
@@ -228,4 +236,27 @@ test "addresses round trip and truncate safely" {
     try std.testing.expectEqual(original, try decodeAddress(&r));
     r = .{ .data = w.written()[0..3] };
     try std.testing.expectError(error.Truncated, decodeAddress(&r));
+}
+
+test "IPv6 addresses preserve flow, scope, port, and MTU" {
+    const original: Address = .{ .ipv6 = .{
+        .octets = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .port = 19132,
+        .flow = 7,
+        .scope = 3,
+    } };
+    var bytes: [128]u8 = undefined;
+    const wire = try encodeOpenConnectionRequest2(original, 0x12345678, 1200, 9, &bytes);
+    const decoded = try decodeOpenConnectionRequest2(wire, true, 576, 1492);
+    try std.testing.expectEqual(original, decoded.server_address);
+    try std.testing.expectEqual(@as(u16, 1200), decoded.mtu);
+}
+
+test "no-free response has the canonical offline shape" {
+    var bytes: [32]u8 = undefined;
+    const wire = try encodeNoFreeIncomingConnections(0x0102030405060708, &bytes);
+    try std.testing.expectEqual(@as(usize, 25), wire.len);
+    try std.testing.expectEqual(@intFromEnum(Id.no_free_incoming_connections), wire[0]);
+    try std.testing.expectEqualSlices(u8, &magic, wire[1..17]);
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), std.mem.readInt(u64, wire[17..25], .big));
 }

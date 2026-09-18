@@ -169,7 +169,16 @@ pub const Decoder = struct {
             try self.scratch.appendSlice(self.allocator, chunk[0..amount]);
             if (amount < read_length) break;
         }
-        if (decompressor.err != null or input.bufferedLen() != 0) return error.InvalidCompressedData;
+        const expected_adler = switch (decompressor.container_metadata) {
+            .zlib => |metadata| metadata.adler,
+            else => unreachable,
+        };
+        if (decompressor.err != null or
+            input.bufferedLen() != 0 or
+            expected_adler != std.hash.Adler32.hash(self.scratch.items))
+        {
+            return error.InvalidCompressedData;
+        }
         return self.scratch.items;
     }
 

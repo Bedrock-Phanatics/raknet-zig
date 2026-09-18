@@ -24,6 +24,8 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = test_root });
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit, adversarial, and deterministic fuzz tests").dependOn(&run_tests.step);
+    const library_tests = b.addTest(.{ .root_module = module(b, "src/root.zig", target, optimize) });
+    run_tests.step.dependOn(&b.addRunArtifact(library_tests).step);
     b.default_step.dependOn(&run_tests.step);
 
     const bench_root = module(b, "bench/main.zig", target, .ReleaseFast);

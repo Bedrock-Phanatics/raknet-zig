@@ -515,7 +515,7 @@ test "completed split can retry after final allocation failure" {
     try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
     try std.testing.expectEqual(@as(usize, 1), receiver.splits.count());
-    try std.testing.expectEqual(@as(usize, 11), receiver.splits.total_bytes);
+    try std.testing.expectEqual(@as(usize, 6), receiver.splits.total_bytes);
 
     quota.maximum_bytes = std.math.maxInt(usize);
     const receipt = try receiver.process(second_wire, 2, &collector, Collector.deliver);

@@ -14,6 +14,7 @@ pub const Options = struct {
     config: Config = .{},
     protocol_version: u8 = 11,
     mtu: u16 = 1492,
+    mtu_fallbacks: []const u16 = &.{ 1200, 576 },
     client_guid: u64 = 0,
     handshake_timeout_ms: u32 = 5_000,
     handshake_retry_ms: u32 = 500,
@@ -45,8 +46,7 @@ pub const Client = struct {
     closed: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
-        try options.config.validate();
-        if (options.mtu < options.config.minimum_mtu or options.mtu > options.config.maximum_mtu or options.handshake_timeout_ms == 0 or options.handshake_retry_ms == 0 or options.handshake_retry_ms > options.handshake_timeout_ms or options.receive_batch_size == 0 or options.receive_batch_size > 256) return error.InvalidConfiguration;
+        try validateOptions(options);
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
         const local: std.Io.net.IpAddress = switch (server) {
@@ -64,9 +64,7 @@ pub const Client = struct {
         const guid = if (options.client_guid != 0) options.client_guid else (std.mem.readInt(u64, &random, .little) | 0x8000_0000_0000_0000);
         const deadline = time.after(io, options.handshake_timeout_ms);
 
-        const request1 = try offline.encodeOpenConnectionRequest1(options.protocol_version, options.mtu, scratch);
-        const reply1_wire = try exchangeExpected(&socket, server, request1, receive_buffer, offline.Id.open_connection_reply_1, deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
-        const reply1 = try offline.decodeOpenConnectionReply1(reply1_wire, options.config.minimum_mtu, options.config.maximum_mtu);
+        const reply1 = try discoverMtu(&socket, server, options, scratch, receive_buffer, deadline);
         const request2 = try offline.encodeOpenConnectionRequest2(toRakAddress(server), reply1.cookie, reply1.mtu, guid, scratch);
         const reply2_wire = try exchangeExpected(&socket, server, request2, receive_buffer, offline.Id.open_connection_reply_2, deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
         const reply2 = try offline.decodeOpenConnectionReply2(reply2_wire, options.config.minimum_mtu, options.config.maximum_mtu);
@@ -361,12 +359,9 @@ pub const Client = struct {
         return sent;
     }
     fn queueReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
-        self.receipts.append(receipt) catch |err| switch (err) {
-            error.ReceiptBatchFull => {
-                try self.flushReceipts();
-                try self.receipts.append(receipt);
-            },
-            else => return err,
+        self.receipts.append(receipt) catch {
+            try self.flushReceipts();
+            try self.receipts.append(receipt);
         };
         if (self.receipts.isEmpty()) return;
         const delay = if (receipt.missing != null) 0 else self.core.config.maximum_ack_delay_ms;
@@ -424,6 +419,16 @@ pub const Client = struct {
     }
 };
 
+fn validateOptions(options: Options) !void {
+    try options.config.validate();
+    if (options.mtu < options.config.minimum_mtu or options.mtu > options.config.maximum_mtu or options.handshake_timeout_ms == 0 or options.handshake_retry_ms == 0 or options.handshake_retry_ms > options.handshake_timeout_ms or options.receive_batch_size == 0 or options.receive_batch_size > 256) return error.InvalidConfiguration;
+    var previous = options.config.maximum_mtu + 1;
+    for (options.mtu_fallbacks) |fallback| {
+        if (fallback < options.config.minimum_mtu or fallback > options.config.maximum_mtu or fallback >= previous) return error.InvalidConfiguration;
+        previous = fallback;
+    }
+}
+
 fn exchangeExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, request: []const u8, buffer: []u8, id: offline.Id, overall: std.Io.Timeout, retry_ms: u32, maximum_work: usize) ![]const u8 {
     while (std.Io.Clock.awake.now(socket.io).nanoseconds < overall.deadline.raw.nanoseconds) {
         try socket.send(server, request);
@@ -432,6 +437,27 @@ fn exchangeExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, reque
             error.Timeout, error.HandshakeWorkLimitExceeded => continue,
             else => return err,
         };
+    }
+    return error.Timeout;
+}
+
+fn discoverMtu(socket: *backend.Socket, server: std.Io.net.IpAddress, options: Options, scratch: []u8, buffer: []u8, overall: std.Io.Timeout) !offline.OpenConnectionReply1 {
+    while (std.Io.Clock.awake.now(socket.io).nanoseconds < overall.deadline.raw.nanoseconds) {
+        var candidate_index: usize = 0;
+        while (candidate_index <= options.mtu_fallbacks.len) : (candidate_index += 1) {
+            const candidate = if (candidate_index == 0) options.mtu else options.mtu_fallbacks[candidate_index - 1];
+            if (candidate_index != 0 and candidate >= options.mtu) continue;
+            const request = try offline.encodeOpenConnectionRequest1(options.protocol_version, candidate, scratch);
+            try socket.send(server, request);
+            const attempt = time.earliest(socket.io, overall, time.after(socket.io, options.handshake_retry_ms));
+            const wire = receiveExpected(socket, server, buffer, .open_connection_reply_1, attempt, options.config.maximum_packets_per_iteration) catch |err| switch (err) {
+                error.Timeout, error.HandshakeWorkLimitExceeded => continue,
+                else => return err,
+            };
+            const reply = try offline.decodeOpenConnectionReply1(wire, options.config.minimum_mtu, options.config.maximum_mtu);
+            if (reply.mtu > candidate) return error.HandshakeMismatch;
+            return reply;
+        }
     }
     return error.Timeout;
 }
@@ -447,6 +473,7 @@ fn receiveExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, buffer
         const message = try receiveTimed(&socket.value, socket.io, buffer, deadline);
         if (!std.meta.eql(message.from, server) or message.flags.trunc or message.data.len == 0) continue;
         if (message.data[0] == @intFromEnum(offline.Id.incompatible_protocol_version)) return error.IncompatibleProtocol;
+        if (message.data[0] == @intFromEnum(offline.Id.no_free_incoming_connections)) return error.NoFreeIncomingConnections;
         if (message.data[0] == @intFromEnum(id)) return message.data;
     }
     return error.HandshakeWorkLimitExceeded;
@@ -457,11 +484,23 @@ fn toRakAddress(address: std.Io.net.IpAddress) offline.Address {
         .ip6 => |v| .{ .ipv6 = .{ .octets = v.bytes, .port = v.port, .flow = v.flow, .scope = v.interface.index } },
     };
 }
+test "client validates a descending MTU ladder" {
+    try validateOptions(.{});
+    try validateOptions(.{ .mtu = 1200 });
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .mtu_fallbacks = &.{ 1200, 1200 } }));
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .mtu_fallbacks = &.{ 576, 1200 } }));
+}
 test "client and server complete a real loopback handshake" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const server_mod = @import("server.zig");
-    const io = std.testing.io;
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
-    var listener = try server_mod.Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;interop" });
+    var server_config: Config = .{};
+    server_config.maximum_mtu = 1200;
+    server_config.maximum_connections = 1;
+    var listener = try server_mod.Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;interop", .config = server_config });
     defer listener.destroy();
     const Harness = struct {
         listener: *server_mod.Listener,
@@ -494,7 +533,7 @@ test "client and server complete a real loopback handshake" {
     var harness: Harness = .{ .listener = listener };
     var server_task = try io.concurrent(Harness.run, .{ &harness, io });
     defer server_task.cancel(io) catch {};
-    const client = Client.connect(std.testing.allocator, io, listener.socket.value.address, .{}) catch |err| {
+    const client = Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 }) catch |err| {
         std.debug.print("client connect failed: {any}\n", .{err});
         return err;
     };
@@ -502,6 +541,22 @@ test "client and server complete a real loopback handshake" {
     try server_task.await(io);
     try std.testing.expect(harness.connected.load(.acquire));
     try std.testing.expectEqual(listener.handshake_handler.server_guid, client.server_guid);
+    try std.testing.expectEqual(@as(u16, 1200), client.mtu);
+
+    const CapacityHarness = struct {
+        listener: *server_mod.Listener,
+        harness: *Harness,
+        fn run(self: *@This()) !void {
+            for (0..2) |_| {
+                _ = try self.listener.poll(.none, .{ .context = self.harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+            }
+        }
+    };
+    var capacity_harness: CapacityHarness = .{ .listener = listener, .harness = &harness };
+    var capacity_task = try io.concurrent(CapacityHarness.run, .{&capacity_harness});
+    defer capacity_task.cancel(io) catch {};
+    try std.testing.expectError(error.NoFreeIncomingConnections, Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 }));
+    try capacity_task.await(io);
 
     try client.send("\xfehello", .reliable_ordered, 0);
     for (0..4) |_| {

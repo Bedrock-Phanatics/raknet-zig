@@ -23,6 +23,12 @@ pub const Reliability = enum(u3) {
     pub fn hasOrderIndex(self: Reliability) bool {
         return self == .unreliable_sequenced or self == .reliable_ordered or self == .reliable_sequenced or self == .reliable_ordered_with_ack_receipt;
     }
+    pub fn supportedForSend(self: Reliability) bool {
+        return switch (self) {
+            .unreliable, .unreliable_sequenced, .reliable, .reliable_ordered, .reliable_sequenced => true,
+            .unreliable_with_ack_receipt, .reliable_with_ack_receipt, .reliable_ordered_with_ack_receipt => false,
+        };
+    }
 };
 
 pub const Split = struct { count: u32, id: u16, index: u32 };
