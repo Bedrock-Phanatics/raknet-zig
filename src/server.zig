@@ -252,19 +252,21 @@ pub const Session = struct {
                 2 => self.core.expireSplits(now_ms, quota).inspected,
                 else => try self.flushRetransmissions(now_ms, quota),
             };
-            remaining -= @min(remaining, used);
+            remaining -= @min(remaining, @max(@as(usize, 1), used));
             active -= 1;
             self.timer_cursor = @intCast((timer + 1) % 4);
         }
         return maximum_work - remaining;
     }
     fn flushRetransmissions(self: *Session, now_ms: u64, maximum_work: usize) !usize {
-        try self.flushReceipts();
+        const receipts_sent = try self.flushReceiptsUpTo(maximum_work);
+        const remaining = maximum_work - receipts_sent;
+        if (remaining == 0) return receipts_sent;
         var due: [256]recovery.Due = undefined;
-        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, maximum_work)], maximum_work);
+        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, remaining)], remaining);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
         for (batch.items) |item| self.socket.send(self.address, item.data) catch return error.TransportFailure;
-        return batch.inspected;
+        return receipts_sent + batch.inspected;
     }
 };
 
@@ -286,6 +288,8 @@ pub const Listener = struct {
     frame_scratch: []frame.Frame,
     timer_entries: []deadline_queue.Entry,
     handshake_output: []u8,
+    pending_message_index: usize = 0,
+    pending_message_count: usize = 0,
     closed: bool = false,
     handshake_timeout_ms: u32,
     ack_capacity: usize,
@@ -376,26 +380,37 @@ pub const Listener = struct {
     pub fn processTimers(self: *Listener, now_ms: u64, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         var stats: PollStats = .{};
-        self.processTimersInto(now_ms, callbacks, &stats);
+        self.processTimersInto(now_ms, callbacks, &stats, self.config.maximum_packets_per_iteration);
         return stats;
     }
 
     pub fn poll(self: *Listener, timeout: std.Io.Timeout, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         var stats: PollStats = .{};
-        const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
-        const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
-            error.Timeout => {
-                self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats);
-                return stats;
-            },
-            else => return err,
-        };
-        stats.malformed += batch.dropped_oversize;
-        for (batch.messages) |message| {
+        if (self.pending_message_index == self.pending_message_count) {
+            const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
+            const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
+                error.Timeout => {
+                    self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats, self.config.maximum_packets_per_iteration);
+                    return stats;
+                },
+                else => return err,
+            };
+            stats.malformed += batch.dropped_oversize;
+            self.pending_message_index = 0;
+            self.pending_message_count = batch.messages.len;
+        }
+        var remaining = self.config.maximum_packets_per_iteration;
+        var now_ms = time.nowMilliseconds(self.io);
+        var processed: usize = 0;
+        while (self.pending_message_index < self.pending_message_count and remaining != 0) {
+            if (processed != 0 and processed % 32 == 0) now_ms = time.nowMilliseconds(self.io);
+            const message = self.messages[self.pending_message_index];
+            self.pending_message_index += 1;
+            processed += 1;
             stats.datagrams += 1;
+            remaining -= 1;
             const key = endpointKey(message.from);
-            const now_ms = time.nowMilliseconds(self.io);
             if (self.sessions.get(key)) |session| {
                 if (message.data.len != 0 and switch (message.data[0]) {
                     @intFromEnum(offline.Id.unconnected_ping), @intFromEnum(offline.Id.unconnected_ping_open_connections), @intFromEnum(offline.Id.open_connection_request_1), @intFromEnum(offline.Id.open_connection_request_2) => true,
@@ -465,6 +480,7 @@ pub const Listener = struct {
                 };
                 var bridge: Bridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
                 const incoming = session.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
+                    remaining = 0;
                     const failure = core_mod.classifyIncomingError(err);
                     if (failure.disposition == .reject) {
                         stats.malformed += 1;
@@ -476,6 +492,8 @@ pub const Listener = struct {
                     self.removeSession(key, callbacks);
                     continue;
                 };
+                const extra_work = incoming.workUnits() -| 1;
+                remaining -= @min(remaining, extra_work);
                 if (incoming == .data) {
                     session.queueReceipt(incoming.data, now_ms) catch |err| {
                         const failure = core_mod.classifyTransitionError(.receipt, err);
@@ -486,12 +504,13 @@ pub const Listener = struct {
                     };
                 }
                 if (session.state != .closed) {
-                    _ = session.flushQueuedAt(now_ms) catch |err| {
+                    const flushed = session.flushQueuedAtLimit(now_ms, remaining) catch |err| {
                         recordSessionFailure(&stats, core_mod.classifyTransitionError(.application_send, err).class);
                         session.state = .closed;
                         self.removeSession(key, callbacks);
                         continue;
                     };
+                    remaining -= @min(remaining, flushed.datagrams);
                 }
                 if (session.state == .closed) {
                     session.flushReceipts() catch |err| {
@@ -540,21 +559,30 @@ pub const Listener = struct {
                 },
             }
         }
-        self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats);
+        if (self.pending_message_index == self.pending_message_count) {
+            self.pending_message_index = 0;
+            self.pending_message_count = 0;
+        }
+        self.processTimersInto(now_ms, callbacks, &stats, remaining);
         return stats;
     }
 
-    fn processTimersInto(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats) void {
+    fn processTimersInto(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats, maximum_work: usize) void {
+        if (maximum_work == 0) return;
         var due_count: usize = 0;
-        while (due_count < self.timer_entries.len) : (due_count += 1) {
+        while (due_count < @min(self.timer_entries.len, maximum_work)) : (due_count += 1) {
             const entry = self.deadlines.popDue(now_ms) orelse break;
             self.timer_entries[due_count] = entry;
         }
-        var remaining = self.config.maximum_packets_per_iteration;
+        var remaining = maximum_work;
         for (self.timer_entries[0..due_count], 0..) |entry, index| {
-            const session = self.sessions.get(entry.key) orelse continue;
+            const session = self.sessions.get(entry.key) orelse {
+                remaining -= 1;
+                continue;
+            };
             if (session.state == .closed) {
                 self.removeSession(entry.key, callbacks);
+                remaining -= 1;
                 continue;
             }
             if ((session.state == .connecting and time.reached(now_ms, session.handshake_deadline_ms)) or
@@ -562,6 +590,7 @@ pub const Listener = struct {
             {
                 stats.sessions_expired += 1;
                 self.removeSession(entry.key, callbacks);
+                remaining -= 1;
                 continue;
             }
             const sessions_left = due_count - index;
@@ -572,7 +601,7 @@ pub const Listener = struct {
                 self.removeSession(entry.key, callbacks);
                 continue;
             };
-            remaining -= @min(remaining, used);
+            remaining -= @min(remaining, @max(@as(usize, 1), used));
             session.schedule() catch {
                 recordSessionFailure(stats, .internal);
                 session.state = .closed;
@@ -734,4 +763,42 @@ test "ACK delay schedules while NACK remains urgent" {
     try std.testing.expectEqual(@as(?u64, 105), session.ack_deadline_ms);
     try session.queueReceipt(.{ .missing = .{ .first = 2, .last = 2, .count = 1 } }, 102);
     try std.testing.expectEqual(@as(?u64, 102), session.ack_deadline_ms);
+}
+
+test "global turn budget carries unread batch entries fairly" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var config: Config = .{};
+    config.maximum_packets_per_iteration = 1;
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;budget", .receive_batch_size = 4, .config = config });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 2048);
+    defer peer.close();
+
+    var ping: [33]u8 = undefined;
+    var writer: @import("protocol/cursor.zig").Writer = .{ .data = &ping };
+    try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
+    try writer.u64be(1);
+    try writer.bytes(&offline.magic);
+    try writer.u64be(2);
+    const flags: std.Io.net.IncomingMessage.Flags = @bitCast(@as(u8, 0));
+    for (listener.messages[0..3]) |*message| message.* = .{ .from = peer.value.address, .data = &ping, .control = &.{}, .flags = flags };
+    listener.pending_message_index = 0;
+    listener.pending_message_count = 3;
+
+    const Noop = struct {
+        fn connected(_: *anyopaque, _: *Session) !void {}
+        fn message(_: *anyopaque, _: *Session, _: receiver.BorrowedPayload) !void {}
+    };
+    var unused: u8 = 0;
+    const callbacks: Callbacks = .{ .context = &unused, .connected = Noop.connected, .message = Noop.message };
+    const first = try listener.poll(.none, callbacks);
+    try std.testing.expectEqual(@as(usize, 1), first.datagrams);
+    try std.testing.expectEqual(@as(usize, 1), listener.pending_message_index);
+    const second = try listener.poll(.none, callbacks);
+    try std.testing.expectEqual(@as(usize, 1), second.datagrams);
+    try std.testing.expectEqual(@as(usize, 2), listener.pending_message_index);
+    const third = try listener.poll(.none, callbacks);
+    try std.testing.expectEqual(@as(usize, 1), third.datagrams);
+    try std.testing.expectEqual(@as(usize, 0), listener.pending_message_count);
 }

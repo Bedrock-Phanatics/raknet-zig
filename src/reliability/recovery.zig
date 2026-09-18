@@ -28,7 +28,7 @@ const Block = struct {
     allocated: bool = false,
 };
 
-pub const Acknowledged = struct { packets: usize = 0, bytes: usize = 0, rtt_sample_ms: ?u64 = null };
+pub const Acknowledged = struct { packets: usize = 0, bytes: usize = 0, rtt_sample_ms: ?u64 = null, work: usize = 0 };
 pub const Due = struct { sequence: u32, data: []const u8, in_flight_bytes: usize, timed_out: bool };
 pub const DueBatch = struct { items: []Due, exhausted: usize, inspected: usize };
 

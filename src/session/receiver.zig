@@ -9,7 +9,16 @@ const ordered_store = @import("../reliability/ordered_store.zig");
 pub const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
-pub const Receipt = struct { acknowledge: ?u32 = null, missing: ?receive_window.Gap = null, delivered: usize = 0 };
+pub const Receipt = struct {
+    acknowledge: ?u32 = null,
+    missing: ?receive_window.Gap = null,
+    delivered: usize = 0,
+    frames: usize = 0,
+
+    pub fn workUnits(self: Receipt) usize {
+        return 1 + self.frames + self.delivered;
+    }
+};
 pub const DeliveryError = error{
     PeerProtocolFailure,
     ResourceLimitFailure,
@@ -86,6 +95,7 @@ pub const Receiver = struct {
         while (datagram.frames.remaining() > 0) {
             if (work >= self.config.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
             work += 1;
+            receipt.frames += 1;
             const value = try frame.decodeOne(&datagram.frames, self.config.maximum_frame_payload, self.config.maximum_split_parts);
             receipt.delivered += try self.processFrame(value, now_ms, context, deliver);
         }
@@ -99,6 +109,7 @@ pub const Receiver = struct {
         if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;
 
         var receipt: Receipt = .{};
+        receipt.frames = datagram.frames.len;
         for (datagram.frames) |value| {
             receipt.delivered += try self.processFrame(value, now_ms, context, deliver);
         }
@@ -257,6 +268,8 @@ test "receiver delivers in order with a zero-copy fast path" {
     const first = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 0, .order_channel = 0, .payload = "first" }};
     const receipt = try receiver.processWithScratch(try @import("../protocol/datagram.zig").encodeData(1, &first, &wire), 1, &descriptors, &collector, Collector.add);
     try std.testing.expectEqual(@as(usize, 2), receipt.delivered);
+    try std.testing.expectEqual(@as(usize, 1), receipt.frames);
+    try std.testing.expectEqual(@as(usize, 4), receipt.workUnits());
     try std.testing.expectEqual(@as(usize, 2), collector.count);
     try std.testing.expectEqualStrings("first", collector.values[0][0..collector.lengths[0]]);
     try std.testing.expectEqualStrings("second", collector.values[1][0..collector.lengths[1]]);

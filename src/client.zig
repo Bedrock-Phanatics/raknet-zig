@@ -40,6 +40,8 @@ pub const Client = struct {
     outbound_deadline_ms: ?u64 = null,
     ack_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
+    pending_message_index: usize = 0,
+    pending_message_count: usize = 0,
     closed: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
@@ -179,7 +181,7 @@ pub const Client = struct {
             self.abort();
             return error.ConnectionTimedOut;
         }
-        self.processDueTimers(now_ms) catch |err| {
+        self.processDueTimers(now_ms, self.core.config.maximum_packets_per_iteration) catch |err| {
             self.abort();
             return err;
         };
@@ -188,14 +190,18 @@ pub const Client = struct {
     /// The callback payload expires when the callback returns.
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
-        const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
-        const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
-            error.Timeout => {
-                try self.processTimers(time.nowMilliseconds(self.io));
-                return error.Timeout;
-            },
-            else => return err,
-        };
+        if (self.pending_message_index == self.pending_message_count) {
+            const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
+            const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
+                error.Timeout => {
+                    try self.processTimers(time.nowMilliseconds(self.io));
+                    return error.Timeout;
+                },
+                else => return err,
+            };
+            self.pending_message_index = 0;
+            self.pending_message_count = batch.messages.len;
+        }
         const Bridge = struct {
             client: *Client,
             context: *anyopaque,
@@ -224,10 +230,16 @@ pub const Client = struct {
         };
         var delivered: usize = 0;
         var latest_ms = time.nowMilliseconds(self.io);
-        for (batch.messages) |message| {
+        var remaining = self.core.config.maximum_packets_per_iteration;
+        var processed: usize = 0;
+        while (self.pending_message_index < self.pending_message_count and remaining != 0) {
+            if (processed != 0 and processed % 32 == 0) latest_ms = time.nowMilliseconds(self.io);
+            const message = self.messages[self.pending_message_index];
+            self.pending_message_index += 1;
+            processed += 1;
+            remaining -= 1;
             if (!std.meta.eql(message.from, self.server)) continue;
-            const now_ms = time.nowMilliseconds(self.io);
-            latest_ms = now_ms;
+            const now_ms = latest_ms;
             self.last_seen_ms = now_ms;
             var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
             const incoming = self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
@@ -235,6 +247,8 @@ pub const Client = struct {
                 if (failure.disposition == .close_session) self.abort();
                 return err;
             };
+            const extra_work = incoming.workUnits() -| 1;
+            remaining -= @min(remaining, extra_work);
             if (incoming == .data) {
                 delivered += incoming.data.delivered;
                 self.queueReceipt(incoming.data, now_ms) catch |err| {
@@ -248,11 +262,16 @@ pub const Client = struct {
                 return delivered;
             }
         }
-        _ = self.flushQueuedAt(latest_ms) catch |err| {
+        if (self.pending_message_index == self.pending_message_count) {
+            self.pending_message_index = 0;
+            self.pending_message_count = 0;
+        }
+        const flushed = self.flushQueuedAtLimit(latest_ms, remaining) catch |err| {
             if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
             return err;
         };
-        self.processDueTimers(latest_ms) catch |err| {
+        remaining -= @min(remaining, flushed.datagrams);
+        self.processDueTimers(latest_ms, remaining) catch |err| {
             if (core_mod.classifyTransitionError(.retransmission, err).disposition == .close_session) self.abort();
             return err;
         };
@@ -361,8 +380,9 @@ pub const Client = struct {
         if (self.receipts.isEmpty()) self.ack_deadline_ms = null;
         return sent;
     }
-    fn processDueTimers(self: *Client, now_ms: u64) !void {
-        var remaining = self.core.config.maximum_packets_per_iteration;
+    fn processDueTimers(self: *Client, now_ms: u64, maximum_work: usize) !void {
+        if (maximum_work == 0) return;
+        var remaining = maximum_work;
         var active: usize = @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms) +
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
@@ -385,19 +405,21 @@ pub const Client = struct {
                 2 => self.core.expireSplits(now_ms, quota).inspected,
                 else => try self.flushRetransmissions(now_ms, quota),
             };
-            remaining -= @min(remaining, used);
+            remaining -= @min(remaining, @max(@as(usize, 1), used));
             active -= 1;
             self.timer_cursor = @intCast((timer + 1) % 4);
         }
     }
 
     fn flushRetransmissions(self: *Client, now_ms: u64, maximum_work: usize) !usize {
-        try self.flushReceipts();
+        const receipts_sent = try self.flushReceiptsUpTo(maximum_work);
+        const remaining = maximum_work - receipts_sent;
+        if (remaining == 0) return receipts_sent;
         var due: [256]recovery.Due = undefined;
-        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, maximum_work)], maximum_work);
+        const batch = self.core.collectRetransmissions(now_ms, due[0..@min(due.len, remaining)], remaining);
         if (batch.exhausted != 0) return error.RetransmissionLimitExceeded;
         for (batch.items) |item| self.socket.send(self.server, item.data) catch return error.TransportFailure;
-        return batch.inspected;
+        return receipts_sent + batch.inspected;
     }
 };
 

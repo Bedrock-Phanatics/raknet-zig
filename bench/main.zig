@@ -252,6 +252,19 @@ pub fn main(init: std.process.Init) !void {
             ack_delay_10.datagrams,
         },
     );
+    const receive_batch_sizes = [_]usize{ 1, 4, 8, 16, 32, 64, 128 };
+    for (receive_batch_sizes) |batch_size| {
+        const measurement = try benchmarkReceiveBatch(io, batch_size, 4096);
+        checksum +%= measurement.checksum;
+        std.debug.print("receive_batch_{d}: {d:.0} packets/s, p50 {d:.2} us, p95 {d:.2} us, p99 {d:.2} us, max returned {d}\n", .{
+            batch_size,
+            measurement.packets_per_second,
+            @as(f64, @floatFromInt(measurement.p50_ns)) / 1000.0,
+            @as(f64, @floatFromInt(measurement.p95_ns)) / 1000.0,
+            @as(f64, @floatFromInt(measurement.p99_ns)) / 1000.0,
+            measurement.maximum_returned,
+        });
+    }
 }
 
 const DueMeasurement = struct { nanoseconds: u64, checksum: usize };
@@ -259,6 +272,14 @@ const PackingMeasurement = struct { nanoseconds: u64, wire_bytes: usize, datagra
 const RecoveryMeasurement = struct { nanoseconds: u64, retained_bytes: usize, checksum: usize };
 const StorageMeasurement = struct { nanoseconds: u64, retained_bytes: usize, checksum: usize };
 const AckBatchMeasurement = struct { nanoseconds: u64, datagrams: usize, checksum: usize };
+const ReceiveBatchMeasurement = struct {
+    packets_per_second: f64,
+    p50_ns: u64,
+    p95_ns: u64,
+    p99_ns: u64,
+    maximum_returned: usize,
+    checksum: usize,
+};
 const bedrock_payload_sizes = [_]usize{ 5, 7, 9, 12, 16, 20, 24, 32, 40, 52, 68, 96, 140, 220, 360, 700 };
 
 fn benchmarkFramePacking(io: std.Io, iterations: usize, pack: bool) !PackingMeasurement {
@@ -445,6 +466,65 @@ fn benchmarkAckBatching(io: std.Io, message_count: usize, group_size: usize) Ack
     }
     const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     return .{ .nanoseconds = nanoseconds, .datagrams = datagrams_count, .checksum = checksum };
+}
+
+fn benchmarkReceiveBatch(io: std.Io, batch_size: usize, message_count: usize) !ReceiveBatchMeasurement {
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var receiver_socket = try raknet.net.Socket.bind(io, address, 64);
+    defer receiver_socket.close();
+    var sender = try raknet.net.Socket.bind(io, address, 64);
+    defer sender.close();
+    const messages = try std.heap.page_allocator.alloc(std.Io.net.IncomingMessage, batch_size);
+    defer std.heap.page_allocator.free(messages);
+    const storage = try std.heap.page_allocator.alloc(u8, batch_size * 64);
+    defer std.heap.page_allocator.free(storage);
+    const latencies = try std.heap.page_allocator.alloc(u64, message_count);
+    defer std.heap.page_allocator.free(latencies);
+
+    var payload: [8]u8 = undefined;
+    var completed: usize = 0;
+    var maximum_returned: usize = 0;
+    var checksum: usize = 0;
+    const started = std.Io.Clock.awake.now(io);
+    while (completed < message_count) {
+        const wave = @min(batch_size, message_count - completed);
+        for (0..wave) |_| {
+            const sent_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+            std.mem.writeInt(u64, &payload, sent_ns, .little);
+            try sender.send(receiver_socket.value.address, &payload);
+        }
+        var received: usize = 0;
+        while (received < wave) {
+            const batch = try receiver_socket.receiveMany(messages, storage, .none);
+            maximum_returned = @max(maximum_returned, batch.messages.len);
+            for (batch.messages) |message| {
+                checksum +%= std.mem.readInt(u64, message.data[0..8], .little) + message.data.len;
+                received += 1;
+            }
+        }
+        completed += wave;
+    }
+    const elapsed_ns: u64 = @intCast(started.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+
+    for (latencies) |*latency| {
+        const sent_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        std.mem.writeInt(u64, &payload, sent_ns, .little);
+        try sender.send(receiver_socket.value.address, &payload);
+        const batch = try receiver_socket.receiveMany(messages, storage, .none);
+        maximum_returned = @max(maximum_returned, batch.messages.len);
+        const callback_ns: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        latency.* = callback_ns -| std.mem.readInt(u64, batch.messages[0].data[0..8], .little);
+        checksum +%= latency.*;
+    }
+    std.mem.sort(u64, latencies, {}, std.sort.asc(u64));
+    return .{
+        .packets_per_second = @as(f64, @floatFromInt(message_count)) * 1_000_000_000.0 / @as(f64, @floatFromInt(elapsed_ns)),
+        .p50_ns = latencies[message_count / 2],
+        .p95_ns = latencies[@min(message_count - 1, message_count * 95 / 100)],
+        .p99_ns = latencies[@min(message_count - 1, message_count * 99 / 100)],
+        .maximum_returned = maximum_returned,
+        .checksum = checksum,
+    };
 }
 
 fn benchmarkDueBatch(io: std.Io, capacity: usize, due_per_turn: usize, turns: usize) !DueMeasurement {

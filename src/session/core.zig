@@ -15,8 +15,18 @@ var next_send_owner: std.atomic.Value(u64) = .init(1);
 pub const Incoming = union(enum) {
     data: receiver.Receipt,
     acknowledged: recovery.Acknowledged,
-    nack_marked: usize,
+    nack_marked: NackMarked,
+
+    pub fn workUnits(self: Incoming) usize {
+        return switch (self) {
+            .data => |receipt| receipt.workUnits(),
+            .acknowledged => |result| 1 + result.work,
+            .nack_marked => |result| 1 + result.work,
+        };
+    }
 };
+
+pub const NackMarked = struct { marked: usize, work: usize };
 
 pub const IncomingErrorClass = enum {
     protocol,
@@ -427,7 +437,8 @@ pub const Core = struct {
             else
                 try self.receiver_state.process(wire, now_ms, context, deliver) },
             .ack => |decoded| blk: {
-                const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
+                var result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
+                result.work = decoded.acknowledged_count;
                 if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes);
                 if (result.rtt_sample_ms) |sample| self.rtt_state.observe(sample);
                 break :blk .{ .acknowledged = result };
@@ -435,7 +446,7 @@ pub const Core = struct {
             .nack => |decoded| blk: {
                 const marked = try self.recovery_state.markNack(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
                 if (marked != 0) self.congestion_state.lost(self.newest_sent);
-                break :blk .{ .nack_marked = marked };
+                break :blk .{ .nack_marked = .{ .marked = marked, .work = decoded.acknowledged_count } };
             },
         };
     }
@@ -474,6 +485,7 @@ test "core validates ACKs against actual send state" {
     const result = try core.processIncoming(wire, 150, &unused, Collector.discard);
     try std.testing.expectEqual(@as(usize, 1), result.acknowledged.packets);
     try std.testing.expectEqual(@as(?u64, 50), result.acknowledged.rtt_sample_ms);
+    try std.testing.expectEqual(@as(usize, 4), result.workUnits());
     try std.testing.expectEqual(@as(usize, 0), (try core.processIncoming(wire, 160, &unused, Collector.discard)).acknowledged.packets);
 }
 
