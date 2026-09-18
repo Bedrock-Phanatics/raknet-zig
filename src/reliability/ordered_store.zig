@@ -29,7 +29,6 @@ pub const RetainedPayload = struct {
     }
 };
 
-/// Shared bounded storage for all order channels.
 pub const Store = struct {
     allocator: std.mem.Allocator,
     channels: []Channel,
@@ -43,7 +42,13 @@ pub const Store = struct {
     retained_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, channel_count: usize, maximum_entries: usize, maximum_bytes: usize, maximum_window: usize) !Store {
-        if (channel_count == 0 or channel_count > 256 or maximum_entries == 0 or maximum_entries >= empty_ref or maximum_bytes == 0 or maximum_window == 0 or maximum_window >= uint24.half_range) return error.InvalidConfiguration;
+        if (channel_count == 0 or
+            channel_count > 256 or
+            maximum_entries == 0 or
+            maximum_entries >= empty_ref or
+            maximum_bytes == 0 or
+            maximum_window == 0 or
+            maximum_window >= uint24.half_range) return error.InvalidConfiguration;
         const channels = try allocator.alloc(Channel, channel_count);
         @memset(channels, .{});
         errdefer allocator.free(channels);

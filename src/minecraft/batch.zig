@@ -17,12 +17,12 @@ pub const Algorithm = enum(u8) {
 };
 
 pub const Options = struct {
-    /// Limits bytes after the batch header, including a declared algorithm byte.
+    /// Includes the declared algorithm byte.
     maximum_compressed_bytes: usize = default_maximum_decompressed_bytes,
     maximum_decompressed_bytes: usize = default_maximum_decompressed_bytes,
     maximum_packets: usize = default_maximum_packets,
     maximum_retained_capacity: usize = default_retained_capacity,
-    /// Compressed plus decompressed bytes allowed per decoder window.
+    /// Compressed and decompressed bytes allowed per window.
     maximum_work_bytes_per_window: usize = 64 * 1024 * 1024,
     work_window_ms: u64 = 1000,
 };
@@ -87,7 +87,7 @@ pub const Decoder = struct {
         return self.scratch.capacity;
     }
 
-    /// Packet bytes expire when the callback returns.
+    /// Packet bytes are valid only during the callback.
     pub fn decodeBorrowed(self: *Decoder, wire: []const u8, compression: Compression, now_ms: u64, context: *anyopaque, callback: PacketFn) !usize {
         defer self.trimScratch();
         const data = try self.decodePayload(wire, compression, now_ms);
@@ -369,7 +369,6 @@ test "snappy copies overlap and malformed offsets fail" {
             try std.testing.expectEqualStrings("aaaaa", packet_value.bytes);
         }
     };
-    // Decoded bytes are a one-byte packet length and five repeated 'a' bytes.
     const valid = [_]u8{ header, 1, 6, 0x04, 5, 'a', 0x01, 1 };
     var decoder = try Decoder.init(std.testing.allocator, .{});
     defer decoder.deinit();

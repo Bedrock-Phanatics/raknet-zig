@@ -1,9 +1,5 @@
 const std = @import("std");
 
-/// A hard byte quota layered over another allocator.
-///
-/// This allocator is intentionally single-owner. RakNet listeners and their
-/// sessions follow the same rule, avoiding synchronization in the packet path.
 pub const QuotaAllocator = struct {
     backing: std.mem.Allocator,
     maximum_bytes: usize,

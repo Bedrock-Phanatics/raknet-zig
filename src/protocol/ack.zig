@@ -16,7 +16,6 @@ pub const Decoded = struct {
     acknowledged_count: usize,
 };
 
-/// Parses compressed ACK/NACK records without expanding ranges. `storage` is caller-owned.
 pub fn decode(data: []const u8, storage: []Record, maximum_records: usize, maximum_acknowledged: usize) !Decoded {
     var reader: cursor.Reader = .{ .data = data };
     const advertised = try reader.u16be();
@@ -38,7 +37,6 @@ pub fn decode(data: []const u8, storage: []Record, maximum_records: usize, maxim
         const n: usize = record.count();
         if (n > maximum_acknowledged -| acknowledged) return error.TooManyAcknowledgements;
 
-        // Canonical form prevents duplicates and overlapping ranges from multiplying work.
         if (previous) |last_record| {
             if (record.first <= last_record.last) return error.OverlappingRanges;
         }

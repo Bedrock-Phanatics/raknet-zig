@@ -7,38 +7,43 @@ pub const Reader = struct {
     pub fn remaining(self: Reader) usize {
         return self.data.len - self.offset;
     }
+
     pub fn take(self: *Reader, n: usize) ![]const u8 {
         if (n > self.remaining()) return error.Truncated;
         const result = self.data[self.offset..][0..n];
         self.offset += n;
         return result;
     }
+
     pub fn byte(self: *Reader) !u8 {
         return (try self.take(1))[0];
     }
+
     pub fn u16be(self: *Reader) !u16 {
-        var a: [2]u8 = undefined;
-        @memcpy(&a, try self.take(2));
-        return std.mem.readInt(u16, &a, .big);
+        return self.readInt(u16, .big);
     }
+
     pub fn u16le(self: *Reader) !u16 {
-        var a: [2]u8 = undefined;
-        @memcpy(&a, try self.take(2));
-        return std.mem.readInt(u16, &a, .little);
+        return self.readInt(u16, .little);
     }
+
     pub fn u24le(self: *Reader) !u32 {
         const b = try self.take(3);
         return @as(u32, b[0]) | (@as(u32, b[1]) << 8) | (@as(u32, b[2]) << 16);
     }
+
     pub fn u32be(self: *Reader) !u32 {
-        var a: [4]u8 = undefined;
-        @memcpy(&a, try self.take(4));
-        return std.mem.readInt(u32, &a, .big);
+        return self.readInt(u32, .big);
     }
+
     pub fn u64be(self: *Reader) !u64 {
-        var a: [8]u8 = undefined;
-        @memcpy(&a, try self.take(8));
-        return std.mem.readInt(u64, &a, .big);
+        return self.readInt(u64, .big);
+    }
+
+    fn readInt(self: *Reader, comptime T: type, endian: std.builtin.Endian) !T {
+        var encoded: [@sizeOf(T)]u8 = undefined;
+        @memcpy(&encoded, try self.take(encoded.len));
+        return std.mem.readInt(T, &encoded, endian);
     }
 };
 
@@ -49,28 +54,30 @@ pub const Writer = struct {
     pub fn remaining(self: Writer) usize {
         return self.data.len - self.offset;
     }
+
     pub fn reserve(self: *Writer, n: usize) ![]u8 {
         if (n > self.remaining()) return error.NoSpaceLeft;
         const result = self.data[self.offset..][0..n];
         self.offset += n;
         return result;
     }
+
     pub fn byte(self: *Writer, value: u8) !void {
         (try self.reserve(1))[0] = value;
     }
+
     pub fn bytes(self: *Writer, value: []const u8) !void {
         @memcpy(try self.reserve(value.len), value);
     }
+
     pub fn u16be(self: *Writer, value: u16) !void {
-        var a: [2]u8 = undefined;
-        std.mem.writeInt(u16, &a, value, .big);
-        try self.bytes(&a);
+        try self.writeInt(u16, value, .big);
     }
+
     pub fn u16le(self: *Writer, value: u16) !void {
-        var a: [2]u8 = undefined;
-        std.mem.writeInt(u16, &a, value, .little);
-        try self.bytes(&a);
+        try self.writeInt(u16, value, .little);
     }
+
     pub fn u24le(self: *Writer, value: u32) !void {
         if (value > 0xffffff) return error.IntegerOutOfRange;
         const b = try self.reserve(3);
@@ -78,16 +85,21 @@ pub const Writer = struct {
         b[1] = @truncate(value >> 8);
         b[2] = @truncate(value >> 16);
     }
+
     pub fn u32be(self: *Writer, value: u32) !void {
-        var a: [4]u8 = undefined;
-        std.mem.writeInt(u32, &a, value, .big);
-        try self.bytes(&a);
+        try self.writeInt(u32, value, .big);
     }
+
     pub fn u64be(self: *Writer, value: u64) !void {
-        var a: [8]u8 = undefined;
-        std.mem.writeInt(u64, &a, value, .big);
-        try self.bytes(&a);
+        try self.writeInt(u64, value, .big);
     }
+
+    fn writeInt(self: *Writer, comptime T: type, value: T, endian: std.builtin.Endian) !void {
+        var encoded: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &encoded, value, endian);
+        try self.bytes(&encoded);
+    }
+
     pub fn written(self: Writer) []u8 {
         return self.data[0..self.offset];
     }

@@ -6,7 +6,6 @@ pub const ReceiveBatch = struct {
     trailing_error: ?anyerror,
 };
 
-/// Thin Zig 0.16 std.Io UDP backend. Batching drains packets already available; it never waits to fill.
 pub const Socket = struct {
     io: std.Io,
     value: std.Io.net.Socket,

@@ -1,7 +1,6 @@
 const std = @import("std");
 const uint24 = @import("../util/uint24.zig");
 
-/// Byte-counting AIMD window with one loss response per recovery block.
 pub const Controller = struct {
     mtu: u32,
     window: u64,

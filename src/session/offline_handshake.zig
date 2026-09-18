@@ -11,7 +11,6 @@ pub const Accepted = struct {
 };
 pub const Action = union(enum) { drop, response: []const u8, accepted: Accepted };
 
-/// Stateless through request 2. The caller creates connection state only after `.accepted`.
 pub const Handler = struct {
     server_guid: u64,
     protocol_version: u8,
@@ -23,7 +22,15 @@ pub const Handler = struct {
 
     pub fn init(server_guid: u64, protocol_version: u8, minimum_mtu: u16, maximum_mtu: u16, advertisement: []const u8, cookies: cookie.Jar, limiter: *rate.Limiter) !Handler {
         if (minimum_mtu < 400 or minimum_mtu > maximum_mtu or advertisement.len > 65_535) return error.InvalidConfiguration;
-        return .{ .server_guid = server_guid, .protocol_version = protocol_version, .minimum_mtu = minimum_mtu, .maximum_mtu = maximum_mtu, .advertisement = advertisement, .cookies = cookies, .limiter = limiter };
+        return .{
+            .server_guid = server_guid,
+            .protocol_version = protocol_version,
+            .minimum_mtu = minimum_mtu,
+            .maximum_mtu = maximum_mtu,
+            .advertisement = advertisement,
+            .cookies = cookies,
+            .limiter = limiter,
+        };
     }
 
     /// `endpoint` must be a canonical address+port byte representation; `source_key` should be keyed.
@@ -55,7 +62,6 @@ pub const Handler = struct {
         }
         const value = self.cookies.create(endpoint, epoch);
         const response = offline.encodeOpenConnectionReply1(self.server_guid, value, request.mtu, true, output) catch return .drop;
-        // Padding mirrors request size, so this step cannot amplify bytes.
         if (response.len > datagram.len) return .drop;
         return .{ .response = response };
     }

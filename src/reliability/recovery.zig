@@ -32,7 +32,6 @@ pub const Acknowledged = struct { packets: usize = 0, bytes: usize = 0, rtt_samp
 pub const Due = struct { sequence: u32, data: []const u8, in_flight_bytes: usize, timed_out: bool };
 pub const DueBatch = struct { items: []Due, exhausted: usize, inspected: usize };
 
-/// Sequence-indexed recovery storage with lazy reusable wire buffers.
 pub const Recovery = struct {
     allocator: std.mem.Allocator,
     slots: []Slot,
@@ -58,7 +57,12 @@ pub const Recovery = struct {
     }
 
     pub fn initWithPolicy(allocator: std.mem.Allocator, maximum_entries: usize, maximum_bytes: usize, maximum_transmissions: u8, mtu: usize, policy: StoragePolicy) !Recovery {
-        if (maximum_entries == 0 or maximum_entries > std.math.maxInt(u32) or maximum_bytes == 0 or maximum_transmissions < 2 or mtu == 0 or mtu > std.math.maxInt(u16)) return error.InvalidConfiguration;
+        if (maximum_entries == 0 or
+            maximum_entries > std.math.maxInt(u32) or
+            maximum_bytes == 0 or
+            maximum_transmissions < 2 or
+            mtu == 0 or
+            mtu > std.math.maxInt(u16)) return error.InvalidConfiguration;
         if (policy != .exact and (std.math.mul(usize, maximum_entries, mtu) catch return error.InvalidConfiguration) > maximum_bytes) return error.InvalidConfiguration;
         const slots = try allocator.alloc(Slot, maximum_entries);
         errdefer allocator.free(slots);
@@ -68,7 +72,17 @@ pub const Recovery = struct {
         errdefer allocator.free(blocks);
         for (slots) |*slot| slot.* = .{};
         for (blocks, 0..) |*block, index| block.* = .{ .next = if (index + 1 < blocks.len) @intCast(index + 1) else none };
-        return .{ .allocator = allocator, .slots = slots, .heap = heap, .blocks = blocks, .maximum_bytes = maximum_bytes, .maximum_transmissions = maximum_transmissions, .mtu = @intCast(mtu), .storage_policy = policy, .unused_head = 0 };
+        return .{
+            .allocator = allocator,
+            .slots = slots,
+            .heap = heap,
+            .blocks = blocks,
+            .maximum_bytes = maximum_bytes,
+            .maximum_transmissions = maximum_transmissions,
+            .mtu = @intCast(mtu),
+            .storage_policy = policy,
+            .unused_head = 0,
+        };
     }
 
     pub fn deinit(self: *Recovery) void {
@@ -90,7 +104,15 @@ pub const Recovery = struct {
         const block_index = try self.acquireBlock(data.len);
         errdefer self.releaseBlock(block_index);
         @memcpy(self.blocks[block_index].data[0..data.len], data);
-        slot.* = .{ .occupied = true, .sequence = sequence, .block_index = block_index, .data_len = @intCast(data.len), .sent_ms = now_ms, .deadline_ms = time.deadline(now_ms, rto_ms), .in_flight_bytes = @intCast(in_flight_bytes) };
+        slot.* = .{
+            .occupied = true,
+            .sequence = sequence,
+            .block_index = block_index,
+            .data_len = @intCast(data.len),
+            .sent_ms = now_ms,
+            .deadline_ms = time.deadline(now_ms, rto_ms),
+            .in_flight_bytes = @intCast(in_flight_bytes),
+        };
         self.total_bytes += data.len;
         self.count_value += 1;
         slot.active_next = self.active_head;
@@ -158,7 +180,12 @@ pub const Recovery = struct {
                 break;
             }
             const block = &self.blocks[slot.block_index];
-            output[due_count] = .{ .sequence = slot.sequence, .data = block.data[0..slot.data_len], .in_flight_bytes = slot.in_flight_bytes, .timed_out = slot.deadline_ms < now_ms };
+            output[due_count] = .{
+                .sequence = slot.sequence,
+                .data = block.data[0..slot.data_len],
+                .in_flight_bytes = slot.in_flight_bytes,
+                .timed_out = slot.deadline_ms < now_ms,
+            };
             due_count += 1;
             slot.transmissions += 1;
             slot.deadline_ms = time.deadline(now_ms, rto_ms);

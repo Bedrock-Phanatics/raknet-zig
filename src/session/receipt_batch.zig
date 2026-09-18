@@ -30,7 +30,16 @@ pub const Batch = struct {
         const wire_storage = try allocator.alloc(u8, try std.math.mul(usize, mtu, 2));
         errdefer allocator.free(wire_storage);
         const messages = try allocator.alloc(std.Io.net.OutgoingMessage, 2);
-        return .{ .allocator = allocator, .ack_values = ack_values, .nack_values = nack_values, .records = records, .wire_storage = wire_storage, .messages = messages, .mtu = mtu, .maximum_sequences = maximum_sequences };
+        return .{
+            .allocator = allocator,
+            .ack_values = ack_values,
+            .nack_values = nack_values,
+            .records = records,
+            .wire_storage = wire_storage,
+            .messages = messages,
+            .mtu = mtu,
+            .maximum_sequences = maximum_sequences,
+        };
     }
 
     pub fn deinit(self: *Batch) void {
@@ -56,7 +65,10 @@ pub const Batch = struct {
             if (gap.first <= gap.last) gap.last - gap.first + 1 else gap.last + 1 + (0xffffff - gap.first + 1)
         else
             0;
-        if (sequence_needed > self.maximum_sequences or self.ack_count + @intFromBool(receipt.acknowledge != null) > self.ack_values.len or self.nack_count + nack_needed > self.nack_values.len or sequence_needed > self.maximum_sequences -| self.nack_sequences) return error.ReceiptBatchFull;
+        if (sequence_needed > self.maximum_sequences or
+            self.ack_count + @intFromBool(receipt.acknowledge != null) > self.ack_values.len or
+            self.nack_count + nack_needed > self.nack_values.len or
+            sequence_needed > self.maximum_sequences -| self.nack_sequences) return error.ReceiptBatchFull;
         if (receipt.acknowledge) |sequence| {
             self.ack_values[self.ack_count] = sequence;
             self.ack_count += 1;

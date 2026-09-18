@@ -17,12 +17,10 @@ pub fn sub(value: Value, delta: Value) Value {
     return (value -% delta) & mask;
 }
 
-/// Forward modular distance from `from` to `to`.
 pub fn distance(from: Value, to: Value) Value {
     return (to -% from) & mask;
 }
 
-/// Half-range modular comparison. Exactly half a cycle is deliberately unordered.
 pub fn isNewer(candidate: Value, reference: Value) bool {
     const d = distance(reference, candidate);
     return d != 0 and d < half_range;

@@ -20,6 +20,12 @@ pub const Sent = struct { datagrams: usize, wire_bytes: usize };
 pub const PackedMessage = struct { payload: []const u8, reliability: frame.Reliability, channel: u8 };
 pub const PackResult = struct { messages: usize = 0, sent: Sent = .{ .datagrams = 0, .wire_bytes = 0 } };
 
+const Layout = struct {
+    capacity: usize,
+    fragment_count: usize,
+    split: bool,
+};
+
 pub const Packetization = struct {
     payload_len: usize,
     reliability: frame.Reliability,
@@ -37,7 +43,7 @@ pub const Packetization = struct {
     }
 };
 
-/// Packetizes synchronously into caller scratch. The emit callback must consume/copy before returning.
+/// Emitted bytes borrow caller scratch.
 pub const Transmitter = struct {
     config: Config,
     mtu: u16,
@@ -53,37 +59,26 @@ pub const Transmitter = struct {
         return .{ .config = config, .mtu = mtu };
     }
 
-    /// A callback error after the first emitted fragment requires closing the connection: the peer may
-    /// otherwise wait forever for the incomplete reliable-ordered message.
+    /// Close the connection if emission fails after the first fragment.
     pub fn send(self: *Transmitter, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, context: *anyopaque, emit: EmitFn) !Sent {
         var packetization = try self.beginPacketization(payload.len, reliability, channel);
         return self.sendAvailable(&packetization, payload, scratch, std.math.maxInt(usize), std.math.maxInt(usize), context, emit);
     }
 
     pub fn beginPacketization(self: *Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !Packetization {
-        if (!reliability.supportedForSend()) return error.UnsupportedReliability;
-        if (payload_len == 0) return error.EmptyPayload;
-        if (payload_len > self.config.maximum_split_bytes) return error.MessageTooLarge;
-        if (channel >= self.config.maximum_order_channels and reliability.hasOrderIndex()) return error.InvalidOrderChannel;
-        const unsplit_capacity = try payloadCapacity(self.mtu, reliability, false);
-        const needs_split = payload_len > unsplit_capacity;
-        if (needs_split and !reliability.hasReliableIndex()) return error.UnreliableMessageTooLarge;
-        const capacity = if (needs_split) try payloadCapacity(self.mtu, reliability, true) else unsplit_capacity;
-        const split_count = (payload_len + capacity - 1) / capacity;
-        if (split_count > self.config.maximum_split_parts or split_count > std.math.maxInt(u32)) return error.MessageTooLarge;
+        const packet_layout = try self.layout(payload_len, reliability, channel);
         return .{
             .payload_len = payload_len,
             .reliability = reliability,
             .channel = channel,
-            .capacity = capacity,
-            .fragment_count = split_count,
+            .capacity = packet_layout.capacity,
+            .fragment_count = packet_layout.fragment_count,
             .order_index = if (reliability.hasOrderIndex()) self.reserveOrder(channel) else null,
             .sequence_index = if (reliability.hasSequenceIndex()) self.reserveSequence(channel) else null,
-            .split_id = if (needs_split) self.reserveSplit() else null,
+            .split_id = if (packet_layout.split) self.reserveSplit() else null,
         };
     }
 
-    /// Emits only complete datagrams that fit the supplied wire-byte budget.
     pub fn sendAvailable(
         self: *Transmitter,
         packetization: *Packetization,
@@ -132,7 +127,6 @@ pub const Transmitter = struct {
         return sent;
     }
 
-    /// Packs compatible unsplit messages into one datagram.
     pub fn pack(self: *Transmitter, source: anytype, scratch: []u8, maximum_wire_bytes: usize, context: *anyopaque, emit: EmitFn) !PackResult {
         if (maximum_wire_bytes < 4) return .{};
         if (scratch.len < self.mtu) return error.NoSpaceLeft;
@@ -183,7 +177,6 @@ pub const Transmitter = struct {
         return .{ .messages = count, .sent = .{ .datagrams = 1, .wire_bytes = wire.len } };
     }
 
-    /// Reports when the queued prefix should be emitted now.
     pub fn packReady(self: *const Transmitter, source: anytype) !bool {
         var messages = source;
         const first = messages.next() orelse return false;
@@ -214,27 +207,30 @@ pub const Transmitter = struct {
     }
 
     fn validateMessage(self: *const Transmitter, message: PackedMessage) !void {
-        if (!message.reliability.supportedForSend()) return error.UnsupportedReliability;
-        if (message.payload.len == 0) return error.EmptyPayload;
-        if (message.payload.len > self.config.maximum_split_bytes) return error.MessageTooLarge;
-        if (message.channel >= self.config.maximum_order_channels and message.reliability.hasOrderIndex()) return error.InvalidOrderChannel;
-        if (message.payload.len > try payloadCapacity(self.mtu, message.reliability, false) and !message.reliability.hasReliableIndex()) return error.UnreliableMessageTooLarge;
+        _ = try self.layout(message.payload.len, message.reliability, message.channel);
     }
 
     pub fn estimateWireBytes(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !usize {
+        const packet_layout = try self.layout(payload_len, reliability, channel);
+        const overhead = @as(usize, self.mtu) - packet_layout.capacity;
+        return try std.math.add(usize, payload_len, try std.math.mul(usize, packet_layout.fragment_count, overhead));
+    }
+
+    fn layout(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !Layout {
         if (!reliability.supportedForSend()) return error.UnsupportedReliability;
         if (payload_len == 0) return error.EmptyPayload;
         if (payload_len > self.config.maximum_split_bytes) return error.MessageTooLarge;
         if (channel >= self.config.maximum_order_channels and reliability.hasOrderIndex()) return error.InvalidOrderChannel;
+
         const unsplit_capacity = try payloadCapacity(self.mtu, reliability, false);
         const split = payload_len > unsplit_capacity;
         if (split and !reliability.hasReliableIndex()) return error.UnreliableMessageTooLarge;
         const capacity = if (split) try payloadCapacity(self.mtu, reliability, true) else unsplit_capacity;
         const count = (payload_len + capacity - 1) / capacity;
-        if (count > self.config.maximum_split_parts) return error.MessageTooLarge;
-        const overhead = @as(usize, self.mtu) - capacity;
-        return try std.math.add(usize, payload_len, try std.math.mul(usize, count, overhead));
+        if (count > self.config.maximum_split_parts or count > std.math.maxInt(u32)) return error.MessageTooLarge;
+        return .{ .capacity = capacity, .fragment_count = count, .split = split };
     }
+
     fn reserveReliable(self: *Transmitter) u32 {
         const value = self.reliable_index;
         self.reliable_index = uint24.add(value, 1);
@@ -487,7 +483,10 @@ test "packer honors MTU boundaries for every reliability mode" {
             const result = try oversized_transmitter.pack(MessageIterator{ .messages = &oversized }, &scratch, 576, &collector, Collector.emit);
             try std.testing.expectEqual(@as(usize, 0), result.messages);
         } else {
-            try std.testing.expectError(error.UnreliableMessageTooLarge, oversized_transmitter.pack(MessageIterator{ .messages = &oversized }, &scratch, 576, &collector, Collector.emit));
+            try std.testing.expectError(
+                error.UnreliableMessageTooLarge,
+                oversized_transmitter.pack(MessageIterator{ .messages = &oversized }, &scratch, 576, &collector, Collector.emit),
+            );
         }
     }
 }

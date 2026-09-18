@@ -26,10 +26,10 @@ pub const DeliveryError = error{
     ApplicationFailure,
     InternalFailure,
 };
-/// The payload expires when this function returns.
+/// The payload is valid only during the callback.
 pub const DeliverFn = *const fn (context: *anyopaque, payload: BorrowedPayload) DeliveryError!void;
 
-/// Single-owner connected receive state. It retains no slice into the datagram after `process` returns.
+/// Retains no slices into processed datagrams.
 pub const Receiver = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -47,7 +47,13 @@ pub const Receiver = struct {
         errdefer allocator.free(datagram_storage);
         const reliable_storage = try allocator.alloc(bool, config.reliable_window);
         errdefer allocator.free(reliable_storage);
-        var splits = try reassembly.Reassembler.init(allocator, .{ .maximum_parts = config.maximum_split_parts, .maximum_bytes = config.maximum_split_bytes, .maximum_concurrent = config.maximum_concurrent_splits, .maximum_total_bytes = config.maximum_split_bytes_per_connection, .timeout_ms = config.split_timeout_ms });
+        var splits = try reassembly.Reassembler.init(allocator, .{
+            .maximum_parts = config.maximum_split_parts,
+            .maximum_bytes = config.maximum_split_bytes,
+            .maximum_concurrent = config.maximum_concurrent_splits,
+            .maximum_total_bytes = config.maximum_split_bytes_per_connection,
+            .timeout_ms = config.split_timeout_ms,
+        });
         errdefer splits.deinit();
         var ordered = try ordered_store.Store.init(allocator, config.maximum_order_channels, config.maximum_ordered_packets, config.maximum_ordered_bytes, config.reliable_window);
         errdefer ordered.deinit();
@@ -436,7 +442,6 @@ test "every truncation inside a later frame is atomic" {
     const first_frame_end = (try @import("../protocol/datagram.zig").encodeData(0, prefix_frames, &prefix_storage)).len;
 
     for (0..full.len) |cut| {
-        // A clean frame boundary is still a valid datagram.
         if (cut == first_frame_end) continue;
         var receiver = try Receiver.init(std.testing.allocator, config);
         defer receiver.deinit();

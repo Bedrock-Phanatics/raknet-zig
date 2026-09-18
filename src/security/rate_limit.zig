@@ -12,7 +12,6 @@ pub const Options = struct {
     }
 };
 
-/// Fixed-memory token buckets. A keyed source hash should be supplied as `key`.
 pub const Limiter = struct {
     entries: []Entry,
     options: Options,

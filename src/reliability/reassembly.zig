@@ -53,7 +53,6 @@ pub const Limits = struct {
 
 pub const ExpiryBatch = struct { expired: usize, inspected: usize };
 
-/// Bounded split state with reusable metadata and scheduled expiry.
 pub const Reassembler = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -98,14 +97,14 @@ pub const Reassembler = struct {
         return self.retained_bytes;
     }
 
-    /// Returns one contiguous owned payload for normal consumers.
+    /// Returns one contiguous owned payload.
     pub fn push(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?OwnedPayload {
         const slot = try self.retain(id, count_value, index, payload, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return null;
         return try self.finish(slot.?);
     }
 
-    /// Calls consume with borrowed fragments and skips the final contiguous copy.
+    /// Borrows fragments and skips the final copy.
     pub fn pushScatter(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64, context: *anyopaque, consume: ScatterFn) !bool {
         const slot = try self.retain(id, count_value, index, payload, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return false;
@@ -411,7 +410,13 @@ test "split limits reject before payload allocation" {
 }
 
 test "advertised split size does not reserve final payload" {
-    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2048, .maximum_bytes = 4 * 1024 * 1024, .maximum_concurrent = 1, .maximum_total_bytes = 4 * 1024 * 1024, .timeout_ms = 10 });
+    var value = try Reassembler.init(std.testing.allocator, .{
+        .maximum_parts = 2048,
+        .maximum_bytes = 4 * 1024 * 1024,
+        .maximum_concurrent = 1,
+        .maximum_total_bytes = 4 * 1024 * 1024,
+        .timeout_ms = 10,
+    });
     defer value.deinit();
     try std.testing.expect((try value.push(1, 2048, 0, "x", 0)) == null);
     try std.testing.expectEqual(@as(usize, 1), value.total_bytes);
@@ -434,7 +439,13 @@ test "split reassembly handles every allocation failure" {
 
 test "expiry inspects only due assemblies" {
     const count = 8;
-    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = count, .maximum_concurrent = count, .maximum_total_bytes = count, .timeout_ms = 10 });
+    var value = try Reassembler.init(std.testing.allocator, .{
+        .maximum_parts = 2,
+        .maximum_bytes = count,
+        .maximum_concurrent = count,
+        .maximum_total_bytes = count,
+        .timeout_ms = 10,
+    });
     defer value.deinit();
     try std.testing.expect((try value.push(1, 2, 0, "x", 0)) == null);
     for (2..count + 1) |id| try std.testing.expect((try value.push(@intCast(id), 2, 0, "x", 100)) == null);

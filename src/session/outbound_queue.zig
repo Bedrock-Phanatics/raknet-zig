@@ -32,7 +32,6 @@ const Slot = struct {
     occupied: bool = false,
 };
 
-/// Two FIFO lanes backed by one bounded slot and byte pool.
 pub const Queue = struct {
     allocator: std.mem.Allocator,
     slots: []Slot,
@@ -142,7 +141,6 @@ pub const Queue = struct {
         return .{ .queue = self, .next_index = self.heads[@intFromEnum(lane)] };
     }
 
-    /// Removes one queued message without disturbing the lane's FIFO order.
     pub fn cancel(self: *Queue, lane: Lane, id: Id) ?Message {
         const lane_index = @intFromEnum(lane);
         var previous: u32 = none;

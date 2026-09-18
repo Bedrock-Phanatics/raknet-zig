@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// All attacker-influenced state has a corresponding explicit bound here.
 pub const Config = struct {
     minimum_mtu: u16 = 576,
     maximum_mtu: u16 = 1492,
@@ -42,12 +41,17 @@ pub const Config = struct {
         if (self.maximum_ack_delay_ms > 10) return error.InvalidConfiguration;
         if (self.receive_window == 0 or self.receive_window > 0x7fffff) return error.InvalidConfiguration;
         if (self.reliable_window == 0 or self.reliable_window > 0x7fffff) return error.InvalidConfiguration;
-        if (self.maximum_retransmissions == 0 or self.maximum_recovery_bytes == 0 or self.maximum_order_channels == 0 or self.maximum_order_channels > 256) return error.InvalidConfiguration;
+        if (self.maximum_retransmissions == 0 or
+            self.maximum_recovery_bytes == 0 or
+            self.maximum_order_channels == 0 or
+            self.maximum_order_channels > 256) return error.InvalidConfiguration;
         if (self.maximum_ordered_packets == 0 or self.maximum_ordered_bytes == 0 or self.maximum_split_parts < 2) return error.InvalidConfiguration;
         if (self.maximum_split_bytes == 0 or self.maximum_split_bytes_per_connection < self.maximum_split_bytes) return error.InvalidConfiguration;
         if (self.maximum_concurrent_splits == 0 or self.split_timeout_ms == 0) return error.InvalidConfiguration;
         if (self.maximum_pending_handshakes == 0 or self.maximum_connections == 0 or self.maximum_connections > 65_536) return error.InvalidConfiguration;
-        if (self.maximum_queued_outbound_packets == 0 or self.maximum_queued_outbound_packets >= std.math.maxInt(u32) or self.maximum_queued_outbound_bytes == 0) return error.InvalidConfiguration;
+        if (self.maximum_queued_outbound_packets == 0 or
+            self.maximum_queued_outbound_packets >= std.math.maxInt(u32) or
+            self.maximum_queued_outbound_bytes == 0) return error.InvalidConfiguration;
         if (self.reserved_control_queue_packets == 0 or self.reserved_control_queue_packets >= self.maximum_queued_outbound_packets) return error.InvalidConfiguration;
         if (self.reserved_control_queue_bytes == 0 or self.reserved_control_queue_bytes >= self.maximum_queued_outbound_bytes) return error.InvalidConfiguration;
         if (self.maximum_packets_per_iteration == 0 or self.maximum_packets_per_iteration > 4096) return error.InvalidConfiguration;

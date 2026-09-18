@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// Integer RFC 6298-style estimator. Durations are monotonic milliseconds.
 pub const Estimator = struct {
     smoothed_ms: u64 = 0,
     variation_ms: u64 = 0,

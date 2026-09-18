@@ -3,7 +3,6 @@ const uint24 = @import("../util/uint24.zig");
 const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
 
-/// One reliable-ordered channel. It owns queued payloads and has hard entry/byte/window caps.
 pub const OrderedQueue = struct {
     allocator: std.mem.Allocator,
     packets: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
@@ -14,9 +13,18 @@ pub const OrderedQueue = struct {
     total_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, expected: u32, maximum_entries: usize, maximum_bytes: usize, maximum_window: usize) !OrderedQueue {
-        if (maximum_entries == 0 or maximum_bytes == 0 or maximum_window == 0 or maximum_window >= uint24.half_range or maximum_entries > std.math.maxInt(u32)) return error.InvalidConfiguration;
-        const self: OrderedQueue = .{ .allocator = allocator, .expected = uint24.normalize(expected), .maximum_entries = maximum_entries, .maximum_bytes = maximum_bytes, .maximum_window = maximum_window };
-        return self;
+        if (maximum_entries == 0 or
+            maximum_bytes == 0 or
+            maximum_window == 0 or
+            maximum_window >= uint24.half_range or
+            maximum_entries > std.math.maxInt(u32)) return error.InvalidConfiguration;
+        return .{
+            .allocator = allocator,
+            .expected = uint24.normalize(expected),
+            .maximum_entries = maximum_entries,
+            .maximum_bytes = maximum_bytes,
+            .maximum_window = maximum_window,
+        };
     }
     pub fn deinit(self: *OrderedQueue) void {
         var iterator = self.packets.valueIterator();
@@ -25,7 +33,6 @@ pub const OrderedQueue = struct {
         self.* = undefined;
     }
 
-    /// Returns false for an exact duplicate or stale index, without replacing retained data.
     pub fn push(self: *OrderedQueue, raw_index: u32, payload: []const u8) !bool {
         const index = uint24.normalize(raw_index);
         const forward = uint24.distance(self.expected, index);

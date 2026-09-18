@@ -1,5 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
+const net_address = @import("net/address.zig");
 const backend = @import("net/backend.zig");
 const connected = @import("protocol/connected.zig");
 const frame = @import("protocol/frame.zig");
@@ -8,6 +9,7 @@ const recovery = @import("reliability/recovery.zig");
 const core_mod = @import("session/core.zig");
 const receiver = @import("session/receiver.zig");
 const receipt_batch = @import("session/receipt_batch.zig");
+const socket_emitter = @import("session/socket_emitter.zig");
 const time = @import("util/time.zig");
 
 pub const Options = struct {
@@ -45,6 +47,58 @@ pub const Client = struct {
     pending_message_count: usize = 0,
     closed: bool = false,
 
+    const PollBridge = struct {
+        client: *Client,
+        context: *anyopaque,
+        callback: MessageFn,
+        now_ms: u64,
+        remote_disconnect: bool = false,
+
+        fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
+            const self: *PollBridge = @ptrCast(@alignCast(raw));
+            const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
+            switch (packet) {
+                .connected_ping => |sent| {
+                    var wire: [17]u8 = undefined;
+                    const pong = connected.encodePong(sent, self.now_ms, &wire) catch return error.InternalFailure;
+                    _ = self.client.sendControlWire(pong, .unreliable, 0, self.now_ms) catch |err| return core_mod.deliverySendFailure(err);
+                },
+                .disconnect => self.remote_disconnect = true,
+                .detect_lost_connections => {
+                    var wire: [9]u8 = undefined;
+                    const ping = connected.encodePing(self.now_ms, &wire) catch return error.InternalFailure;
+                    _ = self.client.sendControlWire(ping, .reliable, 0, self.now_ms) catch |err| return core_mod.deliverySendFailure(err);
+                },
+                .user => |data| self.callback(self.context, .init(data)) catch return error.ApplicationFailure,
+                else => {},
+            }
+        }
+    };
+
+    const HandshakeState = struct {
+        client: *Client,
+        now_ms: u64,
+        accepted: bool = false,
+
+        fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
+            const self: *HandshakeState = @ptrCast(@alignCast(raw));
+            const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
+            if (packet != .connection_request_accepted) return;
+            var wire: [512]u8 = undefined;
+            const incoming = connected.encodeAddressList(
+                .incoming,
+                net_address.toRakNet(self.client.server),
+                0,
+                &.{},
+                self.now_ms,
+                self.now_ms,
+                &wire,
+            ) catch return error.InternalFailure;
+            _ = self.client.sendControlWire(incoming, .reliable_ordered, 0, self.now_ms) catch |err| return core_mod.deliverySendFailure(err);
+            self.accepted = true;
+        }
+    };
+
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
         try validateOptions(options);
         const self = try allocator.create(Client);
@@ -65,8 +119,17 @@ pub const Client = struct {
         const deadline = time.after(io, options.handshake_timeout_ms);
 
         const reply1 = try discoverMtu(&socket, server, options, scratch, receive_buffer, deadline);
-        const request2 = try offline.encodeOpenConnectionRequest2(toRakAddress(server), reply1.cookie, reply1.mtu, guid, scratch);
-        const reply2_wire = try exchangeExpected(&socket, server, request2, receive_buffer, offline.Id.open_connection_reply_2, deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
+        const request2 = try offline.encodeOpenConnectionRequest2(net_address.toRakNet(server), reply1.cookie, reply1.mtu, guid, scratch);
+        const reply2_wire = try exchangeExpected(
+            &socket,
+            server,
+            request2,
+            receive_buffer,
+            .open_connection_reply_2,
+            deadline,
+            options.handshake_retry_ms,
+            options.config.maximum_packets_per_iteration,
+        );
         const reply2 = try offline.decodeOpenConnectionReply2(reply2_wire, options.config.minimum_mtu, options.config.maximum_mtu);
         if (reply2.server_guid != reply1.server_guid or reply2.mtu > reply1.mtu) return error.HandshakeMismatch;
 
@@ -81,7 +144,23 @@ pub const Client = struct {
         errdefer core.deinit();
         var receipts = try receipt_batch.Batch.init(allocator, options.config.maximum_ack_records, reply2.mtu, options.config.maximum_acknowledged_datagrams);
         errdefer receipts.deinit();
-        self.* = .{ .allocator = allocator, .io = io, .socket = socket, .server = server, .core = core, .scratch = scratch, .receive_buffer = receive_buffer, .messages = messages, .receive_storage = receive_storage, .frame_scratch = frame_scratch, .receipts = receipts, .client_guid = guid, .server_guid = reply2.server_guid, .mtu = reply2.mtu, .last_seen_ms = time.nowMilliseconds(io) };
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .socket = socket,
+            .server = server,
+            .core = core,
+            .scratch = scratch,
+            .receive_buffer = receive_buffer,
+            .messages = messages,
+            .receive_storage = receive_storage,
+            .frame_scratch = frame_scratch,
+            .receipts = receipts,
+            .client_guid = guid,
+            .server_guid = reply2.server_guid,
+            .mtu = reply2.mtu,
+            .last_seen_ms = time.nowMilliseconds(io),
+        };
         try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
         self.last_seen_ms = time.nowMilliseconds(io);
         return self;
@@ -114,31 +193,27 @@ pub const Client = struct {
         if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
     }
 
-    /// Sends immediately, returning false without emitting when congestion blocks the whole message.
     pub fn trySend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
         if (self.closed) return error.ConnectionClosed;
         _ = self.sendWire(payload, reliability, channel, time.nowMilliseconds(self.io)) catch |err| {
             if (err == error.CongestionWindowFull or err == error.OutboundQueuePending) return false;
-            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) {
-                self.abort();
-            }
+            self.abortOnError(.application_send, err);
             return err;
         };
         return true;
     }
 
-    /// Copies a message into the bounded application queue.
     pub fn queueSend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
         if (self.closed) return error.ConnectionClosed;
         const handle = self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
-            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
+            self.abortOnError(.application_send, err);
             return err;
         };
         const now_ms = time.nowMilliseconds(self.io);
         self.outbound_deadline_ms = now_ms;
         if (try self.core.outboundReady(.application)) {
             _ = self.flushQueuedAt(now_ms) catch |err| {
-                if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
+                self.abortOnError(.application_send, err);
                 return err;
             };
         }
@@ -152,16 +227,14 @@ pub const Client = struct {
         return result;
     }
 
-    /// Sends queued application data until congestion or the per-turn work limit stops progress.
     pub fn flush(self: *Client) !core_mod.FlushResult {
         if (self.closed) return error.ConnectionClosed;
         return self.flushQueuedAt(time.nowMilliseconds(self.io)) catch |err| {
-            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
+            self.abortOnError(.application_send, err);
             return err;
         };
     }
 
-    /// Returns the next absolute deadline in monotonic milliseconds.
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
         var deadline = time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms);
@@ -172,7 +245,6 @@ pub const Client = struct {
         return deadline;
     }
 
-    /// Processes due timers without waiting for socket traffic.
     pub fn processTimers(self: *Client, now_ms: u64) !void {
         if (self.closed) return error.ConnectionClosed;
         if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms))) {
@@ -185,7 +257,7 @@ pub const Client = struct {
         };
     }
 
-    /// The callback payload expires when the callback returns.
+    /// The payload is valid only during the callback.
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         if (self.pending_message_index == self.pending_message_count) {
@@ -200,32 +272,6 @@ pub const Client = struct {
             self.pending_message_index = 0;
             self.pending_message_count = batch.messages.len;
         }
-        const Bridge = struct {
-            client: *Client,
-            context: *anyopaque,
-            callback: MessageFn,
-            now_ms: u64,
-            remote_disconnect: bool = false,
-            fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
-                const bridge: *@This() = @ptrCast(@alignCast(raw));
-                const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
-                switch (packet) {
-                    .connected_ping => |sent| {
-                        var wire: [17]u8 = undefined;
-                        const pong = connected.encodePong(sent, bridge.now_ms, &wire) catch return error.InternalFailure;
-                        _ = bridge.client.sendControlWire(pong, .unreliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
-                    },
-                    .disconnect => bridge.remote_disconnect = true,
-                    .detect_lost_connections => {
-                        var wire: [9]u8 = undefined;
-                        const ping = connected.encodePing(bridge.now_ms, &wire) catch return error.InternalFailure;
-                        _ = bridge.client.sendControlWire(ping, .reliable, 0, bridge.now_ms) catch |err| return core_mod.deliverySendFailure(err);
-                    },
-                    .user => |data| bridge.callback(bridge.context, .init(data)) catch return error.ApplicationFailure,
-                    else => {},
-                }
-            }
-        };
         var delivered: usize = 0;
         var latest_ms = time.nowMilliseconds(self.io);
         var remaining = self.core.config.maximum_packets_per_iteration;
@@ -239,8 +285,8 @@ pub const Client = struct {
             if (!std.meta.eql(message.from, self.server)) continue;
             const now_ms = latest_ms;
             self.last_seen_ms = now_ms;
-            var bridge: Bridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
-            const processed_incoming = self.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, Bridge.deliver) catch |err| {
+            var bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
+            const processed_incoming = self.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, PollBridge.deliver) catch |err| {
                 const failure = core_mod.classifyIncomingError(err);
                 if (failure.disposition == .close_session) self.abort();
                 return err;
@@ -251,7 +297,7 @@ pub const Client = struct {
             if (incoming == .data) {
                 delivered += incoming.data.delivered;
                 self.queueReceipt(incoming.data, now_ms) catch |err| {
-                    if (core_mod.classifyTransitionError(.receipt, err).disposition == .close_session) self.abort();
+                    self.abortOnError(.receipt, err);
                     return err;
                 };
             }
@@ -266,12 +312,12 @@ pub const Client = struct {
             self.pending_message_count = 0;
         }
         const flushed = self.flushQueuedAtLimit(latest_ms, remaining) catch |err| {
-            if (core_mod.classifyTransitionError(.application_send, err).disposition == .close_session) self.abort();
+            self.abortOnError(.application_send, err);
             return err;
         };
         remaining -= @min(remaining, flushed.datagrams);
         self.processDueTimers(latest_ms, remaining) catch |err| {
-            if (core_mod.classifyTransitionError(.retransmission, err).disposition == .close_session) self.abort();
+            self.abortOnError(.retransmission, err);
             return err;
         };
         return delivered;
@@ -279,7 +325,9 @@ pub const Client = struct {
 
     fn finishConnectedHandshake(self: *Client, deadline: std.Io.Timeout, retry_ms: u32, maximum_work: usize) !void {
         var control: [18]u8 = undefined;
-        _ = try self.sendControlWire(try connected.encodeConnectionRequest(self.client_guid, time.nowMilliseconds(self.io), &control), .reliable_ordered, 0, time.nowMilliseconds(self.io));
+        const request_time = time.nowMilliseconds(self.io);
+        const request = try connected.encodeConnectionRequest(self.client_guid, request_time, &control);
+        _ = try self.sendControlWire(request, .reliable_ordered, 0, request_time);
         var work: usize = 0;
         while (work < maximum_work) : (work += 1) {
             const attempt = time.earliest(self.io, deadline, time.after(self.io, retry_ms));
@@ -291,23 +339,9 @@ pub const Client = struct {
                 else => return err,
             };
             if (!std.meta.eql(message.from, self.server) or message.flags.trunc) continue;
-            const Handshake = struct {
-                client: *Client,
-                accepted: bool = false,
-                now_ms: u64,
-                fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
-                    const value: *@This() = @ptrCast(@alignCast(raw));
-                    const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
-                    if (packet != .connection_request_accepted) return;
-                    var wire: [512]u8 = undefined;
-                    const incoming = connected.encodeAddressList(.incoming, toRakAddress(value.client.server), 0, &.{}, value.now_ms, value.now_ms, &wire) catch return error.InternalFailure;
-                    _ = value.client.sendControlWire(incoming, .reliable_ordered, 0, value.now_ms) catch |err| return core_mod.deliverySendFailure(err);
-                    value.accepted = true;
-                }
-            };
             const now_ms = time.nowMilliseconds(self.io);
-            var state: Handshake = .{ .client = self, .now_ms = now_ms };
-            const incoming = try self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &state, Handshake.deliver);
+            var state: HandshakeState = .{ .client = self, .now_ms = now_ms };
+            const incoming = try self.core.processIncomingWithScratch(message.data, now_ms, self.frame_scratch, &state, HandshakeState.deliver);
             if (incoming == .data) {
                 try self.queueReceipt(incoming.data, now_ms);
                 try self.flushReceipts();
@@ -325,40 +359,24 @@ pub const Client = struct {
     }
     fn sendWireAs(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, now_ms: u64, control: bool) !usize {
         if (control) try self.flushReceipts();
-        const Emitter = struct {
-            client: *Client,
-            count: usize = 0,
-            fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                value.client.socket.send(value.client.server, wire) catch return error.TransportFailure;
-                value.count += 1;
-            }
-        };
-        var emitter: Emitter = .{ .client = self };
+        var emitter: socket_emitter.Emitter = .{ .socket = &self.socket, .address = self.server };
         _ = if (control)
-            try self.core.sendControl(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit)
+            try self.core.sendControl(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit)
         else
-            try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, Emitter.emit);
+            try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit);
         return emitter.count;
     }
     fn flushQueuedAt(self: *Client, now_ms: u64) !core_mod.FlushResult {
         return self.flushQueuedAtLimit(now_ms, self.core.config.maximum_packets_per_iteration);
     }
     fn flushQueuedAtLimit(self: *Client, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
-        const Emitter = struct {
-            client: *Client,
-            fn emit(raw: *anyopaque, wire: []const u8) core_mod.SendError!void {
-                const value: *@This() = @ptrCast(@alignCast(raw));
-                value.client.socket.send(value.client.server, wire) catch return error.TransportFailure;
-            }
-        };
-        var emitter: Emitter = .{ .client = self };
+        var emitter: socket_emitter.Emitter = .{ .socket = &self.socket, .address = self.server };
         self.outbound_deadline_ms = null;
-        const sent = try self.core.flushOutbound(.application, self.scratch, maximum_datagrams, now_ms, &emitter, Emitter.emit);
+        const sent = try self.core.flushOutbound(.application, self.scratch, maximum_datagrams, now_ms, &emitter, socket_emitter.Emitter.emit);
         if (sent.datagrams == maximum_datagrams and self.core.outboundCount(.application) != 0) self.outbound_deadline_ms = now_ms;
         return sent;
     }
-    fn queueReceipt(self: *Client, receipt: @import("session/receiver.zig").Receipt, now_ms: u64) !void {
+    fn queueReceipt(self: *Client, receipt: receiver.Receipt, now_ms: u64) !void {
         self.receipts.append(receipt) catch {
             try self.flushReceipts();
             try self.receipts.append(receipt);
@@ -417,11 +435,23 @@ pub const Client = struct {
         for (batch.items) |item| self.socket.send(self.server, item.data) catch return error.TransportFailure;
         return receipts_sent + batch.inspected;
     }
+
+    fn abortOnError(self: *Client, transition: core_mod.SessionTransition, err: anyerror) void {
+        if (core_mod.classifyTransitionError(transition, err).disposition == .close_session) self.abort();
+    }
 };
 
 fn validateOptions(options: Options) !void {
     try options.config.validate();
-    if (options.mtu < options.config.minimum_mtu or options.mtu > options.config.maximum_mtu or options.handshake_timeout_ms == 0 or options.handshake_retry_ms == 0 or options.handshake_retry_ms > options.handshake_timeout_ms or options.receive_batch_size == 0 or options.receive_batch_size > 256) return error.InvalidConfiguration;
+    const invalid =
+        options.mtu < options.config.minimum_mtu or
+        options.mtu > options.config.maximum_mtu or
+        options.handshake_timeout_ms == 0 or
+        options.handshake_retry_ms == 0 or
+        options.handshake_retry_ms > options.handshake_timeout_ms or
+        options.receive_batch_size == 0 or
+        options.receive_batch_size > 256;
+    if (invalid) return error.InvalidConfiguration;
     var previous = options.config.maximum_mtu + 1;
     for (options.mtu_fallbacks) |fallback| {
         if (fallback < options.config.minimum_mtu or fallback > options.config.maximum_mtu or fallback >= previous) return error.InvalidConfiguration;
@@ -429,7 +459,16 @@ fn validateOptions(options: Options) !void {
     }
 }
 
-fn exchangeExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, request: []const u8, buffer: []u8, id: offline.Id, overall: std.Io.Timeout, retry_ms: u32, maximum_work: usize) ![]const u8 {
+fn exchangeExpected(
+    socket: *backend.Socket,
+    server: std.Io.net.IpAddress,
+    request: []const u8,
+    buffer: []u8,
+    id: offline.Id,
+    overall: std.Io.Timeout,
+    retry_ms: u32,
+    maximum_work: usize,
+) ![]const u8 {
     while (std.Io.Clock.awake.now(socket.io).nanoseconds < overall.deadline.raw.nanoseconds) {
         try socket.send(server, request);
         const attempt = time.earliest(socket.io, overall, time.after(socket.io, retry_ms));
@@ -477,12 +516,6 @@ fn receiveExpected(socket: *backend.Socket, server: std.Io.net.IpAddress, buffer
         if (message.data[0] == @intFromEnum(id)) return message.data;
     }
     return error.HandshakeWorkLimitExceeded;
-}
-fn toRakAddress(address: std.Io.net.IpAddress) offline.Address {
-    return switch (address) {
-        .ip4 => |v| .{ .ipv4 = .{ .octets = v.bytes, .port = v.port } },
-        .ip6 => |v| .{ .ipv6 = .{ .octets = v.bytes, .port = v.port, .flow = v.flow, .scope = v.interface.index } },
-    };
 }
 test "client validates a descending MTU ladder" {
     try validateOptions(.{});

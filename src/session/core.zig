@@ -3,6 +3,7 @@ const Config = @import("../config.zig").Config;
 const ack = @import("../protocol/ack.zig");
 const datagram = @import("../protocol/datagram.zig");
 const congestion = @import("../reliability/congestion.zig");
+const reassembly = @import("../reliability/reassembly.zig");
 const recovery = @import("../reliability/recovery.zig");
 const rtt = @import("../reliability/rtt.zig");
 const receiver = @import("receiver.zig");
@@ -190,7 +191,6 @@ pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) Inc
         },
     };
 }
-/// Protocol state owned by one event-loop context. It performs no socket I/O and needs no locks.
 pub const Core = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -249,11 +249,30 @@ pub const Core = struct {
         return self.sendImmediate(.application, payload, reliability, channel, scratch, now_ms, context, emit);
     }
 
-    pub fn sendControl(self: *Core, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+    pub fn sendControl(
+        self: *Core,
+        payload: []const u8,
+        reliability: frame.Reliability,
+        channel: u8,
+        scratch: []u8,
+        now_ms: u64,
+        context: *anyopaque,
+        emit: SendFn,
+    ) !transmitter.Sent {
         return self.sendImmediate(.control, payload, reliability, channel, scratch, now_ms, context, emit);
     }
 
-    fn sendImmediate(self: *Core, lane: outbound_queue.Lane, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+    fn sendImmediate(
+        self: *Core,
+        lane: outbound_queue.Lane,
+        payload: []const u8,
+        reliability: frame.Reliability,
+        channel: u8,
+        scratch: []u8,
+        now_ms: u64,
+        context: *anyopaque,
+        emit: SendFn,
+    ) !transmitter.Sent {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         const wire_bytes = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
         if (self.outbound_state.count(lane) != 0) return error.OutboundQueuePending;
@@ -269,8 +288,16 @@ pub const Core = struct {
         return self.transmitter_state.beginPacketization(payload_len, reliability, channel);
     }
 
-    /// Advances a prepared message without exceeding the current congestion window.
-    pub fn sendAvailable(self: *Core, packetization: *transmitter.Packetization, payload: []const u8, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+    pub fn sendAvailable(
+        self: *Core,
+        packetization: *transmitter.Packetization,
+        payload: []const u8,
+        scratch: []u8,
+        maximum_datagrams: usize,
+        now_ms: u64,
+        context: *anyopaque,
+        emit: SendFn,
+    ) !transmitter.Sent {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         const Bridge = struct {
             core: *Core,
@@ -351,7 +378,6 @@ pub const Core = struct {
         return .not_found;
     }
 
-    /// Drains one FIFO lane while both congestion and work budgets permit.
     pub fn flushOutbound(self: *Core, lane: outbound_queue.Lane, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         var total: transmitter.Sent = .{ .datagrams = 0, .wire_bytes = 0 };
@@ -424,7 +450,14 @@ pub const Core = struct {
         return (try self.processIncomingImpl(wire, now_ms, frame_scratch, context, deliver)).incoming;
     }
 
-    pub fn processIncomingCountedWithScratch(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: []frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !ProcessedIncoming {
+    pub fn processIncomingCountedWithScratch(
+        self: *Core,
+        wire: []const u8,
+        now_ms: u64,
+        frame_scratch: []frame.Frame,
+        context: *anyopaque,
+        deliver: receiver.DeliverFn,
+    ) !ProcessedIncoming {
         return self.processIncomingImpl(wire, now_ms, frame_scratch, context, deliver);
     }
 
@@ -459,7 +492,7 @@ pub const Core = struct {
         return self.receiver_state.nextSplitDeadline();
     }
 
-    pub fn expireSplits(self: *Core, now_ms: u64, maximum_work: usize) @import("../reliability/reassembly.zig").ExpiryBatch {
+    pub fn expireSplits(self: *Core, now_ms: u64, maximum_work: usize) reassembly.ExpiryBatch {
         return self.receiver_state.expireSplits(now_ms, maximum_work);
     }
 

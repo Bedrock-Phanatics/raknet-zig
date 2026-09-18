@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// A view that expires when its synchronous callback returns.
+/// Valid only during the callback that provided it.
 pub const BorrowedPayload = struct {
     bytes: []const u8,
 
@@ -8,13 +8,12 @@ pub const BorrowedPayload = struct {
         return .{ .bytes = bytes };
     }
 
-    /// Copies exactly bytes.len bytes.
     pub fn toOwned(self: BorrowedPayload, allocator: std.mem.Allocator) !OwnedPayload {
         return .{ .allocator = allocator, .bytes = try allocator.dupe(u8, self.bytes) };
     }
 };
 
-/// Allocator-backed bytes. Call deinit exactly once.
+/// Owned bytes released by deinit.
 pub const OwnedPayload = struct {
     allocator: std.mem.Allocator,
     bytes: []u8,

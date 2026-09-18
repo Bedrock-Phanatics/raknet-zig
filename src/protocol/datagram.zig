@@ -10,7 +10,6 @@ pub const Packet = union(Kind) {
     nack: ack.Decoded,
 };
 
-/// Decodes the outer RakNet datagram and ACK/NACK discriminator.
 pub fn decode(data: []const u8, records: []ack.Record, maximum_records: usize, maximum_acknowledged: usize) !Packet {
     if (data.len == 0) return error.Truncated;
     const flags = data[0];
@@ -19,7 +18,6 @@ pub fn decode(data: []const u8, records: []ack.Record, maximum_records: usize, m
     const is_nack = flags & 0x20 != 0;
     if (is_ack and is_nack) return error.InvalidDatagramFlags;
     if (is_ack or is_nack) {
-        // Control datagrams have no data-only flag bits in Bedrock's RakNet dialect.
         if (flags & 0x1f != 0) return error.InvalidDatagramFlags;
         const decoded = try ack.decode(data[1..], records, maximum_records, maximum_acknowledged);
         return if (is_ack) .{ .ack = decoded } else .{ .nack = decoded };

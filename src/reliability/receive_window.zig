@@ -11,7 +11,6 @@ pub const Result = union(enum) {
 
 pub const Gap = struct { first: u32, last: u32, count: usize };
 
-/// A fixed-storage sliding window. No arrival can grow memory or trigger work proportional to its jump.
 pub const Window = struct {
     present: []bool,
     expected: u32 = 0,
@@ -22,7 +21,6 @@ pub const Window = struct {
         return .{ .present = storage, .expected = uint24.normalize(initial_expected) };
     }
 
-    /// Checks an index without changing the window.
     pub fn inspect(self: *const Window, raw_index: u32, maximum_gap_report: usize) Result {
         const index = uint24.normalize(raw_index);
         const forward = uint24.distance(self.expected, index);

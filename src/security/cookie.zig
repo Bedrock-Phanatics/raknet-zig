@@ -2,8 +2,6 @@ const std = @import("std");
 
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
-/// Stateless 32-bit RakNet handshake cookies, bound to a canonical remote endpoint and epoch.
-/// The wire format limits cookies to 32 bits, so callers must also rate-limit verification attempts.
 pub const Jar = struct {
     current_key: [32]u8,
     previous_key: [32]u8,
@@ -20,7 +18,6 @@ pub const Jar = struct {
         return (@as(u32, mac[0]) << 24) | (@as(u32, mac[1]) << 16) | (@as(u32, mac[2]) << 8) | mac[3];
     }
 
-    /// Accepts current/previous epochs and keys to permit rotation without state per peer.
     pub fn verify(self: Jar, cookie: u32, endpoint: []const u8, epoch: u64) bool {
         const keys = [_][32]u8{ self.current_key, self.previous_key };
         const epochs = [_]u64{ epoch, epoch -| 1 };

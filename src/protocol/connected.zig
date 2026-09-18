@@ -105,7 +105,15 @@ pub fn encodeConnectionRequest(client_guid: u64, request_time: u64, output: []u8
     try writer.byte(0);
     return writer.written();
 }
-pub fn encodeAddressList(id: enum { accepted, incoming }, primary: offline.Address, system_index: u16, addresses: []const offline.Address, ping_time: u64, pong_time: u64, output: []u8) ![]u8 {
+pub fn encodeAddressList(
+    id: enum { accepted, incoming },
+    primary: offline.Address,
+    system_index: u16,
+    addresses: []const offline.Address,
+    ping_time: u64,
+    pong_time: u64,
+    output: []u8,
+) ![]u8 {
     if (addresses.len > 20) return error.TooManySystemAddresses;
     var writer: cursor.Writer = .{ .data = output };
     try writer.byte(if (id == .accepted) @intFromEnum(offline.Id.connection_request_accepted) else @intFromEnum(offline.Id.new_incoming_connection));
