@@ -206,7 +206,7 @@ pub const Core = struct {
         if (mtu < config.minimum_mtu or mtu > config.maximum_mtu) return error.InvalidMtu;
         var receiver_state = try receiver.Receiver.init(allocator, config);
         errdefer receiver_state.deinit();
-        var recovery_state = try recovery.Recovery.init(allocator, config.maximum_retransmissions, config.maximum_recovery_bytes, 8);
+        var recovery_state = try recovery.Recovery.init(allocator, config.maximum_retransmissions, config.maximum_recovery_bytes, 8, mtu);
         errdefer recovery_state.deinit();
         var outbound_state = try outbound_queue.Queue.init(
             allocator,
@@ -681,7 +681,7 @@ test "partial send failure rolls back only the failed datagram" {
     try std.testing.expectEqual(@as(usize, 1), failing.successful);
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.datagram_sequence);
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.reliable_index);
-    try std.testing.expectEqual(@as(usize, 1), core.recovery_state.records.count());
+    try std.testing.expectEqual(@as(usize, 1), core.recovery_state.count());
     try std.testing.expectEqual(@as(u64, 576), core.congestion_state.in_flight);
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
     const progress = core.outbound_packetization[@intFromEnum(outbound_queue.Lane.application)].?;

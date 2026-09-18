@@ -5,6 +5,7 @@ const frame = raknet.protocol.frame;
 const cursor = raknet.protocol.cursor;
 const datagram = raknet.protocol.datagram;
 const receive_window = raknet.reliability.receive_window;
+const recovery = raknet.reliability.recovery;
 const deadline_queue = raknet.session.deadline_queue;
 
 pub fn main(init: std.process.Init) !void {
@@ -146,6 +147,11 @@ pub fn main(init: std.process.Init) !void {
     const packed_send = try benchmarkFramePacking(io, send_iterations, true);
     checksum +%= single_send.checksum +% packed_send.checksum;
     const send_messages = send_iterations * bedrock_payload_sizes.len;
+    const recovery_iterations: usize = 5_000;
+    const recovery_classes = try benchmarkRecoveryStorage(io, recovery_iterations, .size_classes);
+    const recovery_slabs = try benchmarkRecoveryStorage(io, recovery_iterations, .mtu_slabs);
+    checksum +%= recovery_classes.checksum +% recovery_slabs.checksum;
+    const recovery_messages = recovery_iterations * 256;
 
     std.debug.print(
         "ack_decode: {d:.2} ns/op\nframe_decode: {d:.2} ns/op\nwindow_add: {d:.2} ns/op\n" ++
@@ -161,6 +167,8 @@ pub fn main(init: std.process.Init) !void {
             "descriptor_scratch_256_frames: {d} bytes\n" ++
             "bedrock_send_single: {d:.2} ns/message, {d:.2} bytes/message, {d} datagrams\n" ++
             "bedrock_send_packed: {d:.2} ns/message, {d:.2} bytes/message, {d} datagrams\n" ++
+            "recovery_size_classes: {d:.2} ns/message, {d} retained bytes\n" ++
+            "recovery_mtu_slabs: {d:.2} ns/message, {d} retained bytes\n" ++
             "checksum: {d}\n",
         .{
             @as(f64, @floatFromInt(ack_ns)) / @as(f64, @floatFromInt(iterations)),
@@ -182,6 +190,10 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(packed_send.nanoseconds)) / @as(f64, @floatFromInt(send_messages)),
             @as(f64, @floatFromInt(packed_send.wire_bytes)) / @as(f64, @floatFromInt(send_messages)),
             packed_send.datagrams,
+            @as(f64, @floatFromInt(recovery_classes.nanoseconds)) / @as(f64, @floatFromInt(recovery_messages)),
+            recovery_classes.retained_bytes,
+            @as(f64, @floatFromInt(recovery_slabs.nanoseconds)) / @as(f64, @floatFromInt(recovery_messages)),
+            recovery_slabs.retained_bytes,
             checksum,
         },
     );
@@ -189,6 +201,7 @@ pub fn main(init: std.process.Init) !void {
 
 const DueMeasurement = struct { nanoseconds: u64, checksum: usize };
 const PackingMeasurement = struct { nanoseconds: u64, wire_bytes: usize, datagrams: usize, checksum: usize };
+const RecoveryMeasurement = struct { nanoseconds: u64, retained_bytes: usize, checksum: usize };
 const bedrock_payload_sizes = [_]usize{ 5, 7, 9, 12, 16, 20, 24, 32, 40, 52, 68, 96, 140, 220, 360, 700 };
 
 fn benchmarkFramePacking(io: std.Io, iterations: usize, pack: bool) !PackingMeasurement {
@@ -241,6 +254,35 @@ fn benchmarkFramePacking(io: std.Io, iterations: usize, pack: bool) !PackingMeas
     }
     const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     return .{ .nanoseconds = nanoseconds, .wire_bytes = wire_bytes, .datagrams = datagrams, .checksum = checksum };
+}
+
+fn benchmarkRecoveryStorage(io: std.Io, iterations: usize, policy: recovery.StoragePolicy) !RecoveryMeasurement {
+    const capacity = 256;
+    const mtu = 1492;
+    var state = try recovery.Recovery.initWithPolicy(std.heap.page_allocator, capacity, capacity * mtu, 8, mtu, policy);
+    defer state.deinit();
+    var payloads: [bedrock_payload_sizes.len][700]u8 = undefined;
+    for (&payloads, 0..) |*payload, index| {
+        for (payload, 0..) |*byte, byte_index| byte.* = @truncate(index +% byte_index);
+    }
+    var checksum: usize = 0;
+    var sequence: u32 = 0;
+    const start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |iteration| {
+        const first = sequence;
+        for (0..capacity) |index| {
+            const sample = index & (bedrock_payload_sizes.len - 1);
+            const payload_len = bedrock_payload_sizes[sample];
+            payloads[sample][0] = @truncate(iteration +% index);
+            try state.track(sequence, payloads[sample][0..payload_len], payload_len, iteration, 100);
+            sequence = (sequence + 1) & 0xffffff;
+        }
+        const records = [_]ack.Record{.{ .first = first, .last = sequence - 1 }};
+        const acknowledged = try state.acknowledge(&records, iteration + 1, capacity);
+        checksum +%= acknowledged.packets + acknowledged.bytes;
+    }
+    const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    return .{ .nanoseconds = nanoseconds, .retained_bytes = state.retainedCapacity(), .checksum = checksum };
 }
 
 fn benchmarkDueBatch(io: std.Io, capacity: usize, due_per_turn: usize, turns: usize) !DueMeasurement {
