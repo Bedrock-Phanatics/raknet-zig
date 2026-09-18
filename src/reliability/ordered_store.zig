@@ -1,68 +1,228 @@
 const std = @import("std");
 const uint24 = @import("../util/uint24.zig");
-const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
-const OwnedPayload = @import("../payload.zig").OwnedPayload;
+const empty_ref = std.math.maxInt(u32);
+const class_count = 4;
+const class_sizes = [class_count]usize{ 64, 256, 576, 1200 };
 
-/// Shared storage for every order channel, so many channels cannot multiply configured limits.
+const Channel = struct {
+    expected: u32 = 0,
+    ring: []u32 = &.{},
+};
+
+const Packet = struct {
+    occupied: bool = false,
+    index: u32 = 0,
+    channel: u8 = 0,
+    class_index: u8 = class_count,
+    data_len: usize = 0,
+    storage: []u8 = &.{},
+    next: u32 = empty_ref,
+};
+
+pub const RetainedPayload = struct {
+    owner: *Store,
+    packet_ref: u32,
+    bytes: []const u8,
+
+    pub fn deinit(self: RetainedPayload) void {
+        self.owner.releasePacket(self.packet_ref);
+    }
+};
+
+/// Shared bounded storage for all order channels.
 pub const Store = struct {
     allocator: std.mem.Allocator,
-    packets: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
-    expected: []u32,
-    maximum_entries: usize,
+    channels: []Channel,
+    packets: []Packet,
     maximum_bytes: usize,
     maximum_window: usize,
     total_bytes: usize = 0,
+    packet_count: usize = 0,
+    free_head: u32 = empty_ref,
+    class_heads: [class_count]u32 = @splat(empty_ref),
+    retained_bytes: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, channels: usize, maximum_entries: usize, maximum_bytes: usize, maximum_window: usize) !Store {
-        if (channels == 0 or channels > 256 or maximum_entries == 0 or maximum_entries > std.math.maxInt(u32) or maximum_bytes == 0 or maximum_window == 0 or maximum_window >= uint24.half_range) return error.InvalidConfiguration;
-        const expected = try allocator.alloc(u32, channels);
-        @memset(expected, 0);
-        errdefer allocator.free(expected);
-        const self: Store = .{ .allocator = allocator, .expected = expected, .maximum_entries = maximum_entries, .maximum_bytes = maximum_bytes, .maximum_window = maximum_window };
-        return self;
+    pub fn init(allocator: std.mem.Allocator, channel_count: usize, maximum_entries: usize, maximum_bytes: usize, maximum_window: usize) !Store {
+        if (channel_count == 0 or channel_count > 256 or maximum_entries == 0 or maximum_entries >= empty_ref or maximum_bytes == 0 or maximum_window == 0 or maximum_window >= uint24.half_range) return error.InvalidConfiguration;
+        const channels = try allocator.alloc(Channel, channel_count);
+        @memset(channels, .{});
+        errdefer allocator.free(channels);
+        const packets = try allocator.alloc(Packet, maximum_entries);
+        errdefer allocator.free(packets);
+        for (packets, 0..) |*packet, index| packet.* = .{ .next = if (index + 1 < packets.len) @intCast(index + 1) else empty_ref };
+        return .{
+            .allocator = allocator,
+            .channels = channels,
+            .packets = packets,
+            .maximum_bytes = maximum_bytes,
+            .maximum_window = maximum_window,
+            .free_head = 0,
+        };
     }
+
     pub fn deinit(self: *Store) void {
-        var iterator = self.packets.valueIterator();
-        while (iterator.next()) |data| self.allocator.free(data.*);
-        self.packets.deinit(self.allocator);
-        self.allocator.free(self.expected);
+        for (self.packets) |packet| if (packet.storage.len != 0) self.allocator.free(packet.storage);
+        for (self.channels) |channel| if (channel.ring.len != 0) self.allocator.free(channel.ring);
+        self.allocator.free(self.packets);
+        self.allocator.free(self.channels);
         self.* = undefined;
     }
-    pub fn expectedIndex(self: Store, channel: u8) !u32 {
-        if (channel >= self.expected.len) return error.InvalidOrderChannel;
-        return self.expected[channel];
+
+    pub fn count(self: Store) usize {
+        return self.packet_count;
     }
+
+    pub fn metadataCapacity(self: Store) usize {
+        var bytes = self.channels.len * @sizeOf(Channel) + self.packets.len * @sizeOf(Packet);
+        for (self.channels) |channel| bytes += channel.ring.len * @sizeOf(u32);
+        return bytes;
+    }
+
+    pub fn retainedCapacity(self: Store) usize {
+        return self.retained_bytes;
+    }
+
+    pub fn expectedIndex(self: Store, channel: u8) !u32 {
+        if (channel >= self.channels.len) return error.InvalidOrderChannel;
+        return self.channels[channel].expected;
+    }
+
+    pub fn peek(self: Store, channel: u8, raw_index: u32) ?[]const u8 {
+        if (channel >= self.channels.len) return null;
+        const state = self.channels[channel];
+        if (state.ring.len == 0) return null;
+        const index = uint24.normalize(raw_index);
+        const packet_ref = state.ring[index % self.maximum_window];
+        if (packet_ref == empty_ref) return null;
+        const packet = self.packets[packet_ref];
+        if (packet.channel != channel or packet.index != index) return null;
+        if (!packet.occupied) return null;
+        return packet.storage[0..packet.data_len];
+    }
+
     pub fn advanceBorrowed(self: *Store, channel: u8, index: u32) !void {
         if (try self.expectedIndex(channel) != uint24.normalize(index)) return error.UnexpectedOrderIndex;
-        self.expected[channel] = uint24.add(index, 1);
+        self.channels[channel].expected = uint24.add(index, 1);
     }
+
     pub fn push(self: *Store, channel: u8, raw_index: u32, payload: []const u8) !bool {
-        if (channel >= self.expected.len) return error.InvalidOrderChannel;
+        if (channel >= self.channels.len) return error.InvalidOrderChannel;
         const index = uint24.normalize(raw_index);
-        const forward = uint24.distance(self.expected[channel], index);
+        const forward = uint24.distance(self.channels[channel].expected, index);
         if (forward >= uint24.half_range) return false;
         if (forward >= self.maximum_window) return error.OrderWindowExceeded;
-        const key = makeKey(channel, index);
-        if (self.packets.contains(key)) return false;
-        if (self.packets.count() >= self.maximum_entries) return error.OrderQueueFull;
+        if (self.peek(channel, index) != null) return false;
+        if (self.packet_count == self.packets.len) return error.OrderQueueFull;
         if (payload.len > self.maximum_bytes -| self.total_bytes) return error.OrderBytesExceeded;
-        const copy = try BorrowedPayload.init(payload).toOwned(self.allocator);
-        errdefer copy.deinit();
-        try self.packets.put(self.allocator, key, copy.bytes);
-        self.total_bytes += copy.bytes.len;
+
+        if (self.channels[channel].ring.len == 0) {
+            const ring = try self.allocator.alloc(u32, self.maximum_window);
+            @memset(ring, empty_ref);
+            self.channels[channel].ring = ring;
+        }
+        const packet_ref = try self.acquirePacket(payload.len);
+        errdefer self.releasePacket(packet_ref);
+        const ring_slot = index % self.maximum_window;
+        const previous_ref = self.channels[channel].ring[ring_slot];
+        if (previous_ref != empty_ref) {
+            const previous = self.packets[previous_ref];
+            if (previous.occupied and previous.channel == channel and previous.index != index) return error.InternalInvariant;
+        }
+        const packet = &self.packets[packet_ref];
+        @memcpy(packet.storage[0..payload.len], payload);
+        packet.occupied = true;
+        packet.index = index;
+        packet.channel = channel;
+        packet.data_len = payload.len;
+        self.channels[channel].ring[ring_slot] = packet_ref;
+        self.packet_count += 1;
+        self.total_bytes += payload.len;
         return true;
     }
-    pub fn pop(self: *Store, channel: u8) !?OwnedPayload {
-        if (channel >= self.expected.len) return error.InvalidOrderChannel;
-        const removed = self.packets.fetchRemove(makeKey(channel, self.expected[channel])) orelse return null;
-        self.expected[channel] = uint24.add(self.expected[channel], 1);
-        self.total_bytes -= removed.value.len;
-        return .{ .allocator = self.allocator, .bytes = removed.value };
+
+    pub fn pop(self: *Store, channel: u8) !?RetainedPayload {
+        if (channel >= self.channels.len) return error.InvalidOrderChannel;
+        const state = &self.channels[channel];
+        if (state.ring.len == 0) return null;
+        const index = state.expected;
+        const ring_slot = index % self.maximum_window;
+        const packet_ref = state.ring[ring_slot];
+        if (packet_ref == empty_ref) return null;
+        const packet = &self.packets[packet_ref];
+        if (!packet.occupied or packet.channel != channel or packet.index != index) return null;
+        const data = packet.storage[0..packet.data_len];
+        state.ring[ring_slot] = empty_ref;
+        packet.occupied = false;
+        state.expected = uint24.add(index, 1);
+        self.packet_count -= 1;
+        self.total_bytes -= data.len;
+        return .{ .owner = self, .packet_ref = packet_ref, .bytes = data };
     }
-    fn makeKey(channel: u8, index: u32) u32 {
-        return (@as(u32, channel) << 24) | uint24.normalize(index);
+
+    fn acquirePacket(self: *Store, len: usize) !u32 {
+        const class = classIndex(len);
+        var packet_ref: u32 = undefined;
+        if (class) |class_index| {
+            if (self.class_heads[class_index] != empty_ref) {
+                packet_ref = self.class_heads[class_index];
+                self.class_heads[class_index] = self.packets[packet_ref].next;
+                return packet_ref;
+            }
+            packet_ref = self.takeUnused() orelse return error.OrderQueueFull;
+            const storage = self.allocator.alloc(u8, class_sizes[class_index]) catch |err| {
+                self.returnUnused(packet_ref);
+                return err;
+            };
+            self.packets[packet_ref].storage = storage;
+            self.packets[packet_ref].class_index = @intCast(class_index);
+            self.retained_bytes += storage.len;
+            return packet_ref;
+        }
+        packet_ref = self.takeUnused() orelse return error.OrderQueueFull;
+        const storage = self.allocator.alloc(u8, len) catch |err| {
+            self.returnUnused(packet_ref);
+            return err;
+        };
+        self.packets[packet_ref].storage = storage;
+        self.packets[packet_ref].class_index = class_count;
+        self.retained_bytes += storage.len;
+        return packet_ref;
+    }
+
+    fn releasePacket(self: *Store, packet_ref: u32) void {
+        const packet = &self.packets[packet_ref];
+        packet.occupied = false;
+        packet.data_len = 0;
+        if (packet.class_index < class_count) {
+            packet.next = self.class_heads[packet.class_index];
+            self.class_heads[packet.class_index] = packet_ref;
+            return;
+        }
+        if (packet.storage.len != 0) {
+            self.retained_bytes -= packet.storage.len;
+            self.allocator.free(packet.storage);
+            packet.storage = &.{};
+        }
+        self.returnUnused(packet_ref);
+    }
+
+    fn takeUnused(self: *Store) ?u32 {
+        if (self.free_head == empty_ref) return null;
+        const packet_ref = self.free_head;
+        self.free_head = self.packets[packet_ref].next;
+        return packet_ref;
+    }
+
+    fn returnUnused(self: *Store, packet_ref: u32) void {
+        self.packets[packet_ref] = .{ .next = self.free_head };
+        self.free_head = packet_ref;
     }
 };
+
+fn classIndex(len: usize) ?usize {
+    for (class_sizes, 0..) |size, index| if (len <= size) return index;
+    return null;
+}
 
 test "global quotas span channels and in-order fast path advances" {
     var store = try Store.init(std.testing.allocator, 2, 2, 8, 8);
@@ -73,11 +233,36 @@ test "global quotas span channels and in-order fast path advances" {
     try std.testing.expect(try store.push(1, 1, "b"));
     try std.testing.expectError(error.OrderQueueFull, store.push(1, 2, "c"));
 }
+
+test "circular slots reject stale wrap aliases" {
+    var store = try Store.init(std.testing.allocator, 1, 4, 16, 4);
+    defer store.deinit();
+    try std.testing.expect(try store.push(0, 3, "old"));
+    try std.testing.expectError(error.OrderWindowExceeded, store.push(0, 7, "new"));
+    try std.testing.expectEqualStrings("old", store.peek(0, 3).?);
+    try std.testing.expect(store.peek(0, 7) == null);
+}
+
+test "size-class payload storage is reused" {
+    const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
+    var quota = QuotaAllocator.init(std.testing.allocator, std.math.maxInt(usize));
+    var store = try Store.init(quota.allocator(), 1, 2, 64, 4);
+    defer store.deinit();
+    try std.testing.expect(try store.push(0, 1, "first"));
+    try store.advanceBorrowed(0, 0);
+    const first = (try store.pop(0)).?;
+    first.deinit();
+    const retained = quota.used_bytes;
+    quota.maximum_bytes = retained;
+    try std.testing.expect(try store.push(0, 2, "second"));
+    try std.testing.expectEqual(retained, quota.used_bytes);
+}
+
 fn checkOrderedAllocationFailures(allocator: std.mem.Allocator) !void {
     var store = try Store.init(allocator, 2, 4, 64, 8);
     defer store.deinit();
     try std.testing.expect(try store.push(0, 1, "retained"));
-    try std.testing.expectEqual(@as(usize, 1), store.packets.count());
+    try std.testing.expectEqual(@as(usize, 1), store.count());
     try std.testing.expectEqual(@as(usize, 8), store.total_bytes);
 }
 

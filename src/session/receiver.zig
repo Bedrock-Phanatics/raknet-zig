@@ -248,7 +248,7 @@ test "receiver delivers in order with a zero-copy fast path" {
     var wire: [4096]u8 = undefined;
     const second = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 1, .order_channel = 0, .payload = "second" }};
     _ = try receiver.processWithScratch(try @import("../protocol/datagram.zig").encodeData(0, &second, &wire), 0, &descriptors, &collector, Collector.add);
-    const retained = receiver.ordered.packets.get(1).?;
+    const retained = receiver.ordered.peek(0, 1).?;
     const retained_start = @intFromPtr(retained.ptr);
     const wire_start = @intFromPtr(&wire);
     try std.testing.expectEqual(second[0].payload.len, retained.len);
@@ -376,7 +376,7 @@ test "retained allocation failure does not consume datagram or reliable indices"
     try std.testing.expectEqual(@as(usize, 0), counter.count);
     try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
-    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.count());
 
     quota.maximum_bytes = std.math.maxInt(usize);
     const retry_receipt = try receiver.process(blocked_wire, 1, &counter, Counter.deliver);
@@ -436,11 +436,11 @@ test "every truncation inside a later frame is atomic" {
         try std.testing.expectEqual(@as(usize, 0), counter.count);
         try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
         try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
-        try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
+        try std.testing.expectEqual(@as(usize, 0), receiver.splits.count());
         try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
-        try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+        try std.testing.expectEqual(@as(usize, 0), receiver.ordered.count());
         try std.testing.expectEqual(@as(usize, 0), receiver.ordered.total_bytes);
-        try std.testing.expectEqual(@as(u32, 0), receiver.ordered.expected[0]);
+        try std.testing.expectEqual(@as(u32, 0), try receiver.ordered.expectedIndex(0));
         try std.testing.expect(!receiver.sequenced[0].initialized);
     }
 }
@@ -501,7 +501,7 @@ test "completed split can retry after final allocation failure" {
     try std.testing.expectEqual(@as(usize, 0), collector.count);
     try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
-    try std.testing.expectEqual(@as(usize, 1), receiver.splits.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 1), receiver.splits.count());
     try std.testing.expectEqual(@as(usize, 11), receiver.splits.total_bytes);
 
     quota.maximum_bytes = std.math.maxInt(usize);
@@ -511,7 +511,7 @@ test "completed split can retry after final allocation failure" {
     try std.testing.expectEqualStrings("hello world", collector.value[0..collector.length]);
     try std.testing.expectEqual(@as(u32, 2), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 2), receiver.reliable.expected);
-    try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.count());
     try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
 }
 test "small descriptor scratch is rejected before state changes" {
@@ -579,9 +579,9 @@ test "callback failure before prepared state keeps stores empty" {
     try std.testing.expectEqual(@as(usize, 1), failing.calls);
     try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
-    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.count());
     try std.testing.expectEqual(@as(usize, 0), receiver.ordered.total_bytes);
-    try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.count());
 }
 
 test "callback failure after prepared ordered state releases it" {
@@ -630,7 +630,7 @@ test "callback failure after prepared ordered state releases it" {
     const queued_wire = try @import("../protocol/datagram.zig").encodeData(0, &queued, &wire_storage);
     const queued_receipt = try receiver.processWithScratch(queued_wire, 0, &descriptors, &callback, FailingSecond.deliver);
     try std.testing.expectEqual(@as(usize, 0), queued_receipt.delivered);
-    try std.testing.expectEqual(@as(usize, 1), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 1), receiver.ordered.count());
     try std.testing.expectEqual(@as(usize, 6), receiver.ordered.total_bytes);
 
     const immediate = [_]frame.Frame{.{
@@ -648,8 +648,8 @@ test "callback failure after prepared ordered state releases it" {
     try std.testing.expectEqualStrings("second", callback.failed[0..callback.failed_len]);
     try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 2), receiver.reliable.expected);
-    try std.testing.expectEqual(@as(u32, 2), receiver.ordered.expected[0]);
-    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(u32, 2), try receiver.ordered.expectedIndex(0));
+    try std.testing.expectEqual(@as(usize, 0), receiver.ordered.count());
     try std.testing.expectEqual(@as(usize, 0), receiver.ordered.total_bytes);
 }
 
@@ -684,14 +684,14 @@ fn checkOrderedReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
         if (err != error.OutOfMemory) return err;
         try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
         try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
-        try std.testing.expectEqual(@as(usize, 0), receiver.ordered.packets.count());
+        try std.testing.expectEqual(@as(usize, 0), receiver.ordered.count());
         try std.testing.expectEqual(@as(usize, 0), receiver.ordered.total_bytes);
         return err;
     };
 
     try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
-    try std.testing.expectEqual(@as(usize, 1), receiver.ordered.packets.count());
+    try std.testing.expectEqual(@as(usize, 1), receiver.ordered.count());
     try std.testing.expectEqual(@as(usize, 8), receiver.ordered.total_bytes);
 }
 
@@ -737,7 +737,7 @@ fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
         if (err != error.OutOfMemory) return err;
         try std.testing.expectEqual(@as(u32, 0), receiver.datagrams.expected);
         try std.testing.expectEqual(@as(u32, 0), receiver.reliable.expected);
-        try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
+        try std.testing.expectEqual(@as(usize, 0), receiver.splits.count());
         try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
         return err;
     };
@@ -756,7 +756,7 @@ fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
         try std.testing.expectEqual(@as(usize, 0), counter.count);
         try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
         try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
-        try std.testing.expectEqual(@as(usize, 1), receiver.splits.assemblies.count());
+        try std.testing.expectEqual(@as(usize, 1), receiver.splits.count());
         try std.testing.expect(receiver.splits.total_bytes == 6 or receiver.splits.total_bytes == 11);
         return err;
     };
@@ -764,7 +764,7 @@ fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), counter.count);
     try std.testing.expectEqual(@as(u32, 2), receiver.datagrams.expected);
     try std.testing.expectEqual(@as(u32, 2), receiver.reliable.expected);
-    try std.testing.expectEqual(@as(usize, 0), receiver.splits.assemblies.count());
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.count());
     try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
 }
 

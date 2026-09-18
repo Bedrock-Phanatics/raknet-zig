@@ -1,16 +1,41 @@
 const std = @import("std");
-const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 const OwnedPayload = @import("../payload.zig").OwnedPayload;
 const time = @import("../util/time.zig");
 
-const Fragment = struct { data: ?[]u8 = null };
-const Assembly = struct {
-    count: u32,
-    fragments: []Fragment,
-    received: usize = 0,
-    bytes: usize = 0,
-    updated_ms: u64,
+const none = std.math.maxInt(u32);
+const class_sizes = [_]usize{ 64, 256, 576, 1200 };
+
+const Fragment = struct {
+    data: ?[]u8 = null,
+    storage: []u8 = &.{},
 };
+
+const Assembly = struct {
+    active: bool = false,
+    id: u16 = 0,
+    count: u32 = 0,
+    received: u32 = 0,
+    bytes: usize = 0,
+    deadline_ms: u64 = 0,
+    heap_index: u32 = none,
+};
+
+pub const ScatterPayload = struct {
+    owner: *const Reassembler,
+    slot: usize,
+    fragment_count: usize,
+    total_bytes: usize,
+
+    pub fn count(self: ScatterPayload) usize {
+        return self.fragment_count;
+    }
+
+    pub fn get(self: ScatterPayload, index: usize) []const u8 {
+        return self.owner.fragmentSlice(self.slot)[index].data.?;
+    }
+};
+
+pub const ScatterFn = *const fn (*anyopaque, ScatterPayload) error{ApplicationFailure}!void;
 
 pub const Limits = struct {
     maximum_parts: usize,
@@ -20,175 +45,287 @@ pub const Limits = struct {
     timeout_ms: u32,
 
     pub fn validate(self: Limits) !void {
-        if (self.maximum_parts < 2 or self.maximum_bytes == 0 or self.maximum_concurrent == 0 or
-            self.maximum_total_bytes < self.maximum_bytes or self.timeout_ms == 0) return error.InvalidConfiguration;
+        if (self.maximum_parts < 2 or self.maximum_parts > std.math.maxInt(u32) or self.maximum_bytes == 0 or self.maximum_concurrent == 0 or
+            self.maximum_concurrent > std.math.maxInt(u32) or self.maximum_total_bytes < self.maximum_bytes or self.timeout_ms == 0) return error.InvalidConfiguration;
+        if (self.maximum_parts > std.math.maxInt(usize) / self.maximum_concurrent) return error.InvalidConfiguration;
     }
 };
 
 pub const ExpiryBatch = struct { expired: usize, inspected: usize };
 
-/// Reassembles fragments with bounded count, payload bytes, concurrency, metadata, and lifetime.
+/// Bounded split state with reusable metadata and scheduled expiry.
 pub const Reassembler = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
-    assemblies: std.AutoHashMapUnmanaged(u16, Assembly) = .empty,
+    assemblies: []Assembly,
+    fragment_blocks: [][]Fragment,
+    heap: []u32,
+    assembly_count: usize = 0,
+    heap_len: usize = 0,
     total_bytes: usize = 0,
-    next_deadline_ms: ?u64 = null,
-    scan_index: u32 = 0,
-    deadline_rebuild_remaining: usize = 0,
-    deadline_rebuild_min: ?u64 = null,
+    retained_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Reassembler {
         try limits.validate();
-        const self: Reassembler = .{ .allocator = allocator, .limits = limits };
-        return self;
+        const assemblies = try allocator.alloc(Assembly, limits.maximum_concurrent);
+        @memset(assemblies, .{});
+        errdefer allocator.free(assemblies);
+        const fragment_blocks = try allocator.alloc([]Fragment, limits.maximum_concurrent);
+        @memset(fragment_blocks, &.{});
+        errdefer allocator.free(fragment_blocks);
+        const heap = try allocator.alloc(u32, limits.maximum_concurrent);
+        errdefer allocator.free(heap);
+        return .{ .allocator = allocator, .limits = limits, .assemblies = assemblies, .fragment_blocks = fragment_blocks, .heap = heap };
     }
 
     pub fn deinit(self: *Reassembler) void {
-        var iterator = self.assemblies.valueIterator();
-        while (iterator.next()) |assembly| self.freeAssembly(assembly);
-        self.assemblies.deinit(self.allocator);
+        for (0..self.assemblies.len) |slot| if (self.assemblies[slot].active) self.freeFragments(slot);
+        for (self.fragment_blocks) |block| {
+            for (block) |fragment| if (fragment.storage.len != 0) self.allocator.free(fragment.storage);
+            if (block.len != 0) self.allocator.free(block);
+        }
+        self.allocator.free(self.heap);
+        self.allocator.free(self.fragment_blocks);
+        self.allocator.free(self.assemblies);
         self.* = undefined;
     }
 
-    /// Returns a newly allocated complete payload. The caller owns it.
-    pub fn push(self: *Reassembler, id: u16, count: u32, index: u32, payload: []const u8, now_ms: u64) !?OwnedPayload {
-        if (count < 2 or count > self.limits.maximum_parts or index >= count) return error.InvalidSplit;
-        if (payload.len == 0 or payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
-
-        var entry = self.assemblies.getPtr(id);
-        var created = false;
-        if (entry == null) {
-            if (self.assemblies.count() >= self.limits.maximum_concurrent) return error.TooManyAssemblies;
-            const fragments = try self.allocator.alloc(Fragment, count);
-            @memset(fragments, .{});
-            errdefer self.allocator.free(fragments);
-            try self.assemblies.put(self.allocator, id, .{ .count = count, .fragments = fragments, .updated_ms = now_ms });
-            created = true;
-            entry = self.assemblies.getPtr(id).?;
-        }
-        errdefer if (created) self.remove(id);
-
-        const assembly = entry.?;
-        if (assembly.count != count) {
-            self.remove(id);
-            return error.SplitIdCollision;
-        }
-        const slot = &assembly.fragments[index];
-        if (slot.data) |existing| {
-            if (std.mem.eql(u8, existing, payload)) {
-                assembly.updated_ms = now_ms;
-                self.recomputeNextDeadline();
-                if (assembly.received == assembly.fragments.len) return try self.finish(id, assembly);
-                return null;
-            }
-            self.remove(id);
-            return error.ConflictingFragment;
-        }
-        if (payload.len > self.limits.maximum_bytes -| assembly.bytes or
-            payload.len > self.limits.maximum_total_bytes -| self.total_bytes)
-        {
-            self.remove(id);
-            return error.ReassemblyLimitExceeded;
-        }
-        const copy = try BorrowedPayload.init(payload).toOwned(self.allocator);
-        slot.data = copy.bytes;
-        assembly.received += 1;
-        assembly.bytes += copy.bytes.len;
-        self.total_bytes += copy.bytes.len;
-        assembly.updated_ms = now_ms;
-        if (assembly.received != assembly.fragments.len) {
-            self.recomputeNextDeadline();
-            return null;
-        }
-        return try self.finish(id, assembly);
+    pub fn count(self: Reassembler) usize {
+        return self.assembly_count;
     }
 
-    fn finish(self: *Reassembler, id: u16, assembly: *Assembly) !OwnedPayload {
+    pub fn retainedCapacity(self: Reassembler) usize {
+        return self.retained_bytes;
+    }
+
+    /// Returns one contiguous owned payload for normal consumers.
+    pub fn push(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?OwnedPayload {
+        const slot = try self.retain(id, count_value, index, payload, now_ms);
+        if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return null;
+        return try self.finish(slot.?);
+    }
+
+    /// Calls consume with borrowed fragments and skips the final contiguous copy.
+    pub fn pushScatter(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64, context: *anyopaque, consume: ScatterFn) !bool {
+        const slot = try self.retain(id, count_value, index, payload, now_ms);
+        if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return false;
+        const assembly = self.assemblies[slot.?];
+        try consume(context, .{ .owner = self, .slot = slot.?, .fragment_count = assembly.count, .total_bytes = assembly.bytes });
+        self.remove(slot.?);
+        return true;
+    }
+
+    fn retain(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?usize {
+        if (count_value < 2 or count_value > self.limits.maximum_parts or index >= count_value) return error.InvalidSplit;
+        if (payload.len == 0 or payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
+
+        var slot = self.find(id);
+        var created = false;
+        if (slot == null) {
+            if (self.assembly_count == self.assemblies.len) return error.TooManyAssemblies;
+            slot = self.freeSlot() orelse return error.InternalInvariant;
+            try self.ensureFragmentBlock(slot.?, count_value);
+            const deadline_ms = time.deadline(now_ms, self.limits.timeout_ms);
+            self.assemblies[slot.?] = .{ .active = true, .id = id, .count = count_value, .deadline_ms = deadline_ms };
+            self.assembly_count += 1;
+            self.heapInsert(slot.?);
+            created = true;
+        }
+        errdefer if (created) self.remove(slot.?);
+
+        const assembly = &self.assemblies[slot.?];
+        if (assembly.count != count_value) {
+            self.remove(slot.?);
+            return error.SplitIdCollision;
+        }
+        const fragment = &self.fragmentSlice(slot.?)[index];
+        if (fragment.data) |existing| {
+            if (!std.mem.eql(u8, existing, payload)) {
+                self.remove(slot.?);
+                return error.ConflictingFragment;
+            }
+            self.updateDeadline(slot.?, now_ms);
+            return slot;
+        }
+        if (payload.len > self.limits.maximum_bytes -| assembly.bytes or payload.len > self.limits.maximum_total_bytes -| self.total_bytes) {
+            self.remove(slot.?);
+            return error.ReassemblyLimitExceeded;
+        }
+        try self.ensureFragmentStorage(fragment, payload.len);
+        @memcpy(fragment.storage[0..payload.len], payload);
+        fragment.data = fragment.storage[0..payload.len];
+        assembly.received += 1;
+        assembly.bytes += payload.len;
+        self.total_bytes += payload.len;
+        self.updateDeadline(slot.?, now_ms);
+        return slot;
+    }
+
+    fn finish(self: *Reassembler, slot: usize) !OwnedPayload {
+        const assembly = self.assemblies[slot];
         const output = try self.allocator.alloc(u8, assembly.bytes);
         errdefer self.allocator.free(output);
         var offset: usize = 0;
-        for (assembly.fragments) |fragment| {
+        for (self.fragmentSlice(slot)[0..assembly.count]) |fragment| {
             const bytes = fragment.data orelse return error.InternalInvariant;
             @memcpy(output[offset..][0..bytes.len], bytes);
             offset += bytes.len;
         }
-        self.remove(id);
+        self.remove(slot);
         return .{ .allocator = self.allocator, .bytes = output };
     }
 
     pub fn expire(self: *Reassembler, now_ms: u64, maximum_work: usize) ExpiryBatch {
-        if (self.deadline_rebuild_remaining == 0) {
-            self.deadline_rebuild_remaining = self.assemblies.count();
-            self.deadline_rebuild_min = null;
-        }
         var expired: usize = 0;
-        var inspected: usize = 0;
-        const visit_limit = @min(maximum_work, self.deadline_rebuild_remaining);
-        const capacity = self.assemblies.capacity();
-        const start_index = if (self.scan_index < capacity) self.scan_index else 0;
-        var iterator = self.assemblies.iterator();
-        iterator.index = start_index;
-        var wrapped = false;
-        while (inspected < visit_limit) {
-            const entry = iterator.next() orelse {
-                if (wrapped or start_index == 0) break;
-                iterator = self.assemblies.iterator();
-                wrapped = true;
-                continue;
-            };
-            self.scan_index = if (iterator.index == capacity) 0 else iterator.index;
-            inspected += 1;
-            const deadline_ms = time.deadline(entry.value_ptr.updated_ms, self.limits.timeout_ms);
-            if (!time.reached(now_ms, deadline_ms)) {
-                self.includeRebuiltDeadline(deadline_ms);
-                continue;
-            }
-            self.freeAssembly(entry.value_ptr);
-            _ = self.assemblies.remove(entry.key_ptr.*);
+        while (expired < maximum_work and self.heap_len != 0) {
+            const slot = self.heap[0];
+            if (!time.reached(now_ms, self.assemblies[slot].deadline_ms)) break;
+            self.remove(slot);
             expired += 1;
         }
-        self.deadline_rebuild_remaining -= inspected;
-        if (self.deadline_rebuild_remaining == 0) self.next_deadline_ms = self.deadline_rebuild_min;
-        return .{ .expired = expired, .inspected = inspected };
+        return .{ .expired = expired, .inspected = expired };
     }
 
     pub fn nextDeadline(self: Reassembler) ?u64 {
-        return self.next_deadline_ms;
+        return if (self.heap_len == 0) null else self.assemblies[self.heap[0]].deadline_ms;
     }
 
-    fn remove(self: *Reassembler, id: u16) void {
-        const removed = self.assemblies.fetchRemove(id) orelse return;
-        var assembly = removed.value;
-        self.freeAssembly(&assembly);
-        self.recomputeNextDeadline();
+    fn find(self: Reassembler, id: u16) ?usize {
+        for (self.assemblies, 0..) |assembly, slot| if (assembly.active and assembly.id == id) return slot;
+        return null;
     }
 
-    fn recomputeNextDeadline(self: *Reassembler) void {
-        self.deadline_rebuild_remaining = 0;
-        self.deadline_rebuild_min = null;
-        self.next_deadline_ms = null;
-        var iterator = self.assemblies.valueIterator();
-        while (iterator.next()) |assembly| {
-            const deadline = time.deadline(assembly.updated_ms, self.limits.timeout_ms);
-            self.next_deadline_ms = if (self.next_deadline_ms) |current| @min(current, deadline) else deadline;
+    fn freeSlot(self: Reassembler) ?usize {
+        for (self.assemblies, 0..) |assembly, slot| if (!assembly.active) return slot;
+        return null;
+    }
+
+    fn fragmentSlice(self: Reassembler, slot: usize) []Fragment {
+        return self.fragment_blocks[slot];
+    }
+
+    fn ensureFragmentBlock(self: *Reassembler, slot: usize, count_value: u32) !void {
+        const needed: usize = count_value;
+        if (self.fragment_blocks[slot].len >= needed) return;
+        const capacity = @min(self.limits.maximum_parts, std.math.ceilPowerOfTwo(usize, needed) catch self.limits.maximum_parts);
+        const replacement = try self.allocator.alloc(Fragment, capacity);
+        @memset(replacement, .{});
+        if (self.fragment_blocks[slot].len != 0) {
+            for (self.fragment_blocks[slot]) |fragment| {
+                if (fragment.storage.len != 0) {
+                    self.retained_bytes -= fragment.storage.len;
+                    self.allocator.free(fragment.storage);
+                }
+            }
+            self.allocator.free(self.fragment_blocks[slot]);
+        }
+        self.fragment_blocks[slot] = replacement;
+    }
+
+    fn ensureFragmentStorage(self: *Reassembler, fragment: *Fragment, len: usize) !void {
+        const capacity = storageCapacity(len);
+        if (fragment.storage.len == capacity) return;
+        const replacement = try self.allocator.alloc(u8, capacity);
+        if (fragment.storage.len != 0) {
+            self.retained_bytes -= fragment.storage.len;
+            self.allocator.free(fragment.storage);
+        }
+        fragment.storage = replacement;
+        self.retained_bytes += replacement.len;
+    }
+
+    fn updateDeadline(self: *Reassembler, slot: usize, now_ms: u64) void {
+        self.assemblies[slot].deadline_ms = time.deadline(now_ms, self.limits.timeout_ms);
+        const position = self.assemblies[slot].heap_index;
+        self.siftDown(position);
+        self.siftUp(self.assemblies[slot].heap_index);
+    }
+
+    fn remove(self: *Reassembler, slot: usize) void {
+        if (!self.assemblies[slot].active) return;
+        self.heapRemove(self.assemblies[slot].heap_index);
+        self.freeFragments(slot);
+        self.assemblies[slot] = .{};
+        self.assembly_count -= 1;
+    }
+
+    fn freeFragments(self: *Reassembler, slot: usize) void {
+        const bytes = self.assemblies[slot].bytes;
+        for (self.fragmentSlice(slot)[0..self.assemblies[slot].count]) |*fragment| {
+            fragment.data = null;
+            if (fragment.storage.len > class_sizes[class_sizes.len - 1]) {
+                self.retained_bytes -= fragment.storage.len;
+                self.allocator.free(fragment.storage);
+                fragment.storage = &.{};
+            }
+        }
+        self.total_bytes -= bytes;
+    }
+
+    fn heapInsert(self: *Reassembler, slot: usize) void {
+        const position = self.heap_len;
+        self.heap[position] = @intCast(slot);
+        self.heap_len += 1;
+        self.assemblies[slot].heap_index = @intCast(position);
+        self.siftUp(position);
+    }
+
+    fn heapRemove(self: *Reassembler, raw_position: u32) void {
+        const position: usize = raw_position;
+        self.heap_len -= 1;
+        if (position == self.heap_len) return;
+        const moved = self.heap[self.heap_len];
+        self.heap[position] = moved;
+        self.assemblies[moved].heap_index = @intCast(position);
+        self.siftDown(position);
+        self.siftUp(self.assemblies[moved].heap_index);
+    }
+
+    fn less(self: Reassembler, left: usize, right: usize) bool {
+        const lhs = self.assemblies[self.heap[left]];
+        const rhs = self.assemblies[self.heap[right]];
+        return lhs.deadline_ms < rhs.deadline_ms or (lhs.deadline_ms == rhs.deadline_ms and lhs.id < rhs.id);
+    }
+
+    fn swapHeap(self: *Reassembler, left: usize, right: usize) void {
+        const temporary = self.heap[left];
+        self.heap[left] = self.heap[right];
+        self.heap[right] = temporary;
+        self.assemblies[self.heap[left]].heap_index = @intCast(left);
+        self.assemblies[self.heap[right]].heap_index = @intCast(right);
+    }
+
+    fn siftUp(self: *Reassembler, raw_position: u32) void {
+        var position: usize = raw_position;
+        while (position != 0) {
+            const parent = (position - 1) / 2;
+            if (!self.less(position, parent)) break;
+            self.swapHeap(position, parent);
+            position = parent;
         }
     }
 
-    fn includeRebuiltDeadline(self: *Reassembler, deadline_ms: u64) void {
-        self.deadline_rebuild_min = if (self.deadline_rebuild_min) |current| @min(current, deadline_ms) else deadline_ms;
-    }
-
-    fn freeAssembly(self: *Reassembler, assembly: *Assembly) void {
-        for (assembly.fragments) |fragment| if (fragment.data) |data| self.allocator.free(data);
-        self.total_bytes -= assembly.bytes;
-        self.allocator.free(assembly.fragments);
+    fn siftDown(self: *Reassembler, raw_position: u32) void {
+        var position: usize = raw_position;
+        while (true) {
+            const left = position * 2 + 1;
+            if (left >= self.heap_len) break;
+            const right = left + 1;
+            const child = if (right < self.heap_len and self.less(right, left)) right else left;
+            if (!self.less(child, position)) break;
+            self.swapHeap(position, child);
+            position = child;
+        }
     }
 };
 
-test "split assembly handles duplicates, conflicts, collision, and expiry" {
-    const limits: Limits = .{ .maximum_parts = 4, .maximum_bytes = 16, .maximum_concurrent = 2, .maximum_total_bytes = 24, .timeout_ms = 10 };
-    var value = try Reassembler.init(std.testing.allocator, limits);
+fn storageCapacity(len: usize) usize {
+    for (class_sizes) |size| if (len <= size) return size;
+    return len;
+}
+
+test "split assembly handles duplicates conflicts collisions and expiry" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 16, .maximum_concurrent = 2, .maximum_total_bytes = 24, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expect((try value.push(1, 2, 1, "world", 0)) == null);
     try std.testing.expect((try value.push(1, 2, 1, "world", 1)) == null);
@@ -205,28 +342,65 @@ test "split assembly handles duplicates, conflicts, collision, and expiry" {
     try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
 }
 
-test "small fragments detach from large receive buffers" {
-    const limits: Limits = .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .timeout_ms = 10 };
-    var value = try Reassembler.init(std.testing.allocator, limits);
+test "scatter completion avoids a final allocation" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .timeout_ms = 10 });
     defer value.deinit();
+    try std.testing.expect((try value.push(7, 2, 0, "tiny", 0)) == null);
+    const Consumer = struct {
+        value: [8]u8 = undefined,
+        length: usize = 0,
+        fn consume(raw: *anyopaque, payload: ScatterPayload) error{ApplicationFailure}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (0..payload.count()) |index| {
+                const bytes = payload.get(index);
+                @memcpy(self.value[self.length..][0..bytes.len], bytes);
+                self.length += bytes.len;
+            }
+        }
+    };
+    var consumer: Consumer = .{};
+    try std.testing.expect(try value.pushScatter(7, 2, 1, "!", 1, &consumer, Consumer.consume));
+    try std.testing.expectEqualStrings("tiny!", consumer.value[0..consumer.length]);
+    try std.testing.expectEqual(@as(usize, 0), value.count());
+}
 
+test "small fragments detach from large receive buffers" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .timeout_ms = 10 });
+    defer value.deinit();
     var source: [4096]u8 = @splat(0);
     @memcpy(source[100..104], "tiny");
     try std.testing.expect((try value.push(7, 2, 0, source[100..104], 0)) == null);
-
-    const retained = value.assemblies.getPtr(7).?.fragments[0].data.?;
-    const retained_start = @intFromPtr(retained.ptr);
-    const source_start = @intFromPtr(&source);
-    try std.testing.expectEqual(@as(usize, 4), retained.len);
-    try std.testing.expect(retained_start + retained.len <= source_start or retained_start >= source_start + source.len);
-
     @memset(&source, 0xaa);
     const complete = (try value.push(7, 2, 1, "!", 1)).?;
     defer complete.deinit();
     try std.testing.expectEqualStrings("tiny!", complete.bytes);
 }
 
-test "split limits reject before allocation" {
+test "fragment classes are reused and oversized storage is evicted" {
+    const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
+    const Consumer = struct {
+        fn consume(_: *anyopaque, _: ScatterPayload) error{ApplicationFailure}!void {}
+    };
+    var quota = QuotaAllocator.init(std.testing.allocator, std.math.maxInt(usize));
+    var value = try Reassembler.init(quota.allocator(), .{ .maximum_parts = 2, .maximum_bytes = 4096, .maximum_concurrent = 1, .maximum_total_bytes = 4096, .timeout_ms = 10 });
+    defer value.deinit();
+    var unused: u8 = 0;
+    try std.testing.expect((try value.push(1, 2, 0, "a", 0)) == null);
+    try std.testing.expect(try value.pushScatter(1, 2, 1, "b", 1, &unused, Consumer.consume));
+    const retained = quota.used_bytes;
+    quota.maximum_bytes = retained;
+    try std.testing.expect((try value.push(2, 2, 0, "c", 2)) == null);
+    try std.testing.expect(try value.pushScatter(2, 2, 1, "d", 3, &unused, Consumer.consume));
+    try std.testing.expectEqual(retained, quota.used_bytes);
+
+    quota.maximum_bytes = std.math.maxInt(usize);
+    var large: [1300]u8 = @splat(1);
+    try std.testing.expect((try value.push(3, 2, 0, &large, 4)) == null);
+    try std.testing.expect(try value.pushScatter(3, 2, 1, &large, 5, &unused, Consumer.consume));
+    try std.testing.expectEqual(@as(usize, 128), value.retainedCapacity());
+}
+
+test "split limits reject before payload allocation" {
     var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 8, .maximum_concurrent = 1, .maximum_total_bytes = 8, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expectError(error.InvalidSplit, value.push(1, 1, 0, "x", 0));
@@ -235,87 +409,44 @@ test "split limits reject before allocation" {
     try std.testing.expectError(error.TooManyAssemblies, value.push(2, 2, 0, "x", 0));
     try std.testing.expectError(error.ReassemblyLimitExceeded, value.push(1, 2, 1, "x", 0));
 }
-test "new assembly allocation failure leaves no retained state" {
-    const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
-    var quota = QuotaAllocator.init(std.testing.allocator, 0);
-    var value = try Reassembler.init(quota.allocator(), .{
-        .maximum_parts = 4,
-        .maximum_bytes = 16,
-        .maximum_concurrent = 2,
-        .maximum_total_bytes = 32,
-        .timeout_ms = 10,
-    });
+
+test "advertised split size does not reserve final payload" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2048, .maximum_bytes = 4 * 1024 * 1024, .maximum_concurrent = 1, .maximum_total_bytes = 4 * 1024 * 1024, .timeout_ms = 10 });
     defer value.deinit();
-
-    try std.testing.expectError(error.OutOfMemory, value.push(1, 2, 0, "first", 0));
-    try std.testing.expectEqual(@as(usize, 0), value.assemblies.count());
-    try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
-    try std.testing.expectEqual(@as(usize, 0), quota.used_bytes);
-
-    quota.maximum_bytes = std.math.maxInt(usize);
-    try std.testing.expect((try value.push(1, 2, 0, "first", 1)) == null);
-    try std.testing.expectEqual(@as(usize, 1), value.assemblies.count());
-    try std.testing.expectEqual(@as(usize, 5), value.total_bytes);
+    try std.testing.expect((try value.push(1, 2048, 0, "x", 0)) == null);
+    try std.testing.expectEqual(@as(usize, 1), value.total_bytes);
+    try std.testing.expectEqual(@as(usize, 64), value.retainedCapacity());
 }
-fn checkReassemblyAllocationFailures(allocator: std.mem.Allocator) !void {
-    var value = try Reassembler.init(allocator, .{
-        .maximum_parts = 4,
-        .maximum_bytes = 32,
-        .maximum_concurrent = 2,
-        .maximum_total_bytes = 64,
-        .timeout_ms = 10,
-    });
-    defer value.deinit();
 
+fn checkReassemblyAllocationFailures(allocator: std.mem.Allocator) !void {
+    var value = try Reassembler.init(allocator, .{ .maximum_parts = 4, .maximum_bytes = 32, .maximum_concurrent = 2, .maximum_total_bytes = 64, .timeout_ms = 10 });
+    defer value.deinit();
     try std.testing.expect((try value.push(1, 2, 0, "hello ", 0)) == null);
     const complete = (try value.push(1, 2, 1, "world", 1)).?;
     defer complete.deinit();
     try std.testing.expectEqualStrings("hello world", complete.bytes);
-    try std.testing.expectEqual(@as(usize, 0), value.assemblies.count());
-    try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), value.count());
 }
 
 test "split reassembly handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReassemblyAllocationFailures, .{});
 }
 
-test "bounded split expiry resumes fairly" {
+test "expiry inspects only due assemblies" {
     const count = 8;
-    var value = try Reassembler.init(std.testing.allocator, .{
-        .maximum_parts = 2,
-        .maximum_bytes = count,
-        .maximum_concurrent = count,
-        .maximum_total_bytes = count,
-        .timeout_ms = 10,
-    });
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = count, .maximum_concurrent = count, .maximum_total_bytes = count, .timeout_ms = 10 });
     defer value.deinit();
-    for (0..count) |id| try std.testing.expect((try value.push(@intCast(id), 2, 0, "x", 100)) == null);
-
-    var iterator = value.assemblies.iterator();
-    var last: ?u16 = null;
-    while (iterator.next()) |entry| last = entry.key_ptr.*;
-    value.assemblies.getPtr(last.?).?.updated_ms = 0;
-    value.recomputeNextDeadline();
-
-    var expired: usize = 0;
-    for (0..count) |_| {
-        const batch = value.expire(11, 1);
-        try std.testing.expect(batch.inspected <= 1);
-        expired += batch.expired;
-    }
-    try std.testing.expectEqual(@as(usize, 1), expired);
-    try std.testing.expectEqual(@as(usize, count - 1), value.assemblies.count());
+    try std.testing.expect((try value.push(1, 2, 0, "x", 0)) == null);
+    for (2..count + 1) |id| try std.testing.expect((try value.push(@intCast(id), 2, 0, "x", 100)) == null);
+    const batch = value.expire(11, 1);
+    try std.testing.expectEqual(@as(usize, 1), batch.inspected);
+    try std.testing.expectEqual(@as(usize, 1), batch.expired);
+    try std.testing.expectEqual(@as(usize, count - 1), value.count());
     try std.testing.expectEqual(@as(?u64, 110), value.nextDeadline());
 }
 
 test "split expiry honors a saturated deadline" {
-    var value = try Reassembler.init(std.testing.allocator, .{
-        .maximum_parts = 2,
-        .maximum_bytes = 1,
-        .maximum_concurrent = 1,
-        .maximum_total_bytes = 1,
-        .timeout_ms = 10,
-    });
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 1, .maximum_concurrent = 1, .maximum_total_bytes = 1, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expect((try value.push(1, 2, 0, "x", std.math.maxInt(u64) - 5)) == null);
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), value.nextDeadline());

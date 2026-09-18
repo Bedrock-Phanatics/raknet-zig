@@ -6,6 +6,7 @@ const cursor = raknet.protocol.cursor;
 const datagram = raknet.protocol.datagram;
 const receive_window = raknet.reliability.receive_window;
 const recovery = raknet.reliability.recovery;
+const ordered_store = raknet.reliability.ordered_store;
 const deadline_queue = raknet.session.deadline_queue;
 
 pub fn main(init: std.process.Init) !void {
@@ -152,6 +153,13 @@ pub fn main(init: std.process.Init) !void {
     const recovery_slabs = try benchmarkRecoveryStorage(io, recovery_iterations, .mtu_slabs);
     checksum +%= recovery_classes.checksum +% recovery_slabs.checksum;
     const recovery_messages = recovery_iterations * 256;
+    const ordered_iterations: usize = 2_000;
+    const ordered_ring = try benchmarkOrderedRing(io, ordered_iterations);
+    const ordered_hash = try benchmarkOrderedHash(io, ordered_iterations);
+    const retention_exact = try benchmarkRetention(io, ordered_iterations, false);
+    const retention_classes = try benchmarkRetention(io, ordered_iterations, true);
+    checksum +%= ordered_ring.checksum +% ordered_hash.checksum +% retention_exact.checksum +% retention_classes.checksum;
+    const ordered_messages = ordered_iterations * 256;
 
     std.debug.print(
         "ack_decode: {d:.2} ns/op\nframe_decode: {d:.2} ns/op\nwindow_add: {d:.2} ns/op\n" ++
@@ -169,6 +177,10 @@ pub fn main(init: std.process.Init) !void {
             "bedrock_send_packed: {d:.2} ns/message, {d:.2} bytes/message, {d} datagrams\n" ++
             "recovery_size_classes: {d:.2} ns/message, {d} retained bytes\n" ++
             "recovery_mtu_slabs: {d:.2} ns/message, {d} retained bytes\n" ++
+            "ordered_circular: {d:.2} ns/message, {d} metadata bytes\n" ++
+            "ordered_hash: {d:.2} ns/message, {d} metadata bytes\n" ++
+            "retention_exact: {d:.2} ns/message, {d} retained bytes\n" ++
+            "retention_size_classes: {d:.2} ns/message, {d} retained bytes\n" ++
             "checksum: {d}\n",
         .{
             @as(f64, @floatFromInt(ack_ns)) / @as(f64, @floatFromInt(iterations)),
@@ -194,6 +206,14 @@ pub fn main(init: std.process.Init) !void {
             recovery_classes.retained_bytes,
             @as(f64, @floatFromInt(recovery_slabs.nanoseconds)) / @as(f64, @floatFromInt(recovery_messages)),
             recovery_slabs.retained_bytes,
+            @as(f64, @floatFromInt(ordered_ring.nanoseconds)) / @as(f64, @floatFromInt(ordered_messages)),
+            ordered_ring.retained_bytes,
+            @as(f64, @floatFromInt(ordered_hash.nanoseconds)) / @as(f64, @floatFromInt(ordered_messages)),
+            ordered_hash.retained_bytes,
+            @as(f64, @floatFromInt(retention_exact.nanoseconds)) / @as(f64, @floatFromInt(ordered_messages)),
+            retention_exact.retained_bytes,
+            @as(f64, @floatFromInt(retention_classes.nanoseconds)) / @as(f64, @floatFromInt(ordered_messages)),
+            retention_classes.retained_bytes,
             checksum,
         },
     );
@@ -202,6 +222,7 @@ pub fn main(init: std.process.Init) !void {
 const DueMeasurement = struct { nanoseconds: u64, checksum: usize };
 const PackingMeasurement = struct { nanoseconds: u64, wire_bytes: usize, datagrams: usize, checksum: usize };
 const RecoveryMeasurement = struct { nanoseconds: u64, retained_bytes: usize, checksum: usize };
+const StorageMeasurement = struct { nanoseconds: u64, retained_bytes: usize, checksum: usize };
 const bedrock_payload_sizes = [_]usize{ 5, 7, 9, 12, 16, 20, 24, 32, 40, 52, 68, 96, 140, 220, 360, 700 };
 
 fn benchmarkFramePacking(io: std.Io, iterations: usize, pack: bool) !PackingMeasurement {
@@ -283,6 +304,85 @@ fn benchmarkRecoveryStorage(io: std.Io, iterations: usize, policy: recovery.Stor
     }
     const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     return .{ .nanoseconds = nanoseconds, .retained_bytes = state.retainedCapacity(), .checksum = checksum };
+}
+
+fn benchmarkOrderedRing(io: std.Io, iterations: usize) !StorageMeasurement {
+    const capacity = 256;
+    var store = try ordered_store.Store.init(std.heap.page_allocator, 1, capacity, capacity * 32, 512);
+    defer store.deinit();
+    var checksum: usize = 0;
+    var expected: u32 = 0;
+    const start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |_| {
+        for (1..capacity + 1) |offset| std.debug.assert(try store.push(0, expected + @as(u32, @intCast(offset)), "bedrock"));
+        try store.advanceBorrowed(0, expected);
+        for (0..capacity) |_| {
+            const payload = (try store.pop(0)).?;
+            checksum +%= payload.bytes[0] + payload.bytes.len;
+            payload.deinit();
+        }
+        expected = (expected + capacity + 1) & 0xffffff;
+    }
+    const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    return .{ .nanoseconds = nanoseconds, .retained_bytes = store.metadataCapacity(), .checksum = checksum };
+}
+
+fn benchmarkOrderedHash(io: std.Io, iterations: usize) !StorageMeasurement {
+    const capacity = 256;
+    var packets: std.AutoHashMapUnmanaged(u32, []u8) = .empty;
+    defer packets.deinit(std.heap.page_allocator);
+    try packets.ensureTotalCapacity(std.heap.page_allocator, capacity);
+    var checksum: usize = 0;
+    var expected: u32 = 0;
+    const start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |_| {
+        for (1..capacity + 1) |offset| {
+            const copy = try std.heap.page_allocator.dupe(u8, "bedrock");
+            try packets.put(std.heap.page_allocator, (expected + @as(u32, @intCast(offset))) & 0xffffff, copy);
+        }
+        expected = (expected + 1) & 0xffffff;
+        for (0..capacity) |_| {
+            const removed = packets.fetchRemove(expected).?;
+            checksum +%= removed.value[0] + removed.value.len;
+            std.heap.page_allocator.free(removed.value);
+            expected = (expected + 1) & 0xffffff;
+        }
+    }
+    const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    return .{ .nanoseconds = nanoseconds, .retained_bytes = packets.capacity() * (@sizeOf(u32) + @sizeOf([]u8)), .checksum = checksum };
+}
+
+fn benchmarkRetention(io: std.Io, iterations: usize, pooled: bool) !StorageMeasurement {
+    const capacity = 256;
+    var blocks: [capacity][]u8 = undefined;
+    var retained_bytes: usize = 0;
+    if (pooled) {
+        for (&blocks, 0..) |*block, index| {
+            const size = retentionClass(bedrock_payload_sizes[index & (bedrock_payload_sizes.len - 1)]);
+            block.* = try std.heap.page_allocator.alloc(u8, size);
+            retained_bytes += size;
+        }
+    }
+    defer if (pooled) for (blocks) |block| std.heap.page_allocator.free(block);
+    var checksum: usize = 0;
+    const start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |iteration| {
+        for (&blocks, 0..) |*block, index| {
+            const size = bedrock_payload_sizes[index & (bedrock_payload_sizes.len - 1)];
+            if (!pooled) block.* = try std.heap.page_allocator.alloc(u8, size);
+            block.*[0] = @truncate(iteration +% index);
+            checksum +%= block.*[0] + size;
+        }
+        if (!pooled) for (blocks) |block| std.heap.page_allocator.free(block);
+    }
+    const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    return .{ .nanoseconds = nanoseconds, .retained_bytes = retained_bytes, .checksum = checksum };
+}
+
+fn retentionClass(size: usize) usize {
+    const classes = [_]usize{ 64, 256, 576, 1200, 1492 };
+    for (classes) |class| if (size <= class) return class;
+    return size;
 }
 
 fn benchmarkDueBatch(io: std.Io, capacity: usize, due_per_turn: usize, turns: usize) !DueMeasurement {
