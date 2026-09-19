@@ -110,11 +110,11 @@ pub const Client = struct {
             .ip4 => .{ .ip4 = .unspecified(0) },
             .ip6 => .{ .ip6 = .unspecified(0) },
         };
-        var socket = try backend.Socket.bindWithBuffers(io, local, options.config.maximum_datagram_size, options.socket_buffers);
+        var socket = try backend.Socket.bindWithBuffers(io, local, options.config.protocol.maximum_datagram_size, options.socket_buffers);
         errdefer socket.close();
-        const scratch = try allocator.alloc(u8, options.config.maximum_datagram_size);
+        const scratch = try allocator.alloc(u8, options.config.protocol.maximum_datagram_size);
         errdefer allocator.free(scratch);
-        const receive_buffer = try allocator.alloc(u8, options.config.maximum_datagram_size);
+        const receive_buffer = try allocator.alloc(u8, options.config.protocol.maximum_datagram_size);
         errdefer allocator.free(receive_buffer);
         var random: [8]u8 = undefined;
         io.random(&random);
@@ -131,21 +131,21 @@ pub const Client = struct {
             .open_connection_reply_2,
             deadline,
             options.handshake_retry_ms,
-            options.config.maximum_packets_per_iteration,
+            options.config.batching.maximum_packets_per_iteration,
         );
-        const reply2 = try offline.decodeOpenConnectionReply2(reply2_wire, options.config.minimum_mtu, options.config.maximum_mtu);
+        const reply2 = try offline.decodeOpenConnectionReply2(reply2_wire, options.config.protocol.minimum_mtu, options.config.protocol.maximum_mtu);
         if (reply2.server_guid != reply1.server_guid or reply2.mtu > reply1.mtu) return error.HandshakeMismatch;
 
-        const frame_scratch = try allocator.alloc(frame.Frame, options.config.maximum_packets_per_iteration);
+        const frame_scratch = try allocator.alloc(frame.Frame, options.config.batching.maximum_packets_per_iteration);
         errdefer allocator.free(frame_scratch);
         const messages = try allocator.alloc(std.Io.net.IncomingMessage, options.receive_batch_size);
         errdefer allocator.free(messages);
-        const receive_storage = try allocator.alloc(u8, try std.math.mul(usize, options.receive_batch_size, options.config.maximum_datagram_size));
+        const receive_storage = try allocator.alloc(u8, try std.math.mul(usize, options.receive_batch_size, options.config.protocol.maximum_datagram_size));
         errdefer allocator.free(receive_storage);
 
         var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
         errdefer core.deinit();
-        var receipts = try receipt_batch.Batch.init(allocator, options.config.maximum_ack_records, reply2.mtu, options.config.maximum_acknowledged_datagrams);
+        var receipts = try receipt_batch.Batch.init(allocator, options.config.batching.maximum_ack_records, reply2.mtu, options.config.protocol.maximum_acknowledged_datagrams);
         errdefer receipts.deinit();
         self.* = .{
             .allocator = allocator,
@@ -164,13 +164,16 @@ pub const Client = struct {
             .mtu = reply2.mtu,
             .last_seen_ms = time.nowMilliseconds(io),
         };
-        try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.maximum_packets_per_iteration);
+        try self.finishConnectedHandshake(deadline, options.handshake_retry_ms, options.config.batching.maximum_packets_per_iteration);
         self.last_seen_ms = time.nowMilliseconds(io);
         return self;
     }
 
     pub fn kernelBufferSizes(self: *const Client) backend.BufferSizes {
         return self.socket.kernelBufferSizes();
+    }
+    pub fn statistics(self: *const Client) core_mod.Statistics {
+        return self.core.statistics();
     }
     pub fn close(self: *Client) void {
         if (self.closed) return;
@@ -243,7 +246,7 @@ pub const Client = struct {
 
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
-        var deadline = time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms);
+        var deadline = time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms);
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
@@ -253,11 +256,11 @@ pub const Client = struct {
 
     pub fn processTimers(self: *Client, now_ms: u64) !void {
         if (self.closed) return error.ConnectionClosed;
-        if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.idle_timeout_ms))) {
+        if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms))) {
             self.abort();
             return error.ConnectionTimedOut;
         }
-        self.processDueTimers(now_ms, self.core.config.maximum_packets_per_iteration) catch |err| {
+        self.processDueTimers(now_ms, self.core.config.batching.maximum_packets_per_iteration) catch |err| {
             self.abort();
             return err;
         };
@@ -285,7 +288,7 @@ pub const Client = struct {
         }
         var delivered: usize = 0;
         var latest_ms = time.nowMilliseconds(self.io);
-        var remaining = self.core.config.maximum_packets_per_iteration;
+        var remaining = self.core.config.batching.maximum_packets_per_iteration;
         var processed: usize = 0;
         while (self.pending_message_index < self.pending_message_count and remaining != 0) {
             if (processed != 0 and processed % 32 == 0) latest_ms = time.nowMilliseconds(self.io);
@@ -344,7 +347,7 @@ pub const Client = struct {
             const attempt = time.earliest(self.io, deadline, time.after(self.io, retry_ms));
             const message = receiveTimed(&self.socket.value, self.io, self.receive_buffer, attempt) catch |err| switch (err) {
                 error.Timeout => {
-                    _ = try self.flushRetransmissions(time.nowMilliseconds(self.io), self.core.config.maximum_packets_per_iteration);
+                    _ = try self.flushRetransmissions(time.nowMilliseconds(self.io), self.core.config.batching.maximum_packets_per_iteration);
                     continue;
                 },
                 else => return err,
@@ -378,7 +381,7 @@ pub const Client = struct {
         return emitter.count;
     }
     fn flushQueuedAt(self: *Client, now_ms: u64) !core_mod.FlushResult {
-        return self.flushQueuedAtLimit(now_ms, self.core.config.maximum_packets_per_iteration);
+        return self.flushQueuedAtLimit(now_ms, self.core.config.batching.maximum_packets_per_iteration);
     }
     fn flushQueuedAtLimit(self: *Client, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
         var emitter: socket_emitter.Emitter = .{ .socket = &self.socket, .address = self.server };
@@ -393,7 +396,7 @@ pub const Client = struct {
             try self.receipts.append(receipt);
         };
         if (self.receipts.isEmpty()) return;
-        const delay = if (receipt.missing != null) 0 else self.core.config.maximum_ack_delay_ms;
+        const delay = if (receipt.missing != null) 0 else self.core.config.timing.maximum_ack_delay_ms;
         const deadline = time.deadline(now_ms, delay);
         self.ack_deadline_ms = if (self.ack_deadline_ms) |current| @min(current, deadline) else deadline;
     }
@@ -456,17 +459,17 @@ fn validateOptions(options: Options) !void {
     try options.config.validate();
     try options.socket_buffers.validate();
     const invalid =
-        options.mtu < options.config.minimum_mtu or
-        options.mtu > options.config.maximum_mtu or
+        options.mtu < options.config.protocol.minimum_mtu or
+        options.mtu > options.config.protocol.maximum_mtu or
         options.handshake_timeout_ms == 0 or
         options.handshake_retry_ms == 0 or
         options.handshake_retry_ms > options.handshake_timeout_ms or
         options.receive_batch_size == 0 or
         options.receive_batch_size > 256;
     if (invalid) return error.InvalidConfiguration;
-    var previous = options.config.maximum_mtu + 1;
+    var previous = options.config.protocol.maximum_mtu + 1;
     for (options.mtu_fallbacks) |fallback| {
-        if (fallback < options.config.minimum_mtu or fallback > options.config.maximum_mtu or fallback >= previous) return error.InvalidConfiguration;
+        if (fallback < options.config.protocol.minimum_mtu or fallback > options.config.protocol.maximum_mtu or fallback >= previous) return error.InvalidConfiguration;
         previous = fallback;
     }
 }
@@ -501,11 +504,11 @@ fn discoverMtu(socket: *backend.Socket, server: std.Io.net.IpAddress, options: O
             const request = try offline.encodeOpenConnectionRequest1(options.protocol_version, candidate, scratch);
             try socket.send(server, request);
             const attempt = time.earliest(socket.io, overall, time.after(socket.io, options.handshake_retry_ms));
-            const wire = receiveExpected(socket, server, buffer, .open_connection_reply_1, attempt, options.config.maximum_packets_per_iteration) catch |err| switch (err) {
+            const wire = receiveExpected(socket, server, buffer, .open_connection_reply_1, attempt, options.config.batching.maximum_packets_per_iteration) catch |err| switch (err) {
                 error.Timeout, error.HandshakeWorkLimitExceeded => continue,
                 else => return err,
             };
-            const reply = try offline.decodeOpenConnectionReply1(wire, options.config.minimum_mtu, options.config.maximum_mtu);
+            const reply = try offline.decodeOpenConnectionReply1(wire, options.config.protocol.minimum_mtu, options.config.protocol.maximum_mtu);
             if (reply.mtu > candidate) return error.HandshakeMismatch;
             return reply;
         }
@@ -543,8 +546,8 @@ test "client and server complete a real loopback handshake" {
     const io = io_instance.io();
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
     var server_config: Config = .{};
-    server_config.maximum_mtu = 1200;
-    server_config.maximum_connections = 1;
+    server_config.protocol.maximum_mtu = 1200;
+    server_config.listener.maximum_connections = 1;
     var listener = try server_mod.Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;interop", .config = server_config });
     defer listener.destroy();
     const Harness = struct {

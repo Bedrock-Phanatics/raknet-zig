@@ -1,14 +1,14 @@
 const std = @import("std");
 const raknet = @import("raknet");
-const ack = raknet.protocol.ack;
-const frame = raknet.protocol.frame;
-const cursor = raknet.protocol.cursor;
-const datagram = raknet.protocol.datagram;
-const receive_window = raknet.reliability.receive_window;
-const recovery = raknet.reliability.recovery;
-const ordered_store = raknet.reliability.ordered_store;
-const deadline_queue = raknet.session.deadline_queue;
-const receipt_batch = raknet.session.receipt_batch;
+const ack = raknet.advanced.protocol.ack;
+const frame = raknet.advanced.protocol.frame;
+const cursor = raknet.advanced.protocol.cursor;
+const datagram = raknet.advanced.protocol.datagram;
+const receive_window = raknet.advanced.reliability.receive_window;
+const recovery = raknet.advanced.reliability.recovery;
+const ordered_store = raknet.advanced.reliability.ordered_store;
+const deadline_queue = raknet.advanced.session.deadline_queue;
+const receipt_batch = raknet.advanced.session.receipt_batch;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -470,9 +470,9 @@ fn benchmarkAckBatching(io: std.Io, message_count: usize, group_size: usize) Ack
 
 fn benchmarkReceiveBatch(io: std.Io, batch_size: usize, message_count: usize) !ReceiveBatchMeasurement {
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
-    var receiver_socket = try raknet.net.Socket.bind(io, address, 64);
+    var receiver_socket = try raknet.advanced.net.Socket.bind(io, address, 64);
     defer receiver_socket.close();
-    var sender = try raknet.net.Socket.bind(io, address, 64);
+    var sender = try raknet.advanced.net.Socket.bind(io, address, 64);
     defer sender.close();
     const messages = try std.heap.page_allocator.alloc(std.Io.net.IncomingMessage, batch_size);
     defer std.heap.page_allocator.free(messages);

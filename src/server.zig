@@ -103,6 +103,13 @@ pub const PollStats = struct {
     internal_failures: usize = 0,
 };
 
+pub const ListenerStatistics = struct {
+    active_sessions: usize,
+    session_memory_bytes: usize,
+    maximum_session_memory_bytes: usize,
+    socket_buffers: backend.BufferSizes,
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     socket: *backend.Socket,
@@ -141,7 +148,7 @@ pub const Session = struct {
         errdefer core.deinit();
         const scratch = try allocator.alloc(u8, mtu);
         errdefer allocator.free(scratch);
-        var receipts = try receipt_batch.Batch.init(allocator, @min(ack_capacity, config.maximum_ack_records), mtu, config.maximum_acknowledged_datagrams);
+        var receipts = try receipt_batch.Batch.init(allocator, @min(ack_capacity, config.batching.maximum_ack_records), mtu, config.protocol.maximum_acknowledged_datagrams);
         errdefer receipts.deinit();
         self.* = .{
             .allocator = allocator,
@@ -156,7 +163,7 @@ pub const Session = struct {
             .mtu = mtu,
             .last_seen_ms = now_ms,
             .handshake_deadline_ms = time.deadline(now_ms, handshake_timeout_ms),
-            .idle_timeout_ms = config.idle_timeout_ms,
+            .idle_timeout_ms = config.timing.idle_timeout_ms,
         };
         return self;
     }
@@ -169,8 +176,8 @@ pub const Session = struct {
     pub fn isConnected(self: Session) bool {
         return self.state == .connected;
     }
-    pub fn rttMs(self: Session) ?u64 {
-        return if (self.core.rtt_state.initialized) self.core.rtt_state.smoothed_ms else null;
+    pub fn statistics(self: *const Session) core_mod.Statistics {
+        return self.core.statistics();
     }
     pub fn close(self: *Session) void {
         if (self.state == .closed) return;
@@ -241,7 +248,7 @@ pub const Session = struct {
         _ = try self.sendAtLane(payload, reliability, 0, now_ms, true);
     }
     fn flushQueuedAt(self: *Session, now_ms: u64) !core_mod.FlushResult {
-        return self.flushQueuedAtLimit(now_ms, self.core.config.maximum_packets_per_iteration);
+        return self.flushQueuedAtLimit(now_ms, self.core.config.batching.maximum_packets_per_iteration);
     }
     fn flushQueuedAtLimit(self: *Session, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
         var emitter: socket_emitter.Emitter = .{ .socket = self.socket, .address = self.address };
@@ -257,7 +264,7 @@ pub const Session = struct {
             try self.receipts.append(receipt);
         };
         if (self.receipts.isEmpty()) return;
-        const delay = if (receipt.missing != null) 0 else self.core.config.maximum_ack_delay_ms;
+        const delay = if (receipt.missing != null) 0 else self.core.config.timing.maximum_ack_delay_ms;
         const deadline = time.deadline(now_ms, delay);
         self.ack_deadline_ms = if (self.ack_deadline_ms) |current| @min(current, deadline) else deadline;
         try self.schedule();
@@ -362,11 +369,11 @@ pub const Listener = struct {
         try validateOptions(options);
         const self = try allocator.create(Listener);
         errdefer allocator.destroy(self);
-        var socket = try backend.Socket.bindWithBuffers(io, address, options.config.maximum_datagram_size, options.socket_buffers);
+        var socket = try backend.Socket.bindWithBuffers(io, address, options.config.protocol.maximum_datagram_size, options.socket_buffers);
         errdefer socket.close();
         const advertisement = try allocator.dupe(u8, options.advertisement);
         errdefer allocator.free(advertisement);
-        const limiter_count = @min(options.config.maximum_pending_handshakes, 65_536);
+        const limiter_count = @min(options.config.listener.maximum_pending_handshakes, 65_536);
         const rate_entries = try allocator.alloc(rate.Entry, limiter_count);
         errdefer allocator.free(rate_entries);
         const limiter = try rate.Limiter.init(
@@ -381,16 +388,16 @@ pub const Listener = struct {
         );
         const messages = try allocator.alloc(std.Io.net.IncomingMessage, options.receive_batch_size);
         errdefer allocator.free(messages);
-        const receive_size = try std.math.mul(usize, options.receive_batch_size, options.config.maximum_datagram_size);
+        const receive_size = try std.math.mul(usize, options.receive_batch_size, options.config.protocol.maximum_datagram_size);
         const receive_storage = try allocator.alloc(u8, receive_size);
         errdefer allocator.free(receive_storage);
-        const handshake_output = try allocator.alloc(u8, options.config.maximum_datagram_size);
+        const handshake_output = try allocator.alloc(u8, options.config.protocol.maximum_datagram_size);
         errdefer allocator.free(handshake_output);
-        const frame_scratch = try allocator.alloc(frame.Frame, options.config.maximum_packets_per_iteration);
+        const frame_scratch = try allocator.alloc(frame.Frame, options.config.batching.maximum_packets_per_iteration);
         errdefer allocator.free(frame_scratch);
-        const timer_entries = try allocator.alloc(deadline_queue.Entry, options.config.maximum_packets_per_iteration);
+        const timer_entries = try allocator.alloc(deadline_queue.Entry, options.config.batching.maximum_packets_per_iteration);
         errdefer allocator.free(timer_entries);
-        var deadlines = try deadline_queue.Queue.init(allocator, options.config.maximum_connections);
+        var deadlines = try deadline_queue.Queue.init(allocator, options.config.listener.maximum_connections);
         errdefer deadlines.deinit();
         var random: [80]u8 = undefined;
         io.random(&random);
@@ -413,13 +420,13 @@ pub const Listener = struct {
             .timer_entries = timer_entries,
             .handshake_output = handshake_output,
             .handshake_timeout_ms = options.handshake_timeout_ms,
-            .ack_capacity = options.config.maximum_ack_records,
+            .ack_capacity = options.config.batching.maximum_ack_records,
         };
         self.handshake_handler = try handshake.Handler.init(
             guid,
             options.protocol_version,
-            options.config.minimum_mtu,
-            options.config.maximum_mtu,
+            options.config.protocol.minimum_mtu,
+            options.config.protocol.maximum_mtu,
             self.advertisement,
             .{ .current_key = random[8..40].*, .previous_key = random[40..72].* },
             &self.limiter,
@@ -429,6 +436,14 @@ pub const Listener = struct {
 
     pub fn kernelBufferSizes(self: *const Listener) backend.BufferSizes {
         return self.socket.kernelBufferSizes();
+    }
+    pub fn statistics(self: *const Listener) ListenerStatistics {
+        return .{
+            .active_sessions = self.sessions.count(),
+            .session_memory_bytes = self.session_quota.used_bytes,
+            .maximum_session_memory_bytes = self.session_quota.maximum_bytes,
+            .socket_buffers = self.socket.kernelBufferSizes(),
+        };
     }
     pub fn close(self: *Listener) void {
         if (self.closed) return;
@@ -463,7 +478,7 @@ pub const Listener = struct {
     pub fn processTimers(self: *Listener, now_ms: u64, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         var stats: PollStats = .{};
-        self.processTimersInto(now_ms, callbacks, &stats, self.config.maximum_packets_per_iteration);
+        self.processTimersInto(now_ms, callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
         return stats;
     }
 
@@ -474,7 +489,7 @@ pub const Listener = struct {
             const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
             const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
                 error.Timeout => {
-                    self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats, self.config.maximum_packets_per_iteration);
+                    self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
                     return stats;
                 },
                 else => return err,
@@ -484,7 +499,7 @@ pub const Listener = struct {
             self.pending_message_index = 0;
             self.pending_message_count = batch.messages.len;
         }
-        var remaining = self.config.maximum_packets_per_iteration;
+        var remaining = self.config.batching.maximum_packets_per_iteration;
         var now_ms = time.nowMilliseconds(self.io);
         var processed: usize = 0;
         while (self.pending_message_index < self.pending_message_count and remaining != 0) {
@@ -574,7 +589,7 @@ pub const Listener = struct {
                 .drop => stats.rate_limited_or_dropped += 1,
                 .response => |wire| try self.socket.send(message.from, wire),
                 .accepted => |accepted| {
-                    if (self.sessions.count() >= self.config.maximum_connections) {
+                    if (self.sessions.count() >= self.config.listener.maximum_connections) {
                         stats.rate_limited_or_dropped += 1;
                         const response = offline.encodeNoFreeIncomingConnections(self.handshake_handler.server_guid, self.handshake_output) catch continue;
                         try self.socket.send(message.from, response);
@@ -679,7 +694,7 @@ fn validateOptions(options: Options) !void {
     const invalid =
         options.receive_batch_size == 0 or
         options.receive_batch_size > 256 or
-        options.advertisement.len > options.config.maximum_datagram_size -| 35 or
+        options.advertisement.len > options.config.protocol.maximum_datagram_size -| 35 or
         options.maximum_session_memory_bytes == 0 or
         options.handshake_timeout_ms == 0;
     if (invalid) return error.InvalidConfiguration;
@@ -875,7 +890,7 @@ test "ACK delay schedules while NACK remains urgent" {
     var deadlines = try deadline_queue.Queue.init(std.testing.allocator, 1);
     defer deadlines.deinit();
     var config: Config = .{};
-    config.maximum_ack_delay_ms = 5;
+    config.timing.maximum_ack_delay_ms = 5;
     const key = endpointKey(socket.value.address);
     const session = try Session.create(std.testing.allocator, &socket, &deadlines, socket.value.address, key, 1, 576, 100, 1000, 8, config);
     defer session.destroy();
@@ -889,7 +904,7 @@ test "global turn budget carries unread batch entries fairly" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
     var config: Config = .{};
-    config.maximum_packets_per_iteration = 1;
+    config.batching.maximum_packets_per_iteration = 1;
     var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;budget", .receive_batch_size = 4, .config = config });
     defer listener.destroy();
     var peer = try backend.Socket.bind(io, address, 2048);

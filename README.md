@@ -90,6 +90,7 @@ pub fn main(init: std.process.Init) !void {
     const listener = try raknet.Server.listen(init.gpa, init.io, address, .{
         .advertisement = "MCPE;Example Server;11;1.21;0;20;0;world;Survival;1;19132;19133;",
         .maximum_session_memory_bytes = 256 * 1024 * 1024,
+        .config = .{ .listener = .{ .maximum_connections = 1_024 } },
     });
     defer listener.destroy();
 
@@ -121,7 +122,7 @@ Both `poll` methods treat their timeout as an upper bound and shorten it to the
 next protocol deadline.
 
 A `Session` is owned by its listener. Use `Session.send`, `Session.isConnected`,
-and `Session.rttMs` only while the session is live. Do not retain a session
+and `Session.statistics` only while the session is live. Do not retain a session
 pointer after its disconnect callback or after destroying the listener.
 
 ## Client API
@@ -199,47 +200,48 @@ _ = try session.flush();
 const pending = try session.queueSend("cancel me", .reliable, 0);
 _ = session.cancelSend(pending);
 
-const rtt_ms = session.rttMs();
-_ = rtt_ms;
+const statistics = session.statistics();
+_ = statistics;
 ```
 
 ## Configuration
 
-`raknet.Config` contains client/server protocol limits. `raknet.ServerOptions`
-and `raknet.ClientOptions` contain endpoint settings. Defaults are bounded
-starting points. Production deployments should tune them for expected traffic,
+`raknet.Config` groups protocol, session, listener, timing, and batching
+settings. Endpoint settings live in `raknet.ServerOptions` and
+`raknet.ClientOptions`. Defaults are bounded starting points. Production deployments should tune them for expected traffic,
 concurrency, and available memory.
 
 The most important controls are:
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `maximum_connections` | 4,096 | Maximum live server sessions |
-| `maximum_datagram_size` | 2,048 B | Maximum accepted UDP datagram |
-| `maximum_frame_payload` | 8 KiB | Maximum decoded frame payload |
-| `maximum_retransmissions` | 4,096 | Recovery records per connection |
-| `maximum_recovery_bytes` | 16 MiB | Retained recovery bytes per connection |
-| `maximum_queued_outbound_packets` | 256 | Queued messages per connection |
-| `maximum_queued_outbound_bytes` | 16 MiB | Queued payload bytes per connection |
-| `maximum_ordered_bytes` | 16 MiB | Retained ordered payload bytes per connection |
-| `maximum_split_bytes` | 4 MiB | Maximum reassembled message size |
-| `maximum_split_bytes_per_connection` | 16 MiB | Aggregate split payload storage per connection |
-| `maximum_packets_per_iteration` | 256 | Per-turn protocol work bound |
-| `idle_timeout_ms` | 10,000 | Connected-session idle timeout |
+| `config.listener.maximum_connections` | 4,096 | Maximum live server sessions |
+| `config.protocol.maximum_datagram_size` | 2,048 B | Maximum accepted UDP datagram |
+| `config.protocol.maximum_frame_payload` | 8 KiB | Maximum decoded frame payload |
+| `config.session.maximum_retransmissions` | 4,096 | Recovery records per connection |
+| `config.session.maximum_recovery_bytes` | 16 MiB | Retained recovery bytes per connection |
+| `config.session.maximum_queued_outbound_packets` | 256 | Queued messages per connection |
+| `config.session.maximum_queued_outbound_bytes` | 16 MiB | Queued payload bytes per connection |
+| `config.session.maximum_ordered_bytes` | 16 MiB | Retained ordered payload bytes per connection |
+| `config.protocol.maximum_split_bytes` | 4 MiB | Maximum reassembled message size |
+| `config.session.maximum_split_bytes_per_connection` | 16 MiB | Aggregate split payload storage per connection |
+| `config.batching.maximum_packets_per_iteration` | 256 | Per-turn protocol work bound |
+| `config.timing.idle_timeout_ms` | 10,000 | Connected-session idle timeout |
 | `maximum_session_memory_bytes` | 512 MiB | Server-wide session-state quota |
 | `receive_batch_size` | 32 | Listener receive slots per poll |
 | `handshake_timeout_ms` | 5,000 | Connected-handshake deadline |
 
-See [`src/config.zig`](src/config.zig), [`src/server.zig`](src/server.zig), and
-[`src/client.zig`](src/client.zig) for the complete option set.
+See [Configuration](docs/CONFIGURATION.md) for units, scope, memory costs, and
+limit behavior.
 
 Operational guidance:
 
-- Size `maximum_connections` and `maximum_session_memory_bytes` together.
+- Size `config.listener.maximum_connections` and `maximum_session_memory_bytes`
+  together.
 - Poll timeouts are upper bounds. Use `.none` to wait until traffic or the next
   protocol deadline, or pass a shorter timeout for application work.
-- Keep `maximum_datagram_size` at or above `maximum_mtu`. Negotiated MTU controls
-  emitted datagram size.
+- Keep `config.protocol.maximum_datagram_size` at or above
+  `config.protocol.maximum_mtu`. Negotiated MTU controls emitted datagram size.
 - Review split, recovery, and ordered-storage limits as one memory budget.
 - `Listener`, `Session`, and `Client` are single-owner objects. Call them from one
   event-loop context; the packet path intentionally uses no locks.

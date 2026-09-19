@@ -31,6 +31,19 @@ pub const RetainedPayload = struct {
     }
 };
 
+pub const Sequenced = struct {
+    latest: u32 = 0,
+    initialized: bool = false,
+
+    pub fn accept(self: *Sequenced, raw_index: u32) bool {
+        const index = uint24.normalize(raw_index);
+        if (self.initialized and !uint24.isNewer(index, self.latest)) return false;
+        self.latest = index;
+        self.initialized = true;
+        return true;
+    }
+};
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     channels: []Channel,
@@ -77,6 +90,10 @@ pub const Store = struct {
 
     pub fn count(self: Store) usize {
         return self.packet_count;
+    }
+
+    pub fn payloadBytes(self: Store) usize {
+        return self.total_bytes;
     }
 
     pub fn metadataCapacity(self: Store) usize {
@@ -229,6 +246,14 @@ pub const Store = struct {
 fn classIndex(len: usize) ?usize {
     for (class_sizes, 0..) |size, index| if (len <= size) return index;
     return null;
+}
+
+test "sequenced packets use modular ordering" {
+    var sequence: Sequenced = .{};
+    try std.testing.expect(sequence.accept(0xffffff));
+    try std.testing.expect(sequence.accept(0));
+    try std.testing.expect(!sequence.accept(0xffffff));
+    try std.testing.expect(!sequence.accept(0));
 }
 
 test "global quotas span channels and in-order fast path advances" {

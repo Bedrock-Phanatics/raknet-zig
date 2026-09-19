@@ -3,22 +3,22 @@ const build_options = @import("build_options");
 const raknet = @import("raknet");
 
 fn exercise(input: []u8) void {
-    var ack_storage: [16]raknet.protocol.ack.Record = undefined;
-    _ = raknet.protocol.ack.decode(input, &ack_storage, ack_storage.len, 256) catch {};
-    var reader: raknet.protocol.cursor.Reader = .{ .data = input };
+    var ack_storage: [16]raknet.advanced.protocol.ack.Record = undefined;
+    _ = raknet.advanced.protocol.ack.decode(input, &ack_storage, ack_storage.len, 256) catch {};
+    var reader: raknet.advanced.protocol.cursor.Reader = .{ .data = input };
     var work: usize = 0;
     while (reader.remaining() > 0 and work < 32) : (work += 1) {
         const before = reader.offset;
-        _ = raknet.protocol.frame.decodeOne(&reader, 2048, 32) catch break;
+        _ = raknet.advanced.protocol.frame.decodeOne(&reader, 2048, 32) catch break;
         if (reader.offset <= before) break;
     }
-    _ = raknet.protocol.frame.decodeDatagram(input) catch {};
-    _ = raknet.protocol.datagram.decode(input, &ack_storage, ack_storage.len, 256) catch {};
-    _ = raknet.protocol.connected.decode(input) catch {};
-    _ = raknet.protocol.offline.decodeUnconnectedPing(input) catch {};
-    _ = raknet.protocol.offline.decodeOpenConnectionRequest1(input, 576, 1492) catch {};
-    _ = raknet.protocol.offline.decodeOpenConnectionRequest2(input, false, 576, 1492) catch {};
-    _ = raknet.protocol.offline.decodeOpenConnectionRequest2(input, true, 576, 1492) catch {};
+    _ = raknet.advanced.protocol.frame.decodeDatagram(input) catch {};
+    _ = raknet.advanced.protocol.datagram.decode(input, &ack_storage, ack_storage.len, 256) catch {};
+    _ = raknet.advanced.protocol.connected.decode(input) catch {};
+    _ = raknet.advanced.protocol.offline.decodeUnconnectedPing(input) catch {};
+    _ = raknet.advanced.protocol.offline.decodeOpenConnectionRequest1(input, 576, 1492) catch {};
+    _ = raknet.advanced.protocol.offline.decodeOpenConnectionRequest2(input, false, 576, 1492) catch {};
+    _ = raknet.advanced.protocol.offline.decodeOpenConnectionRequest2(input, true, 576, 1492) catch {};
     var batch_decoder = raknet.minecraft.batch.Decoder.init(std.heap.page_allocator, .{
         .maximum_compressed_bytes = 4096,
         .maximum_decompressed_bytes = 8192,

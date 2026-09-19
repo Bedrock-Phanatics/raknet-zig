@@ -5,7 +5,6 @@ pub const BorrowedPayload = @import("../payload.zig").BorrowedPayload;
 pub const OwnedPayload = @import("../payload.zig").OwnedPayload;
 const frame = @import("../protocol/frame.zig");
 const ordered_store = @import("../reliability/ordered_store.zig");
-const ordering = @import("../reliability/ordering.zig");
 const reassembly = @import("../reliability/reassembly.zig");
 const receive_window = @import("../reliability/receive_window.zig");
 
@@ -39,25 +38,25 @@ pub const Receiver = struct {
     reliable_storage: []bool,
     splits: reassembly.Reassembler,
     ordered: ordered_store.Store,
-    sequenced: []ordering.Sequenced,
+    sequenced: []ordered_store.Sequenced,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Receiver {
         try config.validate();
-        const datagram_storage = try allocator.alloc(bool, config.receive_window);
+        const datagram_storage = try allocator.alloc(bool, config.protocol.receive_window);
         errdefer allocator.free(datagram_storage);
-        const reliable_storage = try allocator.alloc(bool, config.reliable_window);
+        const reliable_storage = try allocator.alloc(bool, config.protocol.reliable_window);
         errdefer allocator.free(reliable_storage);
         var splits = try reassembly.Reassembler.init(allocator, .{
-            .maximum_parts = config.maximum_split_parts,
-            .maximum_bytes = config.maximum_split_bytes,
-            .maximum_concurrent = config.maximum_concurrent_splits,
-            .maximum_total_bytes = config.maximum_split_bytes_per_connection,
-            .timeout_ms = config.split_timeout_ms,
+            .maximum_parts = config.protocol.maximum_split_parts,
+            .maximum_bytes = config.protocol.maximum_split_bytes,
+            .maximum_concurrent = config.session.maximum_concurrent_splits,
+            .maximum_total_bytes = config.session.maximum_split_bytes_per_connection,
+            .timeout_ms = config.timing.split_timeout_ms,
         });
         errdefer splits.deinit();
-        var ordered = try ordered_store.Store.init(allocator, config.maximum_order_channels, config.maximum_ordered_packets, config.maximum_ordered_bytes, config.reliable_window);
+        var ordered = try ordered_store.Store.init(allocator, config.protocol.maximum_order_channels, config.session.maximum_ordered_packets, config.session.maximum_ordered_bytes, config.protocol.reliable_window);
         errdefer ordered.deinit();
-        const sequenced = try allocator.alloc(ordering.Sequenced, config.maximum_order_channels);
+        const sequenced = try allocator.alloc(ordered_store.Sequenced, config.protocol.maximum_order_channels);
         @memset(sequenced, .{});
         return .{
             .allocator = allocator,
@@ -89,7 +88,7 @@ pub const Receiver = struct {
     }
 
     pub fn process(self: *Receiver, data: []const u8, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !Receipt {
-        if (data.len > self.config.maximum_datagram_size) return error.DatagramTooLarge;
+        if (data.len > self.config.protocol.maximum_datagram_size) return error.DatagramTooLarge;
 
         // Validate the whole datagram before changing state.
         try self.validateDatagram(data);
@@ -99,17 +98,17 @@ pub const Receiver = struct {
         var receipt: Receipt = .{};
         var work: usize = 0;
         while (datagram.frames.remaining() > 0) {
-            if (work >= self.config.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
+            if (work >= self.config.batching.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
             work += 1;
             receipt.frames += 1;
-            const value = try frame.decodeOne(&datagram.frames, self.config.maximum_frame_payload, self.config.maximum_split_parts);
+            const value = try frame.decodeOne(&datagram.frames, self.config.protocol.maximum_frame_payload, self.config.protocol.maximum_split_parts);
             receipt.delivered += try self.processFrame(value, now_ms, context, deliver);
         }
         return self.commitDatagram(datagram.sequence, receipt);
     }
 
     pub fn processWithScratch(self: *Receiver, data: []const u8, now_ms: u64, scratch: []frame.Frame, context: *anyopaque, deliver: DeliverFn) !Receipt {
-        if (data.len > self.config.maximum_datagram_size) return error.DatagramTooLarge;
+        if (data.len > self.config.protocol.maximum_datagram_size) return error.DatagramTooLarge;
 
         const datagram = try self.decodeDatagramInto(data, scratch);
         if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;
@@ -131,11 +130,11 @@ pub const Receiver = struct {
         var datagram = try frame.decodeDatagram(data);
         var count: usize = 0;
         while (datagram.frames.remaining() > 0) {
-            if (count >= self.config.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
+            if (count >= self.config.batching.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
             if (count >= scratch.len) return error.FrameScratchTooSmall;
-            const value = try frame.decodeOne(&datagram.frames, self.config.maximum_frame_payload, self.config.maximum_split_parts);
+            const value = try frame.decodeOne(&datagram.frames, self.config.protocol.maximum_frame_payload, self.config.protocol.maximum_split_parts);
             if (value.order_channel) |channel| {
-                if (channel >= self.config.maximum_order_channels) return error.InvalidOrderChannel;
+                if (channel >= self.config.protocol.maximum_order_channels) return error.InvalidOrderChannel;
             }
             scratch[count] = value;
             count += 1;
@@ -147,17 +146,17 @@ pub const Receiver = struct {
         var datagram = try frame.decodeDatagram(data);
         var work: usize = 0;
         while (datagram.frames.remaining() > 0) {
-            if (work >= self.config.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
+            if (work >= self.config.batching.maximum_packets_per_iteration) return error.PacketWorkLimitExceeded;
             work += 1;
-            const value = try frame.decodeOne(&datagram.frames, self.config.maximum_frame_payload, self.config.maximum_split_parts);
+            const value = try frame.decodeOne(&datagram.frames, self.config.protocol.maximum_frame_payload, self.config.protocol.maximum_split_parts);
             if (value.order_channel) |channel| {
-                if (channel >= self.config.maximum_order_channels) return error.InvalidOrderChannel;
+                if (channel >= self.config.protocol.maximum_order_channels) return error.InvalidOrderChannel;
             }
         }
     }
 
     fn beginDatagram(self: *const Receiver, sequence: u32) !?Receipt {
-        return switch (self.datagrams.inspect(sequence, self.config.maximum_acknowledged_datagrams)) {
+        return switch (self.datagrams.inspect(sequence, self.config.protocol.maximum_acknowledged_datagrams)) {
             .accepted => null,
             .duplicate, .stale => .{ .acknowledge = sequence },
             .too_far_ahead, .ambiguous => error.DatagramWindowExceeded,
@@ -166,7 +165,7 @@ pub const Receiver = struct {
 
     fn commitDatagram(self: *Receiver, sequence: u32, receipt: Receipt) !Receipt {
         var committed = receipt;
-        switch (self.datagrams.add(sequence, self.config.maximum_acknowledged_datagrams)) {
+        switch (self.datagrams.add(sequence, self.config.protocol.maximum_acknowledged_datagrams)) {
             .accepted => |gap| {
                 committed.acknowledge = sequence;
                 committed.missing = gap;
@@ -210,7 +209,7 @@ pub const Receiver = struct {
                     defer owned.deinit();
                     try deliverPayload(context, owned.bytes, deliver);
                     delivered += 1;
-                    if (delivered >= self.config.maximum_packets_per_iteration) break;
+                    if (delivered >= self.config.batching.maximum_packets_per_iteration) break;
                 }
                 return delivered;
             }
@@ -291,9 +290,9 @@ test "malformed suffix cannot consume sequence state or invoke callbacks" {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_packets_per_iteration = 8;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.batching.maximum_packets_per_iteration = 8;
     var receiver = try Receiver.init(std.testing.allocator, config);
     defer receiver.deinit();
 
@@ -340,9 +339,9 @@ test "invalid later frame metadata is rejected before earlier delivery" {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_packets_per_iteration = 8;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.batching.maximum_packets_per_iteration = 8;
     var receiver = try Receiver.init(std.testing.allocator, config);
     defer receiver.deinit();
 
@@ -369,11 +368,11 @@ test "retained allocation failure does not consume datagram or reliable indices"
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_ordered_packets = 8;
-    config.maximum_ordered_bytes = 128;
-    config.maximum_packets_per_iteration = 8;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.session.maximum_ordered_packets = 8;
+    config.session.maximum_ordered_bytes = 128;
+    config.batching.maximum_packets_per_iteration = 8;
 
     const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
     var quota = QuotaAllocator.init(std.testing.allocator, std.math.maxInt(usize));
@@ -425,10 +424,10 @@ test "every truncation inside a later frame is atomic" {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_order_channels = 2;
-    config.maximum_packets_per_iteration = 8;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.protocol.maximum_order_channels = 2;
+    config.batching.maximum_packets_per_iteration = 8;
 
     const frames = [_]frame.Frame{
         .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .payload = "first" },
@@ -476,15 +475,15 @@ test "completed split can retry after final allocation failure" {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_order_channels = 1;
-    config.maximum_frame_payload = 64;
-    config.maximum_split_parts = 4;
-    config.maximum_split_bytes = 64;
-    config.maximum_split_bytes_per_connection = 64;
-    config.maximum_concurrent_splits = 2;
-    config.maximum_packets_per_iteration = 8;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.protocol.maximum_order_channels = 1;
+    config.protocol.maximum_frame_payload = 64;
+    config.protocol.maximum_split_parts = 4;
+    config.protocol.maximum_split_bytes = 64;
+    config.session.maximum_split_bytes_per_connection = 64;
+    config.session.maximum_concurrent_splits = 2;
+    config.batching.maximum_packets_per_iteration = 8;
 
     const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
     var quota = QuotaAllocator.init(std.testing.allocator, std.math.maxInt(usize));
@@ -542,9 +541,9 @@ test "small descriptor scratch is rejected before state changes" {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_packets_per_iteration = 2;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.batching.maximum_packets_per_iteration = 2;
     var receiver = try Receiver.init(std.testing.allocator, config);
     defer receiver.deinit();
 
@@ -578,8 +577,8 @@ test "callback failure before prepared state keeps stores empty" {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
     var receiver = try Receiver.init(std.testing.allocator, config);
     defer receiver.deinit();
 
@@ -626,12 +625,12 @@ test "callback failure after prepared ordered state releases it" {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_order_channels = 1;
-    config.maximum_ordered_packets = 2;
-    config.maximum_ordered_bytes = 16;
-    config.maximum_packets_per_iteration = 2;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.protocol.maximum_order_channels = 1;
+    config.session.maximum_ordered_packets = 2;
+    config.session.maximum_ordered_bytes = 16;
+    config.batching.maximum_packets_per_iteration = 2;
     var receiver = try Receiver.init(std.testing.allocator, config);
     defer receiver.deinit();
 
@@ -677,12 +676,12 @@ fn checkOrderedReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_order_channels = 1;
-    config.maximum_ordered_packets = 4;
-    config.maximum_ordered_bytes = 64;
-    config.maximum_packets_per_iteration = 2;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.protocol.maximum_order_channels = 1;
+    config.session.maximum_ordered_packets = 4;
+    config.session.maximum_ordered_bytes = 64;
+    config.batching.maximum_packets_per_iteration = 2;
     var receiver = try Receiver.init(allocator, config);
     defer receiver.deinit();
 
@@ -727,15 +726,15 @@ fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
     };
 
     var config: Config = .{};
-    config.receive_window = 8;
-    config.reliable_window = 8;
-    config.maximum_order_channels = 1;
-    config.maximum_frame_payload = 64;
-    config.maximum_split_parts = 4;
-    config.maximum_split_bytes = 64;
-    config.maximum_split_bytes_per_connection = 64;
-    config.maximum_concurrent_splits = 2;
-    config.maximum_packets_per_iteration = 2;
+    config.protocol.receive_window = 8;
+    config.protocol.reliable_window = 8;
+    config.protocol.maximum_order_channels = 1;
+    config.protocol.maximum_frame_payload = 64;
+    config.protocol.maximum_split_parts = 4;
+    config.protocol.maximum_split_bytes = 64;
+    config.session.maximum_split_bytes_per_connection = 64;
+    config.session.maximum_concurrent_splits = 2;
+    config.batching.maximum_packets_per_iteration = 2;
     var receiver = try Receiver.init(allocator, config);
     defer receiver.deinit();
 

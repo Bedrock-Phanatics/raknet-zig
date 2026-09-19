@@ -56,7 +56,7 @@ pub const Transmitter = struct {
 
     pub fn init(mtu: u16, config: Config) !Transmitter {
         try config.validate();
-        if (mtu < config.minimum_mtu or mtu > config.maximum_mtu) return error.InvalidMtu;
+        if (mtu < config.protocol.minimum_mtu or mtu > config.protocol.maximum_mtu) return error.InvalidMtu;
         return .{ .config = config, .mtu = mtu };
     }
 
@@ -220,15 +220,15 @@ pub const Transmitter = struct {
     fn layout(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !Layout {
         if (!reliability.supportedForSend()) return error.UnsupportedReliability;
         if (payload_len == 0) return error.EmptyPayload;
-        if (payload_len > self.config.maximum_split_bytes) return error.MessageTooLarge;
-        if (channel >= self.config.maximum_order_channels and reliability.hasOrderIndex()) return error.InvalidOrderChannel;
+        if (payload_len > self.config.protocol.maximum_split_bytes) return error.MessageTooLarge;
+        if (channel >= self.config.protocol.maximum_order_channels and reliability.hasOrderIndex()) return error.InvalidOrderChannel;
 
         const unsplit_capacity = try payloadCapacity(self.mtu, reliability, false);
         const split = payload_len > unsplit_capacity;
         if (split and !reliability.hasReliableIndex()) return error.UnreliableMessageTooLarge;
         const capacity = if (split) try payloadCapacity(self.mtu, reliability, true) else unsplit_capacity;
         const count = (payload_len + capacity - 1) / capacity;
-        if (count > self.config.maximum_split_parts or count > std.math.maxInt(u32)) return error.MessageTooLarge;
+        if (count > self.config.protocol.maximum_split_parts or count > std.math.maxInt(u32)) return error.MessageTooLarge;
         return .{ .capacity = capacity, .fragment_count = count, .split = split };
     }
 

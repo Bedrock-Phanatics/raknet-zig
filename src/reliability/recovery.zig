@@ -201,6 +201,9 @@ pub const Recovery = struct {
     pub fn count(self: Recovery) usize {
         return self.count_value;
     }
+    pub fn payloadBytes(self: Recovery) usize {
+        return self.total_bytes;
+    }
     pub fn retainedCapacity(self: Recovery) usize {
         return self.retained_bytes;
     }

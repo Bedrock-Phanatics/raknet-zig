@@ -13,6 +13,26 @@ const receiver = @import("receiver.zig");
 const transmitter = @import("transmitter.zig");
 pub const FlushResult = transmitter.Sent;
 
+pub const Statistics = struct {
+    mtu: u16,
+    smoothed_rtt_ms: ?u64,
+    retransmission_timeout_ms: u32,
+    congestion_window_bytes: u64,
+    in_flight_bytes: u64,
+    acknowledged_datagrams: u64,
+    lost_datagrams: u64,
+    retransmitted_datagrams: u64,
+    recovery_packets: usize,
+    recovery_payload_bytes: usize,
+    queued_packets: usize,
+    queued_payload_bytes: usize,
+    ordered_packets: usize,
+    ordered_payload_bytes: usize,
+    split_assemblies: usize,
+    split_payload_bytes: usize,
+    retained_payload_capacity_bytes: usize,
+};
+
 var next_send_owner: std.atomic.Value(u64) = .init(1);
 
 pub const Incoming = union(enum) {
@@ -205,23 +225,26 @@ pub const Core = struct {
     send_owner: u64,
     terminal_send_failure: bool = false,
     newest_sent: u32 = 0,
+    acknowledged_datagrams: u64 = 0,
+    lost_datagrams: u64 = 0,
+    retransmitted_datagrams: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, mtu: u16, config: Config) !Core {
         try config.validate();
-        if (mtu < config.minimum_mtu or mtu > config.maximum_mtu) return error.InvalidMtu;
+        if (mtu < config.protocol.minimum_mtu or mtu > config.protocol.maximum_mtu) return error.InvalidMtu;
         var receiver_state = try receiver.Receiver.init(allocator, config);
         errdefer receiver_state.deinit();
-        var recovery_state = try recovery.Recovery.init(allocator, config.maximum_retransmissions, config.maximum_recovery_bytes, 8, mtu);
+        var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, mtu);
         errdefer recovery_state.deinit();
         var outbound_state = try outbound_queue.Queue.init(
             allocator,
-            config.maximum_queued_outbound_packets,
-            config.maximum_queued_outbound_bytes,
-            config.reserved_control_queue_packets,
-            config.reserved_control_queue_bytes,
+            config.session.maximum_queued_outbound_packets,
+            config.session.maximum_queued_outbound_bytes,
+            config.session.reserved_control_queue_packets,
+            config.session.reserved_control_queue_bytes,
         );
         errdefer outbound_state.deinit();
-        const ack_records = try allocator.alloc(ack.Record, config.maximum_ack_records);
+        const ack_records = try allocator.alloc(ack.Record, config.batching.maximum_ack_records);
         return .{
             .allocator = allocator,
             .config = config,
@@ -230,7 +253,7 @@ pub const Core = struct {
             .outbound_state = outbound_state,
             .recovery_state = recovery_state,
             .congestion_state = try congestion.Controller.init(mtu),
-            .rtt_state = try rtt.Estimator.init(config.minimum_rto_ms, config.maximum_rto_ms),
+            .rtt_state = try rtt.Estimator.init(config.timing.minimum_rto_ms, config.timing.maximum_rto_ms),
             .ack_records = ack_records,
             .send_owner = next_send_owner.fetchAdd(1, .monotonic),
         };
@@ -378,6 +401,32 @@ pub const Core = struct {
         return .not_found;
     }
 
+    pub fn statistics(self: *const Core) Statistics {
+        const receiver_state = self.receiver_state;
+        const recovery_capacity = self.recovery_state.retainedCapacity();
+        const ordered_capacity = receiver_state.ordered.retainedCapacity();
+        const split_capacity = receiver_state.splits.retainedCapacity();
+        return .{
+            .mtu = self.transmitter_state.mtu,
+            .smoothed_rtt_ms = if (self.rtt_state.initialized) self.rtt_state.smoothed_ms else null,
+            .retransmission_timeout_ms = self.rtt_state.rto(),
+            .congestion_window_bytes = self.congestion_state.window,
+            .in_flight_bytes = self.congestion_state.in_flight,
+            .acknowledged_datagrams = self.acknowledged_datagrams,
+            .lost_datagrams = self.lost_datagrams,
+            .retransmitted_datagrams = self.retransmitted_datagrams,
+            .recovery_packets = self.recovery_state.count(),
+            .recovery_payload_bytes = self.recovery_state.payloadBytes(),
+            .queued_packets = self.outbound_state.countAll(),
+            .queued_payload_bytes = self.outbound_state.byteCountAll(),
+            .ordered_packets = receiver_state.ordered.count(),
+            .ordered_payload_bytes = receiver_state.ordered.payloadBytes(),
+            .split_assemblies = receiver_state.splits.count(),
+            .split_payload_bytes = receiver_state.splits.payloadBytes(),
+            .retained_payload_capacity_bytes = recovery_capacity +| ordered_capacity +| split_capacity,
+        };
+    }
+
     pub fn flushOutbound(self: *Core, lane: outbound_queue.Lane, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         var total: transmitter.Sent = .{ .datagrams = 0, .wire_bytes = 0 };
@@ -462,8 +511,8 @@ pub const Core = struct {
     }
 
     fn processIncomingImpl(self: *Core, wire: []const u8, now_ms: u64, frame_scratch: ?[]frame.Frame, context: *anyopaque, deliver: receiver.DeliverFn) !ProcessedIncoming {
-        if (wire.len > self.config.maximum_datagram_size) return error.DatagramTooLarge;
-        return switch (try datagram.decode(wire, self.ack_records, self.config.maximum_ack_records, self.config.maximum_acknowledged_datagrams)) {
+        if (wire.len > self.config.protocol.maximum_datagram_size) return error.DatagramTooLarge;
+        return switch (try datagram.decode(wire, self.ack_records, self.config.batching.maximum_ack_records, self.config.protocol.maximum_acknowledged_datagrams)) {
             .data => blk: {
                 const receipt = if (frame_scratch) |scratch|
                     try self.receiver_state.processWithScratch(wire, now_ms, scratch, context, deliver)
@@ -472,13 +521,15 @@ pub const Core = struct {
                 break :blk .{ .incoming = .{ .data = receipt }, .work_units = receipt.workUnits() };
             },
             .ack => |decoded| blk: {
-                const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
+                const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
+                self.acknowledged_datagrams +|= result.packets;
                 if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes);
                 if (result.rtt_sample_ms) |sample| self.rtt_state.observe(sample);
                 break :blk .{ .incoming = .{ .acknowledged = result }, .work_units = 1 + decoded.acknowledged_count };
             },
             .nack => |decoded| blk: {
-                const marked = try self.recovery_state.markNack(decoded.records, now_ms, self.config.maximum_acknowledged_datagrams);
+                const marked = try self.recovery_state.markNack(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
+                self.lost_datagrams +|= marked;
                 if (marked != 0) self.congestion_state.lost(self.newest_sent);
                 break :blk .{ .incoming = .{ .nack_marked = marked }, .work_units = 1 + decoded.acknowledged_count };
             },
@@ -498,10 +549,13 @@ pub const Core = struct {
 
     pub fn collectRetransmissions(self: *Core, now_ms: u64, output: []recovery.Due, maximum_work: usize) recovery.DueBatch {
         const batch = self.recovery_state.collectDue(now_ms, self.rtt_state.rto(), output, maximum_work);
+        self.retransmitted_datagrams +|= batch.items.len;
+        var timed_out: usize = 0;
         for (batch.items) |item| if (item.timed_out) {
+            timed_out += 1;
             self.congestion_state.timeout(self.newest_sent);
-            break;
         };
+        self.lost_datagrams +|= timed_out;
         return batch;
     }
 };
@@ -520,22 +574,31 @@ test "core validates ACKs against actual send state" {
     try std.testing.expectEqual(@as(usize, 1), counted.incoming.acknowledged.packets);
     try std.testing.expectEqual(@as(?u64, 50), counted.incoming.acknowledged.rtt_sample_ms);
     try std.testing.expectEqual(@as(usize, 4), counted.work_units);
+    const statistics = core.statistics();
+    try std.testing.expectEqual(@as(u16, 1200), statistics.mtu);
+    try std.testing.expectEqual(@as(?u64, 50), statistics.smoothed_rtt_ms);
+    try std.testing.expectEqual(@as(u64, 1), statistics.acknowledged_datagrams);
+    try std.testing.expectEqual(@as(u64, 0), statistics.lost_datagrams);
+    try std.testing.expectEqual(@as(usize, 0), statistics.recovery_packets);
+    try std.testing.expectEqual(@as(usize, 0), statistics.recovery_payload_bytes);
+    try std.testing.expectEqual(@as(usize, 0), statistics.queued_packets);
     try std.testing.expectEqual(@as(usize, 0), (try core.processIncoming(wire, 160, &unused, Collector.discard)).acknowledged.packets);
+    try std.testing.expectEqual(@as(u64, 1), core.statistics().acknowledged_datagrams);
 }
 
 test "recovery and outbound queue byte limits are independent" {
     var recovery_limited: Config = .{};
-    recovery_limited.maximum_recovery_bytes = 1;
-    recovery_limited.maximum_queued_outbound_bytes = 1024;
-    recovery_limited.reserved_control_queue_bytes = 128;
+    recovery_limited.session.maximum_recovery_bytes = 1;
+    recovery_limited.session.maximum_queued_outbound_bytes = 1024;
+    recovery_limited.session.reserved_control_queue_bytes = 128;
     var first = try Core.init(std.testing.allocator, 1200, recovery_limited);
     defer first.deinit();
     try std.testing.expectError(error.RecoveryBytesExceeded, first.trackSent(1, "xx", 2, 0));
 
     var queue_limited: Config = .{};
-    queue_limited.maximum_recovery_bytes = 2;
-    queue_limited.maximum_queued_outbound_bytes = 2;
-    queue_limited.reserved_control_queue_bytes = 1;
+    queue_limited.session.maximum_recovery_bytes = 2;
+    queue_limited.session.maximum_queued_outbound_bytes = 2;
+    queue_limited.session.reserved_control_queue_bytes = 1;
     var second = try Core.init(std.testing.allocator, 1200, queue_limited);
     defer second.deinit();
     try second.trackSent(1, "xx", 2, 0);

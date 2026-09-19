@@ -94,6 +94,10 @@ pub const Reassembler = struct {
         return self.assembly_count;
     }
 
+    pub fn payloadBytes(self: Reassembler) usize {
+        return self.total_bytes;
+    }
+
     pub fn retainedCapacity(self: Reassembler) usize {
         return self.retained_bytes;
     }

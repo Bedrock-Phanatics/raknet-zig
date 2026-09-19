@@ -174,6 +174,14 @@ pub const Queue = struct {
     pub fn countAll(self: Queue) usize {
         return self.counts[0] + self.counts[1];
     }
+
+    pub fn byteCount(self: Queue, lane: Lane) usize {
+        return self.bytes[@intFromEnum(lane)];
+    }
+
+    pub fn byteCountAll(self: Queue) usize {
+        return self.total_bytes;
+    }
 };
 
 test "control and application lanes are bounded FIFOs" {
