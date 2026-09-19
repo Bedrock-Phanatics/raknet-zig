@@ -90,3 +90,25 @@ test "request one is stateless, cookie bound, and non-amplifying" {
     try std.testing.expect(action == .response);
     try std.testing.expect(action.response.len <= request.len);
 }
+
+test "handshake floods stay inside rate limits" {
+    var entries: [4]rate.Entry = undefined;
+    var limiter = try rate.Limiter.init(&entries, .{
+        .tokens_per_second = 1,
+        .burst = 4,
+        .global_tokens_per_second = 1,
+        .global_burst = 4,
+    }, 0);
+    const jar: cookie.Jar = .{ .current_key = [_]u8{3} ** 32, .previous_key = [_]u8{4} ** 32 };
+    var handler = try Handler.init(7, 11, 576, 1492, "MCPE;server", jar, &limiter);
+    var request: [548]u8 = @splat(0);
+    request[0] = @intFromEnum(offline.Id.open_connection_request_1);
+    @memcpy(request[1..17], &offline.magic);
+    request[17] = 11;
+    var output: [1492]u8 = undefined;
+    var responses: usize = 0;
+    for (0..10_000) |_| if (handler.handle(&request, "192.0.2.1:19132", 1, 10, 0, &output) == .response) {
+        responses += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 4), responses);
+}

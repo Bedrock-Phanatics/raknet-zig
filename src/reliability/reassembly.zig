@@ -469,3 +469,28 @@ test "split expiry honors a saturated deadline" {
     try std.testing.expectEqual(@as(usize, 1), value.expire(std.math.maxInt(u64), 1).expired);
     try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
 }
+
+test "split boundaries and abandoned IDs can be reused" {
+    var value = try Reassembler.init(std.testing.allocator, .{
+        .maximum_parts = 4,
+        .maximum_bytes = 16,
+        .maximum_concurrent = 2,
+        .maximum_total_bytes = 16,
+        .timeout_ms = 10,
+    });
+    defer value.deinit();
+    try std.testing.expectError(error.InvalidSplit, value.push(7, 0, 0, "x", 0));
+    try std.testing.expectError(error.InvalidSplit, value.push(7, 4, 4, "x", 0));
+    for (0..3) |index| try std.testing.expect((try value.push(7, 4, @intCast(index), "x", 0)) == null);
+    const complete = (try value.push(7, 4, 3, "y", 0)).?;
+    defer complete.deinit();
+    try std.testing.expectEqualStrings("xxxy", complete.bytes);
+    try std.testing.expect((try value.push(7, 2, 0, "a", 1)) == null);
+    try std.testing.expect((try value.push(8, 2, 0, "b", 1)) == null);
+    try std.testing.expectError(error.TooManyAssemblies, value.push(9, 2, 0, "c", 1));
+    try std.testing.expectEqual(@as(usize, 2), value.expire(11, 2).expired);
+    try std.testing.expect((try value.push(7, 2, 0, "n", 12)) == null);
+    const reused = (try value.push(7, 2, 1, "e", 12)).?;
+    defer reused.deinit();
+    try std.testing.expectEqualStrings("ne", reused.bytes);
+}

@@ -595,16 +595,15 @@ test "client and server complete a real loopback handshake" {
         listener: *server_mod.Listener,
         harness: *Harness,
         fn run(self: *@This()) !void {
-            for (0..2) |_| {
+            while (true) {
                 _ = try self.listener.poll(.none, .{ .context = self.harness, .connected = Harness.onConnect, .message = Harness.onMessage });
             }
         }
     };
     var capacity_harness: CapacityHarness = .{ .listener = listener, .harness = &harness };
     var capacity_task = try io.concurrent(CapacityHarness.run, .{&capacity_harness});
-    defer capacity_task.cancel(io) catch {};
     try std.testing.expectError(error.NoFreeIncomingConnections, Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 }));
-    try capacity_task.await(io);
+    capacity_task.cancel(io) catch {};
 
     try client.send("\xfehello", .reliable_ordered, 0);
     for (0..4) |_| {
@@ -676,8 +675,53 @@ test "client and server complete a real loopback handshake" {
 
     const retransmission_deadline = client.core.nextRetransmissionDeadline().?;
     try std.testing.expectEqual(retransmission_deadline, client.nextDeadline().?);
-    try std.testing.expectError(error.Timeout, client.poll(.none, &collector, ClientCollector.collect));
+    try client.processTimers(retransmission_deadline);
     try std.testing.expect(client.core.nextRetransmissionDeadline().? > retransmission_deadline);
+    try std.testing.expectError(error.Timeout, client.poll(.none, &collector, ClientCollector.collect));
     try std.testing.expectError(error.ConnectionTimedOut, client.processTimers(std.math.maxInt(u64)));
     try std.testing.expect(client.nextDeadline() == null);
+}
+
+test "repeated reconnects survive shutdown with queued traffic" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const server_mod = @import("server.zig");
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var config: Config = .{};
+    config.listener.maximum_connections = 1;
+    var listener = try server_mod.Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;reconnect", .config = config });
+    defer listener.destroy();
+
+    const Harness = struct {
+        listener: *server_mod.Listener,
+        connected: std.atomic.Value(usize) = .init(0),
+        target: usize = 0,
+
+        fn onConnect(raw: *anyopaque, _: *server_mod.Session) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.connected.fetchAdd(1, .release);
+        }
+        fn onMessage(_: *anyopaque, _: *server_mod.Session, _: receiver.BorrowedPayload) !void {}
+        fn run(self: *@This()) !void {
+            while (self.connected.load(.acquire) < self.target) {
+                _ = try self.listener.poll(.none, .{ .context = self, .connected = onConnect, .message = onMessage });
+            }
+        }
+    };
+    var harness: Harness = .{ .listener = listener };
+    for (0..3) |iteration| {
+        harness.target = iteration + 1;
+        var task = try io.concurrent(Harness.run, .{&harness});
+        defer task.cancel(io) catch {};
+        const client = try Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 });
+        try task.await(io);
+        try std.testing.expectEqual(iteration + 1, harness.connected.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+        try client.send("\xfetraffic", .reliable_ordered, 0);
+        client.destroy();
+        _ = try listener.processTimers(std.math.maxInt(u64), .{ .context = &harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+        try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    }
 }

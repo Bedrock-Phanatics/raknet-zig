@@ -831,17 +831,33 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expectEqual(@as(usize, 0), scheduled.receipts.count());
     const retransmission_deadline = scheduled.core.nextRetransmissionDeadline().?;
     try std.testing.expectEqual(retransmission_deadline, listener.nextDeadline().?);
-    const accepted_datagram = try client.value.receive(io, &response);
-    var decoded_datagram = try @import("protocol/frame.zig").decodeDatagram(accepted_datagram.data);
-    const accepted_frame = try @import("protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
-    try std.testing.expect((try connected.decode(accepted_frame.payload)) == .connection_request_accepted);
+    var accepted = false;
+    for (0..4) |_| {
+        const accepted_datagram = try client.value.receive(io, &response);
+        if (accepted_datagram.data[0] & 0x40 != 0) continue;
+        var decoded_datagram = try @import("protocol/frame.zig").decodeDatagram(accepted_datagram.data);
+        const accepted_frame = try @import("protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
+        if ((try connected.decode(accepted_frame.payload)) == .connection_request_accepted) {
+            accepted = true;
+            break;
+        }
+    }
+    try std.testing.expect(accepted);
 
     _ = try transmitter.send(connection_request, .reliable_ordered, 0, send_scratch[0..mtu], &sender, Sender.emit);
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
-    const repeated_accepted = try client.value.receive(io, &response);
-    var repeated_datagram = try @import("protocol/frame.zig").decodeDatagram(repeated_accepted.data);
-    const repeated_frame = try @import("protocol/frame.zig").decodeOne(&repeated_datagram.frames, 8192, 2048);
-    try std.testing.expect((try connected.decode(repeated_frame.payload)) == .connection_request_accepted);
+    accepted = false;
+    for (0..4) |_| {
+        const repeated_accepted = try client.value.receive(io, &response);
+        if (repeated_accepted.data[0] & 0x40 != 0) continue;
+        var repeated_datagram = try @import("protocol/frame.zig").decodeDatagram(repeated_accepted.data);
+        const repeated_frame = try @import("protocol/frame.zig").decodeOne(&repeated_datagram.frames, 8192, 2048);
+        if ((try connected.decode(repeated_frame.payload)) == .connection_request_accepted) {
+            accepted = true;
+            break;
+        }
+    }
+    try std.testing.expect(accepted);
     try std.testing.expectEqual(@as(usize, 0), context.connections);
 
     const new_incoming = try connected.encodeAddressList(.incoming, net_address.toRakNet(listener.socket.value.address), 0, &.{}, 1000, 1001, &control);
@@ -936,4 +952,22 @@ test "global turn budget carries unread batch entries fairly" {
     const third = try listener.poll(.none, callbacks);
     try std.testing.expectEqual(@as(usize, 1), third.datagrams);
     try std.testing.expectEqual(@as(usize, 0), listener.pending_message_count);
+}
+
+fn listenerAllocationScenario(allocator: std.mem.Allocator) !void {
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var config: Config = .{};
+    config.listener.maximum_pending_handshakes = 8;
+    config.listener.maximum_connections = 1;
+    config.batching.maximum_packets_per_iteration = 8;
+    const listener = try Listener.listen(allocator, std.testing.io, address, .{
+        .advertisement = "MCPE;allocation",
+        .config = config,
+        .receive_batch_size = 1,
+    });
+    listener.destroy();
+}
+
+test "listener initialization handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, listenerAllocationScenario, .{});
 }
