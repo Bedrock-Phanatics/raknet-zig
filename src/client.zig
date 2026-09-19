@@ -22,6 +22,7 @@ pub const Options = struct {
     handshake_timeout_ms: u32 = 5_000,
     handshake_retry_ms: u32 = 500,
     receive_batch_size: usize = 32,
+    socket_buffers: backend.BufferOptions = .{},
 };
 pub const MessageFn = *const fn (context: *anyopaque, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void;
 
@@ -46,6 +47,7 @@ pub const Client = struct {
     timer_cursor: u8 = 0,
     pending_message_index: usize = 0,
     pending_message_count: usize = 0,
+    pending_receive_error: ?anyerror = null,
     closed: bool = false,
 
     const PollBridge = struct {
@@ -108,7 +110,7 @@ pub const Client = struct {
             .ip4 => .{ .ip4 = .unspecified(0) },
             .ip6 => .{ .ip6 = .unspecified(0) },
         };
-        var socket = try backend.Socket.bind(io, local, options.config.maximum_datagram_size);
+        var socket = try backend.Socket.bindWithBuffers(io, local, options.config.maximum_datagram_size, options.socket_buffers);
         errdefer socket.close();
         const scratch = try allocator.alloc(u8, options.config.maximum_datagram_size);
         errdefer allocator.free(scratch);
@@ -167,6 +169,9 @@ pub const Client = struct {
         return self;
     }
 
+    pub fn kernelBufferSizes(self: *const Client) backend.BufferSizes {
+        return self.socket.kernelBufferSizes();
+    }
     pub fn close(self: *Client) void {
         if (self.closed) return;
         self.closed = true;
@@ -261,6 +266,10 @@ pub const Client = struct {
     /// The payload is valid only during the callback.
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
+        if (self.pending_receive_error) |err| {
+            self.pending_receive_error = null;
+            return err;
+        }
         if (self.pending_message_index == self.pending_message_count) {
             const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
             const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
@@ -272,6 +281,7 @@ pub const Client = struct {
             };
             self.pending_message_index = 0;
             self.pending_message_count = batch.messages.len;
+            self.pending_receive_error = batch.trailing_error;
         }
         var delivered: usize = 0;
         var latest_ms = time.nowMilliseconds(self.io);
@@ -444,6 +454,7 @@ pub const Client = struct {
 
 fn validateOptions(options: Options) !void {
     try options.config.validate();
+    try options.socket_buffers.validate();
     const invalid =
         options.mtu < options.config.minimum_mtu or
         options.mtu > options.config.maximum_mtu or

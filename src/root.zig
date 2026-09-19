@@ -16,6 +16,8 @@ pub const uint24 = @import("util/uint24.zig");
 
 pub const net = struct {
     pub const Socket = @import("net/backend.zig").Socket;
+    pub const BufferOptions = @import("net/backend.zig").BufferOptions;
+    pub const BufferSizes = @import("net/backend.zig").BufferSizes;
 };
 pub const minecraft = struct {
     pub const batch = @import("minecraft/batch.zig");

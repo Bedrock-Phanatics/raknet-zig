@@ -1,4 +1,22 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+pub const BufferOptions = struct {
+    receive_bytes: ?u32 = null,
+    send_bytes: ?u32 = null,
+
+    pub fn validate(self: BufferOptions) !void {
+        const maximum = 256 * 1024 * 1024;
+        if (self.receive_bytes) |value| if (value == 0 or value > maximum) return error.InvalidConfiguration;
+        if (self.send_bytes) |value| if (value == 0 or value > maximum) return error.InvalidConfiguration;
+        if (builtin.os.tag != .linux and (self.receive_bytes != null or self.send_bytes != null)) return error.SocketBufferConfigurationUnsupported;
+    }
+};
+
+pub const BufferSizes = struct {
+    receive_bytes: ?u32,
+    send_bytes: ?u32,
+};
 
 pub const ReceiveBatch = struct {
     messages: []std.Io.net.IncomingMessage,
@@ -10,10 +28,17 @@ pub const Socket = struct {
     io: std.Io,
     value: std.Io.net.Socket,
     maximum_datagram_size: usize,
+    buffer_sizes: BufferSizes,
 
     pub fn bind(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize) !Socket {
+        return bindWithBuffers(io, address, maximum_datagram_size, .{});
+    }
+    pub fn bindWithBuffers(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize, buffers: BufferOptions) !Socket {
         if (maximum_datagram_size == 0 or maximum_datagram_size > 65_507) return error.InvalidConfiguration;
-        return .{ .io = io, .value = try address.bind(io, .{ .mode = .dgram, .protocol = .udp }), .maximum_datagram_size = maximum_datagram_size };
+        try buffers.validate();
+        var value = try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        errdefer value.close(io);
+        return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(value.handle, buffers) };
     }
     pub fn close(self: *Socket) void {
         self.value.close(self.io);
@@ -26,6 +51,9 @@ pub const Socket = struct {
     pub fn sendMany(self: *const Socket, messages: []std.Io.net.OutgoingMessage) !void {
         for (messages) |message| if (message.data_len > self.maximum_datagram_size) return error.DatagramTooLarge;
         try self.value.sendMany(self.io, messages, .{});
+    }
+    pub fn kernelBufferSizes(self: *const Socket) BufferSizes {
+        return self.buffer_sizes;
     }
 
     /// `data_storage` must reserve maximum_datagram_size bytes per message slot.
@@ -61,6 +89,33 @@ pub const Socket = struct {
     }
 };
 
+fn configureBuffers(handle: std.Io.net.Socket.Handle, options: BufferOptions) !BufferSizes {
+    if (builtin.os.tag != .linux) return .{ .receive_bytes = null, .send_bytes = null };
+    if (options.receive_bytes) |value| try setLinuxBuffer(handle, std.os.linux.SO.RCVBUF, value);
+    if (options.send_bytes) |value| try setLinuxBuffer(handle, std.os.linux.SO.SNDBUF, value);
+    return .{
+        .receive_bytes = try getLinuxBuffer(handle, std.os.linux.SO.RCVBUF),
+        .send_bytes = try getLinuxBuffer(handle, std.os.linux.SO.SNDBUF),
+    };
+}
+
+fn setLinuxBuffer(handle: std.Io.net.Socket.Handle, option: u32, value: u32) !void {
+    var native: c_int = @intCast(value);
+    try std.posix.setsockopt(handle, std.os.linux.SOL.SOCKET, option, std.mem.asBytes(&native));
+}
+
+fn getLinuxBuffer(handle: std.Io.net.Socket.Handle, option: u32) !u32 {
+    var value: c_int = 0;
+    var length: std.os.linux.socklen_t = @sizeOf(c_int);
+    const result = std.os.linux.getsockopt(handle, std.os.linux.SOL.SOCKET, option, @ptrCast(&value), &length);
+    switch (std.posix.errno(result)) {
+        .SUCCESS => {},
+        else => return error.SocketOptionQueryFailed,
+    }
+    if (length != @sizeOf(c_int) or value < 0) return error.SocketOptionQueryFailed;
+    return @intCast(value);
+}
+
 test "batched backend receives available loopback datagrams without filling batch" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
@@ -74,4 +129,25 @@ test "batched backend receives available loopback datagrams without filling batc
     const result = try server.receiveMany(&messages, &data, .none);
     try std.testing.expect(result.messages.len >= 1);
     try std.testing.expectEqualStrings("hello", result.messages[0].data);
+}
+
+test "socket buffer options are bounded" {
+    try BufferOptions.validate(.{});
+    try std.testing.expectError(error.InvalidConfiguration, BufferOptions.validate(.{ .receive_bytes = 0 }));
+    try std.testing.expectError(error.InvalidConfiguration, BufferOptions.validate(.{ .send_bytes = 256 * 1024 * 1024 + 1 }));
+}
+
+test "socket reports kernel buffer sizes where supported" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    if (builtin.os.tag != .linux) {
+        try std.testing.expectError(error.SocketBufferConfigurationUnsupported, Socket.bindWithBuffers(io, address, 64, .{ .receive_bytes = 64 * 1024 }));
+        return;
+    }
+    var socket = try Socket.bindWithBuffers(io, address, 64, .{ .receive_bytes = 64 * 1024, .send_bytes = 64 * 1024 });
+    defer socket.close();
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(socket.kernelBufferSizes().receive_bytes.? >= 64 * 1024);
+        try std.testing.expect(socket.kernelBufferSizes().send_bytes.? >= 64 * 1024);
+    }
 }

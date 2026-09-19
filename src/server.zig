@@ -28,6 +28,7 @@ pub const Options = struct {
     protocol_version: u8 = 11,
     advertisement: []const u8,
     receive_batch_size: usize = 32,
+    socket_buffers: backend.BufferOptions = .{},
     offline_rate_per_second: u32 = 20,
     offline_burst: u32 = 40,
     global_offline_rate_per_second: u32 = 20_000,
@@ -361,7 +362,7 @@ pub const Listener = struct {
         try validateOptions(options);
         const self = try allocator.create(Listener);
         errdefer allocator.destroy(self);
-        var socket = try backend.Socket.bind(io, address, options.config.maximum_datagram_size);
+        var socket = try backend.Socket.bindWithBuffers(io, address, options.config.maximum_datagram_size, options.socket_buffers);
         errdefer socket.close();
         const advertisement = try allocator.dupe(u8, options.advertisement);
         errdefer allocator.free(advertisement);
@@ -426,6 +427,9 @@ pub const Listener = struct {
         return self;
     }
 
+    pub fn kernelBufferSizes(self: *const Listener) backend.BufferSizes {
+        return self.socket.kernelBufferSizes();
+    }
     pub fn close(self: *Listener) void {
         if (self.closed) return;
         var iterator = self.sessions.valueIterator();
@@ -476,6 +480,7 @@ pub const Listener = struct {
                 else => return err,
             };
             stats.malformed += batch.dropped_oversize;
+            stats.transport_failures += @intFromBool(batch.trailing_error != null);
             self.pending_message_index = 0;
             self.pending_message_count = batch.messages.len;
         }
@@ -670,6 +675,7 @@ pub const Listener = struct {
 
 fn validateOptions(options: Options) !void {
     try options.config.validate();
+    try options.socket_buffers.validate();
     const invalid =
         options.receive_batch_size == 0 or
         options.receive_batch_size > 256 or
