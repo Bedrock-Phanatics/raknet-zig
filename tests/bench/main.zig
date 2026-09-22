@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const batch_bench = @import("batch.zig");
 const raknet = @import("raknet");
 const ack = raknet.advanced.protocol.ack;
 const frame = raknet.advanced.protocol.frame;
@@ -12,32 +14,65 @@ const receipt_batch = raknet.advanced.session.receipt_batch;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const records = [_]ack.Record{ .{ .first = 1, .last = 64 }, .{ .first = 100, .last = 300 } };
-    var ack_wire: [64]u8 = undefined;
-    const encoded_ack = try ack.encode(&records, &ack_wire);
+    const sample_count = 64;
+    var ack_wires: [sample_count][64]u8 = undefined;
+    var ack_lengths: [sample_count]usize = undefined;
+    var frame_wires: [sample_count][64]u8 = undefined;
+    var frame_lengths: [sample_count]usize = undefined;
+    for (0..sample_count) |index| {
+        const first: u32 = @intCast(index * 37 + 1);
+        const records = [_]ack.Record{ .{ .first = first, .last = first + 15 }, .{ .first = first + 32, .last = first + 63 } };
+        ack_lengths[index] = (try ack.encode(&records, &ack_wires[index])).len;
+        var payload: [8]u8 = undefined;
+        for (&payload, 0..) |*byte, offset| byte.* = @truncate(index *% 17 +% offset);
+        var writer: cursor.Writer = .{ .data = &frame_wires[index] };
+        try frame.encode(.{ .reliability = .reliable_ordered, .reliable_index = first, .order_index = first, .order_channel = @intCast(index & 3), .payload = &payload }, &writer);
+        frame_lengths[index] = writer.written().len;
+    }
+    var frame_values: [sample_count]frame.Frame = undefined;
+    for (0..sample_count) |index| {
+        var reader: cursor.Reader = .{ .data = frame_wires[index][0..frame_lengths[index]] };
+        frame_values[index] = try frame.decodeOne(&reader, 1492, 128);
+    }
+    var encoded_frame: [64]u8 = undefined;
+    std.mem.doNotOptimizeAway(&ack_wires);
+    std.mem.doNotOptimizeAway(&frame_wires);
     var ack_storage: [16]ack.Record = undefined;
     const iterations: usize = 2_000_000;
-    var start = std.Io.Clock.awake.now(io);
     var checksum: usize = 0;
-    for (0..iterations) |_| {
-        const decoded = try ack.decode(encoded_ack, &ack_storage, 16, 4096);
-        checksum +%= decoded.acknowledged_count;
+    var start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |iteration| {
+        const index = iteration & (sample_count - 1);
+        checksum +%= ack_lengths[index];
+        std.mem.doNotOptimizeAway(ack_wires[index][0]);
+    }
+    const loop_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |iteration| {
+        const index = iteration & (sample_count - 1);
+        const decoded = try ack.decode(ack_wires[index][0..ack_lengths[index]], &ack_storage, 16, 4096);
+        for (decoded.records) |record| checksum +%= record.first +% record.last;
         std.mem.doNotOptimizeAway(decoded.records.ptr);
     }
     const ack_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     start = std.Io.Clock.awake.now(io);
 
-    var frame_wire: [64]u8 = undefined;
-    var writer: cursor.Writer = .{ .data = &frame_wire };
-    try frame.encode(.{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 1, .order_channel = 0, .payload = "bedrock" }, &writer);
-    const encoded_frame = writer.written();
-    for (0..iterations) |_| {
-        var reader: cursor.Reader = .{ .data = encoded_frame };
+    for (0..iterations) |iteration| {
+        const index = iteration & (sample_count - 1);
+        var reader: cursor.Reader = .{ .data = frame_wires[index][0..frame_lengths[index]] };
         const decoded = try frame.decodeOne(&reader, 1492, 128);
-        checksum +%= decoded.payload.len;
-        std.mem.doNotOptimizeAway(decoded.payload.ptr);
+        checksum +%= consumeFrame(decoded);
     }
     const frame_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+    start = std.Io.Clock.awake.now(io);
+    for (0..iterations) |iteration| {
+        const index = iteration & (sample_count - 1);
+        var writer: cursor.Writer = .{ .data = &encoded_frame };
+        try frame.encode(frame_values[index], &writer);
+        for (writer.written()) |byte| checksum +%= byte;
+        std.mem.doNotOptimizeAway(&encoded_frame);
+    }
+    const frame_encode_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     start = std.Io.Clock.awake.now(io);
 
     var slots: [4096]bool = undefined;
@@ -171,6 +206,17 @@ pub fn main(init: std.process.Init) !void {
     const ack_delay_10 = benchmarkAckBatching(io, ack_batch_messages, 11);
     checksum +%= ack_singleton.checksum +% ack_input_batch.checksum +% ack_delay_0.checksum +% ack_delay_1.checksum +% ack_delay_2.checksum +% ack_delay_5.checksum +% ack_delay_10.checksum;
 
+    std.debug.print("benchmark: os={s} arch={s} cpu={s} mode={s} zig={s} codec_samples={d} codec_iterations={d}\ncodec_loop: {d:.2} ns/op\n", .{
+        @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+        builtin.cpu.model.name,
+        @tagName(builtin.mode),
+        builtin.zig_version_string,
+        sample_count,
+        iterations,
+        @as(f64, @floatFromInt(loop_ns)) / @as(f64, @floatFromInt(iterations)),
+    });
+    std.debug.print("frame_encode: {d:.2} ns/op\n", .{@as(f64, @floatFromInt(frame_encode_ns)) / @as(f64, @floatFromInt(iterations))});
     std.debug.print(
         "ack_decode: {d:.2} ns/op\nframe_decode: {d:.2} ns/op\nwindow_add: {d:.2} ns/op\n" ++
             "deadline_reschedule_4096: {d:.2} ns/op\n" ++
@@ -252,7 +298,12 @@ pub fn main(init: std.process.Init) !void {
             ack_delay_10.datagrams,
         },
     );
-    const receive_batch_sizes = [_]usize{ 1, 4, 8, 16, 32, 64, 128 };
+    try batch_bench.run(io);
+    const receive_batch_sizes: []const usize = if (builtin.os.tag == .windows)
+        &.{1}
+    else
+        &.{ 1, 4, 8, 16, 32, 64, 128 };
+    if (builtin.os.tag == .windows) std.debug.print("receive_batch: Windows backend returns one message per call\n", .{});
     for (receive_batch_sizes) |batch_size| {
         const measurement = try benchmarkReceiveBatch(io, batch_size, 4096);
         checksum +%= measurement.checksum;
@@ -595,7 +646,8 @@ fn parseDescriptors(wire: []const u8, scratch: []frame.Frame) !usize {
 }
 
 fn consumeFrame(value: frame.Frame) usize {
-    var result = value.payload.len + value.payload[0];
+    var result = value.payload.len;
+    for (value.payload) |byte| result +%= byte;
     if (value.reliable_index) |index| result +%= index;
     if (value.order_index) |index| result +%= index;
     if (value.order_channel) |channel| result +%= channel;
