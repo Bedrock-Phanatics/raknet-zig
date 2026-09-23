@@ -299,6 +299,12 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     try batch_bench.run(io);
+    const send_single_ns = try benchmarkSend(io, false);
+    const send_many_ns = try benchmarkSend(io, true);
+    std.debug.print("send_single_2: {d:.2} ns/message\nsend_many_2: {d:.2} ns/message\n", .{
+        @as(f64, @floatFromInt(send_single_ns)) / 4096.0,
+        @as(f64, @floatFromInt(send_many_ns)) / 4096.0,
+    });
     const receive_batch_sizes: []const usize = if (builtin.os.tag == .windows)
         &.{1}
     else
@@ -517,6 +523,44 @@ fn benchmarkAckBatching(io: std.Io, message_count: usize, group_size: usize) Ack
     }
     const nanoseconds: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
     return .{ .nanoseconds = nanoseconds, .datagrams = datagrams_count, .checksum = checksum };
+}
+
+fn benchmarkSend(io: std.Io, batched: bool) !u64 {
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var receiver = try raknet.advanced.net.Socket.bind(io, address, 64);
+    defer receiver.close();
+    var sender = try raknet.advanced.net.Socket.bind(io, address, 64);
+    defer sender.close();
+    var payloads: [2][8]u8 = undefined;
+    var outgoing: [2]std.Io.net.OutgoingMessage = undefined;
+    var incoming: [2]std.Io.net.IncomingMessage = undefined;
+    var storage: [128]u8 = undefined;
+    var send_ns: u64 = 0;
+    for (0..2048) |wave| {
+        for (&payloads, 0..) |*payload, index| {
+            std.mem.writeInt(u64, payload, wave * 2 + index, .little);
+            outgoing[index] = .{ .address = &receiver.value.address, .data_ptr = payload, .data_len = payload.len };
+        }
+        const started = std.Io.Clock.awake.now(io);
+        if (batched) {
+            try sender.sendMany(&outgoing);
+        } else {
+            for (payloads) |payload| try sender.send(receiver.value.address, &payload);
+        }
+        send_ns += @intCast(started.durationTo(std.Io.Clock.awake.now(io)).nanoseconds);
+        var received: usize = 0;
+        var sum: u64 = 0;
+        while (received < 2) {
+            const batch = try receiver.receiveMany(&incoming, &storage, .none);
+            for (batch.messages) |message| {
+                if (message.data.len != 8) return error.BenchmarkDatagramMismatch;
+                sum +%= std.mem.readInt(u64, message.data[0..8], .little);
+                received += 1;
+            }
+        }
+        if (sum != wave * 4 + 1) return error.BenchmarkDatagramMismatch;
+    }
+    return send_ns;
 }
 
 fn benchmarkReceiveBatch(io: std.Io, batch_size: usize, message_count: usize) !ReceiveBatchMeasurement {
