@@ -91,12 +91,14 @@ pub const Client = struct {
             const self: *HandshakeState = @ptrCast(@alignCast(raw));
             const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
             if (packet != .connection_request_accepted) return;
-            var wire: [512]u8 = undefined;
+            var wire: [1024]u8 = undefined;
+            const server = net_address.toRakNet(self.client.server);
+            const systems: [20]@TypeOf(server) = @splat(net_address.unspecified(server));
             const incoming = connected.encodeAddressList(
                 .incoming,
-                net_address.toRakNet(self.client.server),
+                server,
                 0,
-                &.{},
+                &systems,
                 self.now_ms,
                 self.now_ms,
                 &wire,
@@ -822,7 +824,6 @@ test "graceful client close delivers queued data before the disconnect" {
         };
     }
     try std.testing.expect(client.isClosed());
-    // Closed by the disconnect ACK, not by the shutdown deadline.
     try std.testing.expect(time.nowMilliseconds(io) - started_ms < client.core.config.timing.shutdown_timeout_ms);
     try std.testing.expectEqual(@as(usize, 0), client.core.recovery_state.count());
     try std.testing.expectEqual(@as(usize, 0), client.core.outbound_state.countAll());

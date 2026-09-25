@@ -9,7 +9,7 @@ pub const ProtocolLimits = struct {
     receive_window: usize = 4096,
     reliable_window: usize = 4096,
     maximum_order_channels: usize = 32,
-    maximum_split_parts: usize = 2048,
+    maximum_split_parts: usize = 8192,
     maximum_split_bytes: usize = 4 * 1024 * 1024,
 
     fn validate(self: ProtocolLimits) !void {
@@ -29,8 +29,9 @@ pub const SessionLimits = struct {
     maximum_recovery_bytes: usize = 16 * 1024 * 1024,
     maximum_ordered_packets: usize = 4096,
     maximum_ordered_bytes: usize = 16 * 1024 * 1024,
-    maximum_concurrent_splits: usize = 16,
+    maximum_concurrent_splits: usize = 64,
     maximum_split_bytes_per_connection: usize = 16 * 1024 * 1024,
+    maximum_split_parts_per_connection: usize = 16384,
     maximum_queued_outbound_packets: usize = 256,
     maximum_queued_outbound_bytes: usize = 16 * 1024 * 1024,
     reserved_control_queue_packets: usize = 16,
@@ -100,6 +101,7 @@ pub const Config = struct {
         try self.timing.validate();
         try self.batching.validate();
         if (self.session.maximum_split_bytes_per_connection < self.protocol.maximum_split_bytes) return error.InvalidConfiguration;
+        if (self.session.maximum_split_parts_per_connection < self.protocol.maximum_split_parts) return error.InvalidConfiguration;
     }
 };
 

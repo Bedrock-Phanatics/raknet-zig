@@ -141,3 +141,23 @@ test "variable system-address lists preserve timestamps" {
     try std.testing.expectEqual(@as(usize, 1), value.system_address_count);
     try std.testing.expectEqual(@as(u64, 12), value.pong_time);
 }
+
+test "system address lists accept variable counts in either family" {
+    const v4: offline.Address = .{ .ipv4 = .{ .octets = .{ 192, 0, 2, 1 }, .port = 19132 } };
+    const v6: offline.Address = .{ .ipv6 = .{ .octets = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ .{1}, .port = 19132 } };
+    var bytes: [1024]u8 = undefined;
+    for ([_]offline.Address{ v4, v6 }) |primary| {
+        for ([_]usize{ 0, 1, 10, 20 }) |count| {
+            const systems: [20]offline.Address = @splat(primary);
+            const wire = try encodeAddressList(.incoming, primary, 0, systems[0..count], 5, 6, &bytes);
+            const value = (try decode(wire)).new_incoming_connection;
+            try std.testing.expectEqual(count, value.system_address_count);
+            try std.testing.expectEqual(primary, value.primary);
+            if (count != 0) try std.testing.expectEqual(primary, value.system_addresses[count - 1]);
+            try std.testing.expectEqual(@as(u64, 6), value.pong_time);
+            try std.testing.expect(std.meta.isError(decode(wire[0 .. wire.len - 1])));
+        }
+    }
+    const systems: [21]offline.Address = @splat(v6);
+    try std.testing.expectError(error.TooManySystemAddresses, encodeAddressList(.accepted, v4, 0, &systems, 0, 0, &bytes));
+}

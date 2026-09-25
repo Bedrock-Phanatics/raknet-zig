@@ -115,16 +115,18 @@ pub fn classifyIncomingError(err: anyerror) IncomingFailure {
         error.DatagramWindowExceeded,
         => .{ .class = .protocol, .disposition = .reject },
 
+        error.TooManyAssemblies,
+        error.SplitBudgetExceeded,
+        => .{ .class = .resource, .disposition = .reject },
+
         error.PeerProtocolFailure,
         error.ReliableWindowExceeded,
         error.OrderWindowExceeded,
-        error.SplitIdCollision,
         error.ConflictingFragment,
         => .{ .class = .protocol, .disposition = .close_session },
 
         error.OutOfMemory,
         error.ResourceLimitFailure,
-        error.TooManyAssemblies,
         error.ReassemblyLimitExceeded,
         error.OrderQueueFull,
         error.OrderBytesExceeded,
@@ -481,21 +483,16 @@ pub const Core = struct {
         }
         return total;
     }
-    /// Flushes the control lane before application data.
     pub fn flushAllOutbound(self: *Core, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         const control = try self.flushOutbound(.control, scratch, maximum_datagrams, now_ms, context, emit);
         const application = try self.flushOutbound(.application, scratch, maximum_datagrams - control.datagrams, now_ms, context, emit);
         return .{ .datagrams = control.datagrams + application.datagrams, .wire_bytes = control.wire_bytes + application.wire_bytes };
     }
 
-    /// Starts a graceful close. Repeated calls keep the first deadline.
     pub fn beginClose(self: *Core, now_ms: u64) void {
         if (self.close_deadline_ms == null) self.close_deadline_ms = now_ms +| self.config.timing.shutdown_timeout_ms;
     }
 
-    /// Queues the disconnect once all prior data is acknowledged, then reports `done`
-    /// once the disconnect itself is acknowledged or the shutdown deadline passes.
-    /// The disconnect rides the normal queue, recovery, and retransmission paths.
     pub fn advanceClose(self: *Core, now_ms: u64) !CloseStep {
         const deadline = self.close_deadline_ms orelse return .pending;
         if (now_ms >= deadline) return .done;
@@ -854,6 +851,10 @@ test "incoming failures keep their origin and commit safety" {
     try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.DatagramWindowExceeded));
     try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ReliableWindowExceeded));
     try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.OrderQueueFull));
+    try std.testing.expectEqual(IncomingFailure{ .class = .resource, .disposition = .reject }, classifyIncomingError(error.TooManyAssemblies));
+    try std.testing.expectEqual(IncomingFailure{ .class = .resource, .disposition = .reject }, classifyIncomingError(error.SplitBudgetExceeded));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ReassemblyLimitExceeded));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ConflictingFragment));
 
     try std.testing.expect(deliverySendFailure(error.OutOfMemory) == error.ResourceLimitFailure);
     try std.testing.expect(deliverySendFailure(error.TransportFailure) == error.TransportFailure);
@@ -917,7 +918,6 @@ const ClosePeer = struct {
         _ = try core.processIncoming(try datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire), now_ms, &unused, Discard.deliver);
     }
 
-    /// Drives `advanceClose` the way owners do and returns the step taken.
     fn step(self: *@This(), core: *Core, now_ms: u64) !CloseStep {
         const result = try core.advanceClose(now_ms);
         var scratch: [576]u8 = undefined;
@@ -963,7 +963,6 @@ test "close drains queued application and control data before the disconnect" {
         var scratch: [576]u8 = undefined;
         _ = try core.flushAllOutbound(&scratch, 8, 0, &peer, ClosePeer.emit);
         try std.testing.expect(peer.count != 0 and !peer.disconnects[0]);
-        // Queued data is sent but still in recovery, so the disconnect waits.
         try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 1));
         for (0..peer.count) |index| try peer.acknowledge(&core, index, 2);
         const data_datagrams = peer.count;
@@ -988,7 +987,6 @@ test "close waits for outstanding reliable data and retransmits a lost disconnec
     try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 10));
     try std.testing.expect(peer.disconnects[1]);
 
-    // The first disconnect is lost; the normal recovery path resends it.
     const deadline = core.nextRetransmissionDeadline().?;
     var due: [4]recovery.Due = undefined;
     const batch = core.collectRetransmissions(deadline, &due, 4);

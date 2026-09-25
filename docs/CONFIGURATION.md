@@ -22,7 +22,7 @@ Default origins are:
 | `receive_window` | 4,096 packets | Session | Reference | Allocates one receive bit per slot; large jumps are rejected. |
 | `reliable_window` | 4,096 packets | Session | Reference | Allocates one reliable bit per slot; large jumps close the session. |
 | `maximum_order_channels` | 32 | Session | Compatibility | Allocates per-channel state; larger channel IDs are rejected. |
-| `maximum_split_parts` | 2,048 | Session | Policy | Bounds fragment metadata and rejects larger split counts. |
+| `maximum_split_parts` | 8,192 | Session | Compatibility | Rejects larger split counts. |
 | `maximum_split_bytes` | 4 MiB | Message | Policy | Rejects larger outbound or reassembled messages. |
 
 ## Session limits
@@ -33,8 +33,9 @@ Default origins are:
 | `maximum_recovery_bytes` | 16 MiB | Session | Policy | Independently caps retained wire data; excess sends fail. |
 | `maximum_ordered_packets` | 4,096 packets | Session | Policy | Preallocates ordered metadata; excess packets close the session. |
 | `maximum_ordered_bytes` | 16 MiB | Session | Policy | Caps buffered out-of-order payload; excess closes the session. |
-| `maximum_concurrent_splits` | 16 | Session | Policy | Preallocates assembly metadata; excess assemblies are rejected. |
-| `maximum_split_bytes_per_connection` | 16 MiB | Session | Policy | Caps all incomplete fragment payloads; excess closes the session. |
+| `maximum_concurrent_splits` | 64 | Session | Policy | Preallocates assembly slots; a new assembly beyond it is left unacknowledged for retry. |
+| `maximum_split_bytes_per_connection` | 16 MiB | Session | Policy | Caps all incomplete fragment payloads; excess fragments are left unacknowledged for retry. |
+| `maximum_split_parts_per_connection` | 16,384 | Session | Policy | Caps fragment metadata across assemblies; excess assemblies are left unacknowledged for retry. |
 | `maximum_queued_outbound_packets` | 256 packets | Session | Policy | Preallocates queue slots; excess application sends return backpressure. |
 | `maximum_queued_outbound_bytes` | 16 MiB | Session | Policy | Caps queued owned payloads; excess application sends return backpressure. |
 | `reserved_control_queue_packets` | 16 packets | Session | Policy | Reserves existing queue slots for control traffic. |
@@ -63,6 +64,7 @@ All timing values use monotonic milliseconds.
 | `idle_timeout_ms` | 10,000 ms | Session | Policy | Idle sessions are closed. |
 | `minimum_rto_ms` | 50 ms | Session | Compatibility | Lower RTT estimates are clamped. |
 | `maximum_rto_ms` | 5,000 ms | Session | Compatibility | Higher retransmission delays are clamped. |
+| `shutdown_timeout_ms` | 5,000 ms | Session | Compatibility | A local close that is not acknowledged by then is forced. |
 
 ## Batching
 

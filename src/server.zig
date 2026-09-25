@@ -62,7 +62,7 @@ const DeliveryBridge = struct {
             .connection_request => |request| {
                 var wire: [1024]u8 = undefined;
                 const remote = net_address.toRakNet(self.session.address);
-                var systems: [20]offline.Address = @splat(emptyAddress(remote));
+                var systems: [20]offline.Address = @splat(net_address.unspecified(remote));
                 const accepted = connected.encodeAddressList(.accepted, remote, 0, &systems, request.request_time, self.now_ms, &wire) catch return error.InternalFailure;
                 self.session.sendControl(accepted, .reliable_ordered, self.now_ms) catch |err| return core_mod.deliverySendFailure(err);
             },
@@ -176,9 +176,6 @@ pub const Session = struct {
     pub fn statistics(self: *const Session) core_mod.Statistics {
         return self.core.statistics();
     }
-    /// Rejects new sends, drains queued and in-flight reliable data, then sends a
-    /// reliable disconnect. The listener removes the session once it is acknowledged
-    /// or `shutdown_timeout_ms` passes.
     pub fn close(self: *Session) void {
         const now_ms = time.nowMilliseconds(self.socket.io);
         switch (self.state) {
@@ -191,7 +188,6 @@ pub const Session = struct {
         self.advanceClose(now_ms) catch return self.closeAt(now_ms);
         self.schedule() catch self.closeAt(now_ms);
     }
-    /// Best-effort single notification for an immediate teardown.
     fn closeNow(self: *Session) void {
         const now_ms = time.nowMilliseconds(self.socket.io);
         if ((self.state == .connected or self.state == .closing) and !self.core.disconnect_queued) {
@@ -627,7 +623,7 @@ pub const Listener = struct {
             remaining.* = 0;
             const failure = core_mod.classifyIncomingError(err);
             if (failure.disposition == .reject) {
-                stats.malformed += 1;
+                if (failure.class == .resource) stats.rate_limited_or_dropped += 1 else stats.malformed += 1;
                 return;
             }
 
@@ -757,13 +753,6 @@ fn isOfflineHandshake(data: []const u8) bool {
         @intFromEnum(offline.Id.open_connection_request_2),
         => true,
         else => false,
-    };
-}
-
-fn emptyAddress(address: offline.Address) offline.Address {
-    return switch (address) {
-        .ipv4 => .{ .ipv4 = .{ .octets = .{ 0, 0, 0, 0 }, .port = 0 } },
-        .ipv6 => .{ .ipv6 = .{ .octets = @splat(0), .port = 0 } },
     };
 }
 
@@ -959,7 +948,6 @@ const CloseHarness = struct {
     }
 
     const Received = struct { sequence: u32, disconnect: bool };
-    /// Reads the next data datagram sent to `peer`, skipping ACKs.
     fn receive(peer: *backend.Socket) !Received {
         var storage: [576]u8 = undefined;
         while (true) {
@@ -994,8 +982,6 @@ test "graceful session close drains data and retransmits the disconnect until AC
     try std.testing.expectError(error.NotConnected, session.queueSend("\xfelate", .reliable_ordered, 0));
     try std.testing.expectError(error.NotConnected, session.send("\xfelate", .reliable_ordered, 0));
 
-    // The disconnect waits until the final application packet is acknowledged.
-    // Queued data still drains through the normal outbound timer while closing.
     try std.testing.expectEqual(@as(usize, 1), session.core.outbound_state.countAll());
     _ = try listener.processTimers(session.outbound_deadline_ms.?, harness.callbacks());
     const data = try CloseHarness.receive(&peer);
@@ -1005,7 +991,6 @@ test "graceful session close drains data and retransmits the disconnect until AC
     const disconnect = try CloseHarness.receive(&peer);
     try std.testing.expect(disconnect.disconnect);
 
-    // The first disconnect is lost and resent by the normal retransmission timer.
     _ = try listener.processTimers(session.core.nextRetransmissionDeadline().?, harness.callbacks());
     const resent = try CloseHarness.receive(&peer);
     try std.testing.expect(resent.disconnect);

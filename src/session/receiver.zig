@@ -49,6 +49,7 @@ pub const Receiver = struct {
             .maximum_bytes = config.protocol.maximum_split_bytes,
             .maximum_concurrent = config.session.maximum_concurrent_splits,
             .maximum_total_bytes = config.session.maximum_split_bytes_per_connection,
+            .maximum_total_parts = config.session.maximum_split_parts_per_connection,
             .timeout_ms = config.timing.split_timeout_ms,
         });
         errdefer splits.deinit();
@@ -221,6 +222,7 @@ pub const Receiver = struct {
     }
 
     fn deliverPayload(context: *anyopaque, payload: []const u8, deliver: DeliverFn) !void {
+        if (payload.len == 0) return;
         try deliver(context, .init(payload));
     }
     fn previewReliable(self: *const Receiver, reliable_index: ?u32) !bool {
@@ -784,4 +786,118 @@ fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "split receive state survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSplitReceiveAllocationFailures, .{});
+}
+
+const TestCollector = struct {
+    values: [8][16]u8 = undefined,
+    lengths: [8]usize = @splat(0),
+    count: usize = 0,
+    fn deliver(raw: *anyopaque, payload: BorrowedPayload) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (payload.bytes.len == 0) return error.ApplicationFailure;
+        @memcpy(self.values[self.count][0..payload.bytes.len], payload.bytes);
+        self.lengths[self.count] = payload.bytes.len;
+        self.count += 1;
+    }
+    fn get(self: *const @This(), index: usize) []const u8 {
+        return self.values[index][0..self.lengths[index]];
+    }
+};
+
+fn testDatagram(sequence: u32, frames: []const frame.Frame, storage: []u8) ![]u8 {
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = storage };
+    try writer.byte(0x84);
+    try writer.u24le(sequence);
+    for (frames) |value| {
+        if (value.payload.len != 0) {
+            try frame.encode(value, &writer);
+            continue;
+        }
+        const start = writer.offset;
+        var padded = value;
+        padded.payload = "x";
+        try frame.encode(padded, &writer);
+        writer.offset -= 1;
+        storage[start + 1] = 0;
+        storage[start + 2] = 0;
+    }
+    return writer.written();
+}
+
+test "split pressure leaves the datagram unacknowledged so the sender can retry" {
+    var config: Config = .{};
+    config.protocol.maximum_split_parts = 4;
+    config.session.maximum_concurrent_splits = 1;
+    var receiver = try Receiver.init(std.testing.allocator, config);
+    defer receiver.deinit();
+    var collector: TestCollector = .{};
+    var storage: [128]u8 = undefined;
+
+    const first = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .split = .{ .count = 2, .id = 1, .index = 0 }, .payload = "ab" }};
+    _ = try receiver.process(try testDatagram(0, &first, &storage), 0, &collector, TestCollector.deliver);
+    const second = [_]frame.Frame{
+        .{ .reliability = .reliable, .reliable_index = 1, .payload = "\xfeside" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 2, .order_index = 1, .order_channel = 0, .split = .{ .count = 2, .id = 2, .index = 0 }, .payload = "cd" },
+    };
+    var second_storage: [128]u8 = undefined;
+    const second_wire = try testDatagram(1, &second, &second_storage);
+    try std.testing.expectError(error.TooManyAssemblies, receiver.process(second_wire, 1, &collector, TestCollector.deliver));
+    try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
+    try std.testing.expectEqual(@as(usize, 1), receiver.splits.count());
+
+    const finish = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 3, .order_index = 0, .order_channel = 0, .split = .{ .count = 2, .id = 1, .index = 1 }, .payload = "!" }};
+    _ = try receiver.process(try testDatagram(2, &finish, &storage), 2, &collector, TestCollector.deliver);
+    _ = try receiver.process(second_wire, 3, &collector, TestCollector.deliver);
+    const last = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 4, .order_index = 1, .order_channel = 0, .split = .{ .count = 2, .id = 2, .index = 1 }, .payload = "e" }};
+    _ = try receiver.process(try testDatagram(3, &last, &storage), 4, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(usize, 3), collector.count);
+    try std.testing.expectEqualStrings("\xfeside", collector.get(0));
+    try std.testing.expectEqualStrings("ab!", collector.get(1));
+    try std.testing.expectEqualStrings("cde", collector.get(2));
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.count());
+}
+
+test "zero-length frames consume ordering state without delivery" {
+    var receiver = try Receiver.init(std.testing.allocator, .{});
+    defer receiver.deinit();
+    var collector: TestCollector = .{};
+    var storage: [128]u8 = undefined;
+    const frames = [_]frame.Frame{
+        .{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 1, .order_channel = 0, .payload = "after" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .payload = "" },
+        .{ .reliability = .unreliable, .payload = "" },
+        .{ .reliability = .reliable, .reliable_index = 2, .split = .{ .count = 2, .id = 3, .index = 0 }, .payload = "" },
+        .{ .reliability = .reliable, .reliable_index = 3, .split = .{ .count = 2, .id = 3, .index = 1 }, .payload = "split" },
+    };
+    const receipt = try receiver.process(try testDatagram(0, &frames, &storage), 0, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(?u32, 0), receipt.acknowledge);
+    try std.testing.expectEqual(@as(usize, 2), collector.count);
+    try std.testing.expectEqualStrings("after", collector.get(0));
+    try std.testing.expectEqualStrings("split", collector.get(1));
+    try std.testing.expectEqual(@as(u32, 2), try receiver.ordered.expectedIndex(0));
+    try std.testing.expectEqual(@as(u32, 4), receiver.reliable.expected);
+}
+
+test "ordered and reliable indices cross the 24-bit wrap" {
+    var receiver = try Receiver.init(std.testing.allocator, .{});
+    defer receiver.deinit();
+    receiver.reliable = try receive_window.Window.init(receiver.reliable_storage, 0xfffffe);
+    receiver.ordered.channels[0].expected = 0xfffffe;
+    var collector: TestCollector = .{};
+    var storage: [128]u8 = undefined;
+    const frames = [_]frame.Frame{
+        .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .payload = "third" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 0xffffff, .order_index = 0xffffff, .order_channel = 0, .payload = "second" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 0xfffffe, .order_index = 0xfffffe, .order_channel = 0, .payload = "first" },
+    };
+    _ = try receiver.process(try testDatagram(0, &frames, &storage), 0, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(usize, 3), collector.count);
+    try std.testing.expectEqualStrings("first", collector.get(0));
+    try std.testing.expectEqualStrings("second", collector.get(1));
+    try std.testing.expectEqualStrings("third", collector.get(2));
+    try std.testing.expectEqual(@as(u32, 1), try receiver.ordered.expectedIndex(0));
+    try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
+    const replay = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0xffffff, .order_index = 0xffffff, .order_channel = 0, .payload = "second" }};
+    _ = try receiver.process(try testDatagram(1, &replay, &storage), 1, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(usize, 3), collector.count);
 }
