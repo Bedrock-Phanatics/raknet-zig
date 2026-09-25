@@ -51,6 +51,7 @@ pub const Client = struct {
     pending_message_index: usize = 0,
     pending_message_count: usize = 0,
     pending_receive_error: ?anyerror = null,
+    closing: bool = false,
     closed: bool = false,
 
     const PollBridge = struct {
@@ -75,7 +76,7 @@ pub const Client = struct {
                     const ping = connected.encodePing(self.now_ms, &wire) catch return error.InternalFailure;
                     _ = self.client.sendControlWire(ping, .reliable, 0, self.now_ms) catch |err| return core_mod.deliverySendFailure(err);
                 },
-                .user => |data| self.callback(self.context, .init(data)) catch return error.ApplicationFailure,
+                .user => |data| if (!self.client.closing) self.callback(self.context, .init(data)) catch return error.ApplicationFailure,
                 else => {},
             }
         }
@@ -185,11 +186,25 @@ pub const Client = struct {
         return self.core.statistics();
     }
     pub fn close(self: *Client) void {
-        if (self.closed) return;
-        self.closed = true;
-        var payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
-        _ = self.sendControlWire(&payload, .reliable_ordered, 0, time.nowMilliseconds(self.io)) catch {};
-        self.socket.close();
+        if (self.closed or self.closing) return;
+        self.closing = true;
+        const now_ms = time.nowMilliseconds(self.io);
+        self.core.beginClose(now_ms);
+        self.advanceClose(now_ms) catch self.abort();
+    }
+    pub fn isClosed(self: *const Client) bool {
+        return self.closed;
+    }
+    fn advanceClose(self: *Client, now_ms: u64) !void {
+        if (!self.closing or self.closed) return;
+        switch (try self.core.advanceClose(now_ms)) {
+            .pending => {},
+            .flush => _ = try self.flushQueuedAt(now_ms),
+            .done => {
+                self.flushReceipts() catch {};
+                self.abort();
+            },
+        }
     }
     fn abort(self: *Client) void {
         if (self.closed) return;
@@ -197,7 +212,11 @@ pub const Client = struct {
         self.socket.close();
     }
     pub fn destroy(self: *Client) void {
-        self.close();
+        if (!self.closed and !self.core.disconnect_queued) {
+            var payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
+            _ = self.sendControlWire(&payload, .reliable_ordered, 0, time.nowMilliseconds(self.io)) catch {};
+        }
+        self.abort();
         self.receipts.deinit();
         self.core.deinit();
         self.allocator.free(self.receive_storage);
@@ -212,7 +231,7 @@ pub const Client = struct {
     }
 
     pub fn trySend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
-        if (self.closed) return error.ConnectionClosed;
+        if (self.closed or self.closing) return error.ConnectionClosed;
         _ = self.sendWire(payload, reliability, channel, time.nowMilliseconds(self.io)) catch |err| {
             if (err == error.CongestionWindowFull or err == error.OutboundQueuePending) return false;
             self.abortOnError(.application_send, err);
@@ -222,7 +241,7 @@ pub const Client = struct {
     }
 
     pub fn queueSend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
-        if (self.closed) return error.ConnectionClosed;
+        if (self.closed or self.closing) return error.ConnectionClosed;
         const handle = self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
             self.abortOnError(.application_send, err);
             return err;
@@ -260,6 +279,7 @@ pub const Client = struct {
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
+        if (self.core.close_deadline_ms) |close_deadline| deadline = @min(deadline, close_deadline);
         return deadline;
     }
 
@@ -273,9 +293,12 @@ pub const Client = struct {
             self.abort();
             return err;
         };
+        self.advanceClose(now_ms) catch |err| {
+            self.abort();
+            return err;
+        };
     }
 
-    /// The payload is valid only during the callback.
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         if (self.pending_receive_error) |err| {
@@ -343,6 +366,10 @@ pub const Client = struct {
             self.abortOnError(.retransmission, err);
             return err;
         };
+        self.advanceClose(latest_ms) catch |err| {
+            self.abort();
+            return err;
+        };
         return delivered;
     }
 
@@ -402,8 +429,8 @@ pub const Client = struct {
     fn flushQueuedAtLimit(self: *Client, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
         var emitter: socket_emitter.Emitter = .{ .socket = &self.socket, .address = self.server };
         self.outbound_deadline_ms = null;
-        const sent = try self.core.flushOutbound(.application, self.scratch, maximum_datagrams, now_ms, &emitter, socket_emitter.Emitter.emit);
-        if (sent.datagrams == maximum_datagrams and self.core.outboundCount(.application) != 0) self.outbound_deadline_ms = now_ms;
+        const sent = try self.core.flushAllOutbound(self.scratch, maximum_datagrams, now_ms, &emitter, socket_emitter.Emitter.emit);
+        if (sent.datagrams == maximum_datagrams and self.core.outbound_state.countAll() != 0) self.outbound_deadline_ms = now_ms;
         return sent;
     }
     fn queueReceipt(self: *Client, receipt: receiver.Receipt, now_ms: u64) !void {
@@ -739,4 +766,67 @@ test "handshake deadline and cancellation release every resource" {
     var probe: [2048]u8 = undefined;
     _ = try silent.value.receiveTimeout(io, &probe, time.after(io, 1_000));
     try std.testing.expectError(error.Canceled, task.cancel(io));
+}
+
+test "graceful client close delivers queued data before the disconnect" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const server_mod = @import("server.zig");
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var listener = try server_mod.Listener.listen(std.testing.allocator, io, try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"), .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
+
+    const Harness = struct {
+        listener: *server_mod.Listener,
+        received: std.atomic.Value(usize) = .init(0),
+        received_before_disconnect: usize = 0,
+        disconnected: std.atomic.Value(bool) = .init(false),
+
+        fn onConnect(_: *anyopaque, _: *server_mod.Session) !void {}
+        fn onMessage(raw: *anyopaque, _: *server_mod.Session, _: receiver.BorrowedPayload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.received.fetchAdd(1, .release);
+        }
+        fn onDisconnect(raw: *anyopaque, _: *server_mod.Session) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.received_before_disconnect = self.received.load(.acquire);
+            self.disconnected.store(true, .release);
+        }
+        fn run(self: *@This()) !void {
+            while (!self.disconnected.load(.acquire)) {
+                _ = try self.listener.poll(.none, .{ .context = self, .connected = onConnect, .message = onMessage, .disconnected = onDisconnect });
+            }
+        }
+    };
+    var harness: Harness = .{ .listener = listener };
+    var server_task = try io.concurrent(Harness.run, .{&harness});
+    defer server_task.cancel(io) catch {};
+
+    const client = try Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 });
+    defer client.destroy();
+    for (0..3) |_| _ = try client.queueSend("\xfefinal", .reliable_ordered, 0);
+    const started_ms = time.nowMilliseconds(io);
+    client.close();
+    client.close();
+    try std.testing.expectError(error.ConnectionClosed, client.queueSend("\xfelate", .reliable_ordered, 0));
+    const Ignore = struct {
+        fn message(_: *anyopaque, _: receiver.BorrowedPayload) !void {}
+    };
+    var unused: u8 = 0;
+    for (0..1_000) |_| {
+        if (client.isClosed()) break;
+        _ = client.poll(time.after(io, 20), &unused, Ignore.message) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+    }
+    try std.testing.expect(client.isClosed());
+    // Closed by the disconnect ACK, not by the shutdown deadline.
+    try std.testing.expect(time.nowMilliseconds(io) - started_ms < client.core.config.timing.shutdown_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 0), client.core.recovery_state.count());
+    try std.testing.expectEqual(@as(usize, 0), client.core.outbound_state.countAll());
+    try std.testing.expect(client.nextDeadline() == null);
+    try server_task.await(io);
+    try std.testing.expectEqual(@as(usize, 3), harness.received_before_disconnect);
 }

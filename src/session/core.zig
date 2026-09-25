@@ -4,6 +4,7 @@ const Config = @import("../config.zig").Config;
 const ack = @import("../protocol/ack.zig");
 const datagram = @import("../protocol/datagram.zig");
 const frame = @import("../protocol/frame.zig");
+const offline = @import("../protocol/offline.zig");
 const congestion = @import("../reliability/congestion.zig");
 const reassembly = @import("../reliability/reassembly.zig");
 const recovery = @import("../reliability/recovery.zig");
@@ -40,6 +41,8 @@ pub const Incoming = union(enum) {
     acknowledged: recovery.Acknowledged,
     nack_marked: usize,
 };
+
+pub const CloseStep = enum { pending, flush, done };
 
 pub const ProcessedIncoming = struct {
     incoming: Incoming,
@@ -225,6 +228,8 @@ pub const Core = struct {
     send_owner: u64,
     terminal_send_failure: bool = false,
     newest_sent: u32 = 0,
+    close_deadline_ms: ?u64 = null,
+    disconnect_queued: bool = false,
     acknowledged_datagrams: u64 = 0,
     lost_datagrams: u64 = 0,
     retransmitted_datagrams: u64 = 0,
@@ -476,6 +481,31 @@ pub const Core = struct {
         }
         return total;
     }
+    /// Flushes the control lane before application data.
+    pub fn flushAllOutbound(self: *Core, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        const control = try self.flushOutbound(.control, scratch, maximum_datagrams, now_ms, context, emit);
+        const application = try self.flushOutbound(.application, scratch, maximum_datagrams - control.datagrams, now_ms, context, emit);
+        return .{ .datagrams = control.datagrams + application.datagrams, .wire_bytes = control.wire_bytes + application.wire_bytes };
+    }
+
+    /// Starts a graceful close. Repeated calls keep the first deadline.
+    pub fn beginClose(self: *Core, now_ms: u64) void {
+        if (self.close_deadline_ms == null) self.close_deadline_ms = now_ms +| self.config.timing.shutdown_timeout_ms;
+    }
+
+    /// Queues the disconnect once all prior data is acknowledged, then reports `done`
+    /// once the disconnect itself is acknowledged or the shutdown deadline passes.
+    /// The disconnect rides the normal queue, recovery, and retransmission paths.
+    pub fn advanceClose(self: *Core, now_ms: u64) !CloseStep {
+        const deadline = self.close_deadline_ms orelse return .pending;
+        if (now_ms >= deadline) return .done;
+        if (self.outbound_state.countAll() != 0 or self.recovery_state.count() != 0) return .pending;
+        if (self.disconnect_queued) return .done;
+        _ = try self.enqueueOutbound(.control, &.{@intFromEnum(offline.Id.disconnect_notification)}, .reliable_ordered, 0);
+        self.disconnect_queued = true;
+        return .flush;
+    }
+
     /// Copies a reliable datagram into bounded recovery storage before it is handed to the socket.
     pub fn trackSent(self: *Core, sequence: u32, wire: []const u8, in_flight_bytes: usize, now_ms: u64) !void {
         if (self.terminal_send_failure) return error.ConnectionClosed;
@@ -857,4 +887,129 @@ test "transition policy distinguishes rejection, retry, and closure" {
     try std.testing.expectEqual(IncomingErrorClass.transport, classifyTransitionError(.retransmission, error.RetransmissionLimitExceeded).class);
     try std.testing.expectEqual(IncomingErrorClass.protocol, classifyTransitionError(.handshake, error.IncompatibleProtocol).class);
     try std.testing.expectEqual(IncomingErrorClass.transport, classifyTransitionError(.handshake, error.Timeout).class);
+}
+
+const ClosePeer = struct {
+    sequences: [16]u32 = undefined,
+    disconnects: [16]bool = undefined,
+    count: usize = 0,
+
+    fn emit(raw: *anyopaque, wire: []const u8) SendError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
+        var disconnect = false;
+        while (decoded.frames.remaining() != 0) {
+            const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
+            disconnect = disconnect or value.payload[0] == @intFromEnum(offline.Id.disconnect_notification);
+        }
+        self.sequences[self.count] = decoded.sequence;
+        self.disconnects[self.count] = disconnect;
+        self.count += 1;
+    }
+
+    fn acknowledge(self: *@This(), core: *Core, index: usize, now_ms: u64) !void {
+        const Discard = struct {
+            fn deliver(_: *anyopaque, _: receiver.BorrowedPayload) !void {}
+        };
+        var wire: [32]u8 = undefined;
+        const sequence = self.sequences[index];
+        var unused: u8 = 0;
+        _ = try core.processIncoming(try datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire), now_ms, &unused, Discard.deliver);
+    }
+
+    /// Drives `advanceClose` the way owners do and returns the step taken.
+    fn step(self: *@This(), core: *Core, now_ms: u64) !CloseStep {
+        const result = try core.advanceClose(now_ms);
+        var scratch: [576]u8 = undefined;
+        if (result == .flush) _ = try core.flushAllOutbound(&scratch, 8, now_ms, self, emit);
+        return result;
+    }
+};
+
+fn expectClosedClean(core: *const Core) !void {
+    try std.testing.expectEqual(@as(usize, 0), core.recovery_state.count());
+    try std.testing.expectEqual(@as(usize, 0), core.outbound_state.countAll());
+    try std.testing.expectEqual(@as(?u64, null), core.nextRetransmissionDeadline());
+    try std.testing.expectEqual(@as(u64, 0), core.congestion_state.in_flight);
+}
+
+test "close with empty queues sends a reliable disconnect and finishes on its ACK" {
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    var peer: ClosePeer = .{};
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 0));
+    core.beginClose(0);
+    core.beginClose(1_000);
+    try std.testing.expectEqual(@as(?u64, 5_000), core.close_deadline_ms);
+    try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 0));
+    try std.testing.expectEqual(@as(usize, 1), peer.count);
+    try std.testing.expect(peer.disconnects[0]);
+    try std.testing.expectEqual(@as(usize, 1), core.recovery_state.count());
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 1));
+    try peer.acknowledge(&core, 0, 2);
+    try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 2));
+    try std.testing.expectEqual(@as(usize, 1), peer.count);
+    try expectClosedClean(&core);
+}
+
+test "close drains queued application and control data before the disconnect" {
+    for ([_][]const outbound_queue.Lane{ &.{.application}, &.{.control}, &.{ .control, .application } }) |lanes| {
+        var core = try Core.init(std.testing.allocator, 576, .{});
+        defer core.deinit();
+        var peer: ClosePeer = .{};
+        for (lanes) |lane| _ = try core.enqueueOutbound(lane, "\xfequeued", .reliable_ordered, 0);
+        core.beginClose(0);
+        try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 0));
+        var scratch: [576]u8 = undefined;
+        _ = try core.flushAllOutbound(&scratch, 8, 0, &peer, ClosePeer.emit);
+        try std.testing.expect(peer.count != 0 and !peer.disconnects[0]);
+        // Queued data is sent but still in recovery, so the disconnect waits.
+        try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 1));
+        for (0..peer.count) |index| try peer.acknowledge(&core, index, 2);
+        const data_datagrams = peer.count;
+        try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 2));
+        try std.testing.expect(peer.disconnects[data_datagrams]);
+        try std.testing.expect(peer.sequences[data_datagrams] > peer.sequences[data_datagrams - 1]);
+        try peer.acknowledge(&core, data_datagrams, 3);
+        try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 3));
+        try expectClosedClean(&core);
+    }
+}
+
+test "close waits for outstanding reliable data and retransmits a lost disconnect" {
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    var peer: ClosePeer = .{};
+    var scratch: [576]u8 = undefined;
+    _ = try core.send("\xfeinflight", .reliable_ordered, 0, &scratch, 0, &peer, ClosePeer.emit);
+    core.beginClose(0);
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 0));
+    try peer.acknowledge(&core, 0, 10);
+    try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 10));
+    try std.testing.expect(peer.disconnects[1]);
+
+    // The first disconnect is lost; the normal recovery path resends it.
+    const deadline = core.nextRetransmissionDeadline().?;
+    var due: [4]recovery.Due = undefined;
+    const batch = core.collectRetransmissions(deadline, &due, 4);
+    try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+    try ClosePeer.emit(&peer, batch.items[0].data);
+    try std.testing.expect(peer.disconnects[2]);
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, deadline));
+    try peer.acknowledge(&core, 2, deadline + 1);
+    try std.testing.expectEqual(CloseStep.done, try peer.step(&core, deadline + 1));
+    try expectClosedClean(&core);
+}
+
+test "close is forced at the shutdown deadline when the ACK never arrives" {
+    var config: Config = .{};
+    config.timing.shutdown_timeout_ms = 100;
+    var core = try Core.init(std.testing.allocator, 576, config);
+    defer core.deinit();
+    var peer: ClosePeer = .{};
+    core.beginClose(0);
+    try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 0));
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 99));
+    try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 100));
+    try std.testing.expectEqual(@as(usize, 1), peer.count);
 }

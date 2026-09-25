@@ -20,7 +20,7 @@ const transmitter_mod = @import("session/transmitter.zig");
 const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
 const time = @import("util/time.zig");
 
-const State = enum { connecting, connected, closed };
+const State = enum { connecting, connected, closing, closed };
 
 pub const Options = struct {
     config: Config = .{},
@@ -33,17 +33,14 @@ pub const Options = struct {
     offline_burst: u32 = 40,
     global_offline_rate_per_second: u32 = 20_000,
     global_offline_burst: u32 = 40_000,
-    /// Caps the session table and all remote session state.
     maximum_session_memory_bytes: usize = 512 * 1024 * 1024,
     handshake_timeout_ms: u32 = 5_000,
-    /// Kept for compatibility. Exact deadlines ignore it.
     maintenance_interval_ms: u32 = 10,
 };
 
 pub const Callbacks = struct {
     context: *anyopaque,
     connected: *const fn (context: *anyopaque, session: *Session) core_mod.ApplicationCallbackError!void,
-    /// The payload is valid only during the callback.
     message: *const fn (context: *anyopaque, session: *Session, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void,
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
 };
@@ -179,14 +176,37 @@ pub const Session = struct {
     pub fn statistics(self: *const Session) core_mod.Statistics {
         return self.core.statistics();
     }
+    /// Rejects new sends, drains queued and in-flight reliable data, then sends a
+    /// reliable disconnect. The listener removes the session once it is acknowledged
+    /// or `shutdown_timeout_ms` passes.
     pub fn close(self: *Session) void {
-        if (self.state == .closed) return;
         const now_ms = time.nowMilliseconds(self.socket.io);
-        if (self.state == .connected) {
+        switch (self.state) {
+            .closing, .closed => return,
+            .connecting => return self.closeAt(now_ms),
+            .connected => {},
+        }
+        self.state = .closing;
+        self.core.beginClose(now_ms);
+        self.advanceClose(now_ms) catch return self.closeAt(now_ms);
+        self.schedule() catch self.closeAt(now_ms);
+    }
+    /// Best-effort single notification for an immediate teardown.
+    fn closeNow(self: *Session) void {
+        const now_ms = time.nowMilliseconds(self.socket.io);
+        if ((self.state == .connected or self.state == .closing) and !self.core.disconnect_queued) {
             const payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
             self.sendControl(&payload, .reliable_ordered, now_ms) catch {};
         }
         self.closeAt(now_ms);
+    }
+    fn advanceClose(self: *Session, now_ms: u64) !void {
+        if (self.state != .closing) return;
+        switch (try self.core.advanceClose(now_ms)) {
+            .pending => {},
+            .flush => _ = try self.flushQueuedAt(now_ms),
+            .done => self.closeAt(now_ms),
+        }
     }
     pub fn send(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
         if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
@@ -253,8 +273,8 @@ pub const Session = struct {
     fn flushQueuedAtLimit(self: *Session, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
         var emitter: socket_emitter.Emitter = .{ .socket = self.socket, .address = self.address };
         self.outbound_deadline_ms = null;
-        const sent = try self.core.flushOutbound(.application, self.scratch, maximum_datagrams, now_ms, &emitter, socket_emitter.Emitter.emit);
-        if (sent.datagrams == maximum_datagrams and self.core.outboundCount(.application) != 0) self.outbound_deadline_ms = now_ms;
+        const sent = try self.core.flushAllOutbound(self.scratch, maximum_datagrams, now_ms, &emitter, socket_emitter.Emitter.emit);
+        if (sent.datagrams == maximum_datagrams and self.core.outbound_state.countAll() != 0) self.outbound_deadline_ms = now_ms;
         if (sent.datagrams != 0) try self.schedule();
         return sent;
     }
@@ -284,6 +304,7 @@ pub const Session = struct {
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
+        if (self.core.close_deadline_ms) |close_deadline| deadline = @min(deadline, close_deadline);
         try self.deadlines.upsert(self.key, deadline);
     }
     fn processDueTimers(self: *Session, now_ms: u64, maximum_work: usize) !usize {
@@ -448,7 +469,7 @@ pub const Listener = struct {
     pub fn close(self: *Listener) void {
         if (self.closed) return;
         var iterator = self.sessions.valueIterator();
-        while (iterator.next()) |session| session.*.close();
+        while (iterator.next()) |session| session.*.closeNow();
         self.closed = true;
         self.socket.close();
     }
@@ -636,6 +657,12 @@ pub const Listener = struct {
                 return;
             };
             remaining.* -= @min(remaining.*, flushed.datagrams);
+            session.advanceClose(now_ms) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
         }
         if (session.state == .closed) {
             session.flushReceipts() catch |err| {
@@ -686,6 +713,14 @@ pub const Listener = struct {
                 continue;
             };
             remaining -= @min(remaining, @max(@as(usize, 1), used));
+            session.advanceClose(now_ms) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
+                session.state = .closed;
+            };
+            if (session.state == .closed) {
+                self.removeSession(entry.key, callbacks);
+                continue;
+            }
             session.schedule() catch {
                 recordSessionFailure(stats, .internal);
                 session.state = .closed;
@@ -892,29 +927,162 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expect(listener.nextDeadline() == null);
 }
 
-test "closing a connected session sends a disconnect" {
+const CloseHarness = struct {
+    disconnected: usize = 0,
+
+    fn onConnect(_: *anyopaque, _: *Session) !void {}
+    fn onMessage(_: *anyopaque, _: *Session, _: receiver.BorrowedPayload) !void {}
+    fn onDisconnect(raw: *anyopaque, _: *Session) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.disconnected += 1;
+    }
+    fn callbacks(self: *@This()) Callbacks {
+        return .{ .context = self, .connected = onConnect, .message = onMessage, .disconnected = onDisconnect };
+    }
+
+    fn open(listener: *Listener, peer: *backend.Socket) !*Session {
+        const key = endpointKey(peer.value.address);
+        const allocator = listener.session_quota.allocator();
+        const session = try Session.create(allocator, &listener.socket, &listener.deadlines, peer.value.address, key, 1, 576, time.nowMilliseconds(listener.io), 1000, 8, listener.config);
+        errdefer session.destroy();
+        try listener.sessions.put(allocator, key, session);
+        session.state = .connected;
+        try session.schedule();
+        return session;
+    }
+
+    fn inject(self: *@This(), listener: *Listener, from: std.Io.net.IpAddress, wire: []u8) !void {
+        listener.messages[0] = .{ .from = from, .data = wire, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+        listener.pending_message_index = 0;
+        listener.pending_message_count = 1;
+        _ = try listener.poll(.none, self.callbacks());
+    }
+
+    const Received = struct { sequence: u32, disconnect: bool };
+    /// Reads the next data datagram sent to `peer`, skipping ACKs.
+    fn receive(peer: *backend.Socket) !Received {
+        var storage: [576]u8 = undefined;
+        while (true) {
+            const message = try peer.value.receive(peer.io, &storage);
+            if (message.data[0] & 0x40 != 0) continue;
+            var decoded = try frame.decodeDatagram(message.data);
+            const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
+            return .{ .sequence = decoded.sequence, .disconnect = value.payload[0] == @intFromEnum(offline.Id.disconnect_notification) };
+        }
+    }
+
+    fn ack(self: *@This(), listener: *Listener, peer: *backend.Socket, sequence: u32) !void {
+        var wire: [32]u8 = undefined;
+        try self.inject(listener, peer.value.address, try @import("protocol/datagram.zig").encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire));
+    }
+};
+
+test "graceful session close drains data and retransmits the disconnect until ACKed" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
-    var socket = try backend.Socket.bind(io, address, 576);
-    defer socket.close();
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
     var peer = try backend.Socket.bind(io, address, 576);
     defer peer.close();
-    var deadlines = try deadline_queue.Queue.init(std.testing.allocator, 1);
-    defer deadlines.deinit();
-    const key = endpointKey(peer.value.address);
-    const session = try Session.create(std.testing.allocator, &socket, &deadlines, peer.value.address, key, 1, 576, 100, 1000, 8, .{});
-    defer session.destroy();
-    session.state = .connected;
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
 
+    _ = try session.queueSend("\xfefinal", .reliable_ordered, 0);
+    session.close();
+    session.close();
+    try std.testing.expectEqual(State.closing, session.state);
+    try std.testing.expectError(error.NotConnected, session.queueSend("\xfelate", .reliable_ordered, 0));
+    try std.testing.expectError(error.NotConnected, session.send("\xfelate", .reliable_ordered, 0));
+
+    // The disconnect waits until the final application packet is acknowledged.
+    // Queued data still drains through the normal outbound timer while closing.
+    try std.testing.expectEqual(@as(usize, 1), session.core.outbound_state.countAll());
+    _ = try listener.processTimers(session.outbound_deadline_ms.?, harness.callbacks());
+    const data = try CloseHarness.receive(&peer);
+    try std.testing.expect(!data.disconnect);
+    try std.testing.expect(!session.core.disconnect_queued);
+    try harness.ack(listener, &peer, data.sequence);
+    const disconnect = try CloseHarness.receive(&peer);
+    try std.testing.expect(disconnect.disconnect);
+
+    // The first disconnect is lost and resent by the normal retransmission timer.
+    _ = try listener.processTimers(session.core.nextRetransmissionDeadline().?, harness.callbacks());
+    const resent = try CloseHarness.receive(&peer);
+    try std.testing.expect(resent.disconnect);
+    try std.testing.expectEqual(disconnect.sequence, resent.sequence);
+    try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+
+    try harness.ack(listener, &peer, resent.sequence);
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+}
+
+test "session close is forced when the disconnect is never acknowledged" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
+    session.close();
+    try std.testing.expect((try CloseHarness.receive(&peer)).disconnect);
+    const deadline = session.core.close_deadline_ms.?;
+    _ = try listener.processTimers(deadline - 1, harness.callbacks());
+    try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+    _ = try listener.processTimers(deadline, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+}
+
+test "remote disconnect during a local close removes the session promptly" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
+    _ = try session.queueSend("\xfeunacked", .reliable_ordered, 0);
+    session.close();
+
+    const Collector = struct {
+        wire: [576]u8 = undefined,
+        len: usize = 0,
+        fn emit(raw: *anyopaque, _: u32, _: bool, wire: []const u8) transmitter_mod.EmitError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(self.wire[0..wire.len], wire);
+            self.len = wire.len;
+        }
+    };
+    var remote = try transmitter_mod.Transmitter.init(576, .{});
+    var collector: Collector = .{};
+    var scratch: [576]u8 = undefined;
+    _ = try remote.send(&.{@intFromEnum(offline.Id.disconnect_notification)}, .reliable_ordered, 0, &scratch, &collector, Collector.emit);
+    try harness.inject(listener, peer.value.address, collector.wire[0..collector.len]);
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+}
+
+test "closing a connecting session is immediate" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
+    session.state = .connecting;
     session.close();
     try std.testing.expectEqual(State.closed, session.state);
-    try std.testing.expectEqual(@as(usize, 1), deadlines.count());
-
-    var storage: [576]u8 = undefined;
-    const message = try peer.value.receive(io, &storage);
-    var decoded = try @import("protocol/frame.zig").decodeDatagram(message.data);
-    const value = try @import("protocol/frame.zig").decodeOne(&decoded.frames, 8192, 2048);
-    try std.testing.expectEqual(@intFromEnum(offline.Id.disconnect_notification), value.payload[0]);
+    _ = try listener.processTimers(time.nowMilliseconds(io), harness.callbacks());
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
 }
 
 test "ACK delay schedules while NACK remains urgent" {

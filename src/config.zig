@@ -62,9 +62,10 @@ pub const TimingOptions = struct {
     idle_timeout_ms: u32 = 10_000,
     minimum_rto_ms: u32 = 50,
     maximum_rto_ms: u32 = 5_000,
+    shutdown_timeout_ms: u32 = 5_000,
 
     fn validate(self: TimingOptions) !void {
-        if (self.maximum_ack_delay_ms > 10 or self.split_timeout_ms == 0) return error.InvalidConfiguration;
+        if (self.maximum_ack_delay_ms > 10 or self.split_timeout_ms == 0 or self.shutdown_timeout_ms == 0) return error.InvalidConfiguration;
         if (self.idle_timeout_ms == 0 or self.minimum_rto_ms == 0 or self.minimum_rto_ms > self.maximum_rto_ms) return error.InvalidConfiguration;
     }
 };

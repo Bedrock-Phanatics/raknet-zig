@@ -115,7 +115,6 @@ pub const Queue = struct {
         return id;
     }
 
-    /// Transfers payload ownership to the caller.
     pub fn pop(self: *Queue, lane: Lane) ?Message {
         const lane_index = @intFromEnum(lane);
         const index = self.heads[lane_index];

@@ -35,7 +35,6 @@ pub fn decodeAddress(reader: *cursor.Reader) !Address {
             break :blk .{ .ipv4 = .{ .octets = .{ ~encoded[0], ~encoded[1], ~encoded[2], ~encoded[3] }, .port = port } };
         },
         6 => blk: {
-            // Peers vary in the IPv6 address family value.
             _ = try reader.u16le();
             const port = try reader.u16be();
             const flow = try reader.u32be();

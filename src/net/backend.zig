@@ -56,8 +56,6 @@ pub const Socket = struct {
         return self.buffer_sizes;
     }
 
-    /// `data_storage` must reserve maximum_datagram_size bytes per message slot.
-    /// On Windows Zig currently returns one message; on Linux this maps to non-waiting batch drains.
     pub fn receiveMany(self: *const Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8, timeout: std.Io.Timeout) !ReceiveBatch {
         if (messages.len == 0) return error.InvalidConfiguration;
         const required = try std.math.mul(usize, messages.len, self.maximum_datagram_size);

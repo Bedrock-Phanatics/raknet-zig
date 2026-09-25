@@ -34,7 +34,6 @@ pub const Reliability = enum(u3) {
 
 pub const Split = struct { count: u32, id: u16, index: u32 };
 
-/// All slices borrow the input datagram and must not outlive its receive buffer.
 pub const Frame = struct {
     reliability: Reliability,
     reliable_index: ?u32 = null,

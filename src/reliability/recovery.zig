@@ -167,7 +167,6 @@ pub const Recovery = struct {
         return marked;
     }
 
-    /// Borrows due payloads until the next recovery mutation.
     pub fn collectDue(self: *Recovery, now_ms: u64, rto_ms: u32, output: []Due, maximum_work: usize) DueBatch {
         var due_count: usize = 0;
         var inspected: usize = 0;

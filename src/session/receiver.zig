@@ -25,10 +25,8 @@ pub const DeliveryError = error{
     ApplicationFailure,
     InternalFailure,
 };
-/// The payload is valid only during the callback.
 pub const DeliverFn = *const fn (context: *anyopaque, payload: BorrowedPayload) DeliveryError!void;
 
-/// Retains no slices into processed datagrams.
 pub const Receiver = struct {
     allocator: std.mem.Allocator,
     config: Config,

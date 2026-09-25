@@ -102,14 +102,12 @@ pub const Reassembler = struct {
         return self.retained_bytes;
     }
 
-    /// Returns one contiguous owned payload.
     pub fn push(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?OwnedPayload {
         const slot = try self.retain(id, count_value, index, payload, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return null;
         return try self.finish(slot.?);
     }
 
-    /// Borrows fragments and skips the final copy.
     pub fn pushScatter(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64, context: *anyopaque, consume: ScatterFn) !bool {
         const slot = try self.retain(id, count_value, index, payload, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return false;
