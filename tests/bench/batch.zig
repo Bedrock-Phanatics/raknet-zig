@@ -88,6 +88,63 @@ fn measure(io: std.Io, wire: []const u8, owned: bool, iterations: usize) !Measur
     };
 }
 
+fn writeVarUInt(output: []u8, cursor: *usize, value: u32) void {
+    var remaining = value;
+    while (remaining >= 0x80) {
+        output[cursor.*] = @as(u8, @truncate(remaining)) | 0x80;
+        cursor.* += 1;
+        remaining >>= 7;
+    }
+    output[cursor.*] = @truncate(remaining);
+    cursor.* += 1;
+}
+
+fn poolCycle(small: []const u8) !void {
+    const large_packet_size = 1024 * 1024 + 64;
+    const raw = try std.heap.page_allocator.alloc(u8, large_packet_size + 4);
+    defer std.heap.page_allocator.free(raw);
+    var raw_len: usize = 0;
+    writeVarUInt(raw, &raw_len, large_packet_size);
+    for (raw[raw_len..][0..large_packet_size], 0..) |*byte, index| byte.* = @truncate(index);
+    raw_len += large_packet_size;
+    const wire = try std.heap.page_allocator.alloc(u8, raw_len + 12);
+    defer std.heap.page_allocator.free(wire);
+    wire[0] = batch.header;
+    wire[1] = @intFromEnum(batch.Algorithm.snappy);
+    var wire_len: usize = 2;
+    writeVarUInt(wire, &wire_len, @intCast(raw_len));
+    wire[wire_len] = 0xfc;
+    wire_len += 1;
+    std.mem.writeInt(u32, wire[wire_len..][0..4], @intCast(raw_len - 1), .little);
+    wire_len += 4;
+    @memcpy(wire[wire_len..][0..raw_len], raw[0..raw_len]);
+    wire_len += raw_len;
+
+    var counting: CountingAllocator = .{ .child = std.heap.page_allocator };
+    var decoder = try batch.Decoder.init(counting.allocator(), .{
+        .maximum_work_bytes_per_window = std.math.maxInt(usize),
+    });
+    defer decoder.deinit();
+    var checksum: usize = 0;
+    _ = try decoder.decodeBorrowed(small, .declared, 0, &checksum, addPacket);
+    counting.events = 0;
+    _ = try decoder.decodeBorrowed(small, .declared, 0, &checksum, addPacket);
+    const warm_allocations = counting.events;
+    const warm_retained = decoder.retainedCapacity();
+    counting.events = 0;
+    _ = try decoder.decodeBorrowed(wire[0..wire_len], .declared, 0, &checksum, addPacket);
+    const burst_allocations = counting.events;
+    const burst_retained = decoder.retainedCapacity();
+    counting.events = 0;
+    _ = try decoder.decodeBorrowed(small, .declared, 0, &checksum, addPacket);
+    const idle_allocations = counting.events;
+    const idle_retained = decoder.retainedCapacity();
+    if (warm_allocations != 0 or warm_retained == 0 or burst_retained != 0 or idle_retained == 0 or idle_allocations == 0) return error.BenchmarkPoolMismatch;
+    std.debug.print("batch_pool: warm {d} allocs/{d} retained, burst {d} allocs/{d} retained, idle {d} allocs/{d} retained, checksum {d}\n", .{
+        warm_allocations, warm_retained, burst_allocations, burst_retained, idle_allocations, idle_retained, checksum,
+    });
+}
+
 pub fn run(io: std.Io) !void {
     const packet_count = 16;
     const packet_size = 256;
@@ -153,4 +210,5 @@ pub fn run(io: std.Io) !void {
             });
         }
     }
+    try poolCycle(snappy);
 }
