@@ -15,11 +15,13 @@ pub const Gap = struct { first: u32, last: u32, count: usize };
 pub const Window = struct {
     present: []bool,
     expected: u32 = 0,
+    next: u32 = 0,
 
     pub fn init(storage: []bool, initial_expected: u32) !Window {
         if (storage.len == 0 or storage.len >= uint24.half_range) return error.InvalidWindowSize;
         @memset(storage, false);
-        return .{ .present = storage, .expected = uint24.normalize(initial_expected) };
+        const expected = uint24.normalize(initial_expected);
+        return .{ .present = storage, .expected = expected, .next = expected };
     }
 
     pub fn inspect(self: *const Window, raw_index: u32, maximum_gap_report: usize) Result {
@@ -30,16 +32,15 @@ pub const Window = struct {
         if (forward >= self.present.len) return .too_far_ahead;
 
         const slot = index % self.present.len;
-        if (forward != 0) {
-            if (self.present[slot]) return .duplicate;
-            const count = @min(forward, maximum_gap_report);
-            return .{ .accepted = .{
-                .first = uint24.sub(index, @intCast(count)),
-                .last = uint24.sub(index, 1),
-                .count = count,
-            } };
-        }
-        return .{ .accepted = null };
+        if (forward != 0 and self.present[slot]) return .duplicate;
+        const skipped = uint24.distance(self.next, index);
+        if (skipped == 0 or skipped >= uint24.half_range) return .{ .accepted = null };
+        const count = @min(skipped, maximum_gap_report);
+        return .{ .accepted = .{
+            .first = uint24.sub(index, @intCast(count)),
+            .last = uint24.sub(index, 1),
+            .count = count,
+        } };
     }
 
     pub fn add(self: *Window, raw_index: u32, maximum_gap_report: usize) Result {
@@ -48,6 +49,7 @@ pub const Window = struct {
         const forward = uint24.distance(self.expected, index);
         switch (result) {
             .accepted => {
+                if (uint24.distance(self.next, index) < uint24.half_range) self.next = uint24.add(index, 1);
                 if (forward != 0) {
                     self.present[index % self.present.len] = true;
                     return result;
@@ -88,6 +90,24 @@ test "gap reports have a strict work cap" {
     try std.testing.expectEqual(@as(usize, 5), result.accepted.?.count);
     try std.testing.expectEqual(@as(u32, 45), result.accepted.?.first);
 }
+test "gaps are reported once as they appear" {
+    var slots: [64]bool = undefined;
+    var window = try Window.init(&slots, 0);
+    try std.testing.expectEqual(@as(?Gap, null), window.add(0, 64).accepted);
+    try std.testing.expectEqual(Gap{ .first = 1, .last = 2, .count = 2 }, window.add(3, 64).accepted.?);
+    try std.testing.expectEqual(@as(?Gap, null), window.add(4, 64).accepted);
+    try std.testing.expectEqual(Gap{ .first = 5, .last = 5, .count = 1 }, window.add(6, 64).accepted.?);
+    try std.testing.expectEqual(@as(?Gap, null), window.add(1, 64).accepted);
+    try std.testing.expectEqual(@as(?Gap, null), window.add(2, 64).accepted);
+    try std.testing.expectEqual(@as(u32, 5), window.expected);
+    try std.testing.expectEqual(@as(?Gap, null), window.add(5, 64).accepted);
+    try std.testing.expectEqual(@as(u32, 7), window.expected);
+
+    window = try Window.init(&slots, 0xfffffe);
+    try std.testing.expectEqual(Gap{ .first = 0xfffffe, .last = 0xffffff, .count = 2 }, window.add(0, 64).accepted.?);
+    try std.testing.expectEqual(@as(?Gap, null), window.add(1, 64).accepted);
+}
+
 test "inspection is non-mutating" {
     var slots: [8]bool = undefined;
     var window = try Window.init(&slots, 4);

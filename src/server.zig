@@ -49,6 +49,7 @@ const DeliveryBridge = struct {
     callbacks: Callbacks,
     session: *Session,
     now_ms: u64,
+    connected: bool = false,
 
     fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
         const self: *DeliveryBridge = @ptrCast(@alignCast(raw));
@@ -69,6 +70,7 @@ const DeliveryBridge = struct {
             .new_incoming_connection => {
                 if (self.session.state == .connecting) {
                     self.session.state = .connected;
+                    self.connected = true;
                     self.callbacks.connected(self.callbacks.context, self.session) catch return error.ApplicationFailure;
                 }
             },
@@ -105,6 +107,40 @@ pub const ListenerStatistics = struct {
     session_memory_bytes: usize,
     maximum_session_memory_bytes: usize,
     socket_buffers: backend.BufferSizes,
+    traffic: backend.Traffic,
+    unconnected_pings: u64,
+    open_connection_requests_1: u64,
+    open_connection_requests_2: u64,
+    handshakes_started: u64,
+    handshakes_completed: u64,
+    handshakes_rejected: u64,
+    ack_records_received: u64,
+    ack_records_sent: u64,
+    nack_records_received: u64,
+    nack_records_sent: u64,
+    retransmitted_datagrams: u64,
+    malformed_datagrams: u64,
+    dropped_datagrams: u64,
+    recovery_bytes: usize,
+    queued_packets_high_water: usize,
+};
+
+const SessionTotals = struct {
+    ack_records_received: u64 = 0,
+    ack_records_sent: u64 = 0,
+    nack_records_received: u64 = 0,
+    nack_records_sent: u64 = 0,
+    retransmitted_datagrams: u64 = 0,
+    queued_packets_high_water: usize = 0,
+
+    fn add(self: *SessionTotals, stats: core_mod.Statistics) void {
+        self.ack_records_received += stats.ack_records_received;
+        self.ack_records_sent += stats.ack_records_sent;
+        self.nack_records_received += stats.nack_records_received;
+        self.nack_records_sent += stats.nack_records_sent;
+        self.retransmitted_datagrams += stats.retransmitted_datagrams;
+        self.queued_packets_high_water = @max(self.queued_packets_high_water, stats.queued_packets_high_water);
+    }
 };
 
 pub const Session = struct {
@@ -174,7 +210,10 @@ pub const Session = struct {
         return self.state == .connected;
     }
     pub fn statistics(self: *const Session) core_mod.Statistics {
-        return self.core.statistics();
+        var stats = self.core.statistics();
+        stats.ack_records_sent = self.receipts.ack_records_sent;
+        stats.nack_records_sent = self.receipts.nack_records_sent;
+        return stats;
     }
     pub fn close(self: *Session) void {
         const now_ms = time.nowMilliseconds(self.socket.io);
@@ -368,6 +407,12 @@ pub const Listener = struct {
     deadlines: deadline_queue.Queue,
     advertisement: []u8,
     rate_entries: []rate.Entry,
+    retired: SessionTotals = .{},
+    handshakes_started: u64 = 0,
+    handshakes_completed: u64 = 0,
+    capacity_rejections: u64 = 0,
+    malformed_datagrams: u64 = 0,
+    dropped_datagrams: u64 = 0,
     limiter: rate.Limiter,
     handshake_handler: handshake.Handler,
     source_secret: u64,
@@ -388,8 +433,9 @@ pub const Listener = struct {
         errdefer allocator.destroy(self);
         var socket = try backend.Socket.bindWithBuffers(io, address, options.config.protocol.maximum_datagram_size, options.socket_buffers);
         errdefer socket.close();
-        const advertisement = try allocator.dupe(u8, options.advertisement);
+        const advertisement = try allocator.alloc(u8, options.config.protocol.maximum_datagram_size - 35);
         errdefer allocator.free(advertisement);
+        @memcpy(advertisement[0..options.advertisement.len], options.advertisement);
         const limiter_count = @min(options.config.listener.maximum_pending_handshakes, 65_536);
         const rate_entries = try allocator.alloc(rate.Entry, limiter_count);
         errdefer allocator.free(rate_entries);
@@ -444,7 +490,7 @@ pub const Listener = struct {
             options.protocol_version,
             options.config.protocol.minimum_mtu,
             options.config.protocol.maximum_mtu,
-            self.advertisement,
+            self.advertisement[0..options.advertisement.len],
             .{ .current_key = random[8..40].*, .previous_key = random[40..72].* },
             &self.limiter,
         );
@@ -455,12 +501,43 @@ pub const Listener = struct {
         return self.socket.kernelBufferSizes();
     }
     pub fn statistics(self: *const Listener) ListenerStatistics {
+        var totals = self.retired;
+        var recovery_bytes: usize = 0;
+        var iterator = self.sessions.valueIterator();
+        while (iterator.next()) |session| {
+            const stats = session.*.statistics();
+            totals.add(stats);
+            recovery_bytes += stats.recovery_payload_bytes;
+        }
+        const handshake_counters = self.handshake_handler.counters;
         return .{
             .active_sessions = self.sessions.count(),
             .session_memory_bytes = self.session_quota.used_bytes,
             .maximum_session_memory_bytes = self.session_quota.maximum_bytes,
             .socket_buffers = self.socket.kernelBufferSizes(),
+            .traffic = self.socket.traffic,
+            .unconnected_pings = handshake_counters.unconnected_pings,
+            .open_connection_requests_1 = handshake_counters.open_connection_requests_1,
+            .open_connection_requests_2 = handshake_counters.open_connection_requests_2,
+            .handshakes_started = self.handshakes_started,
+            .handshakes_completed = self.handshakes_completed,
+            .handshakes_rejected = handshake_counters.rejected + self.capacity_rejections,
+            .ack_records_received = totals.ack_records_received,
+            .ack_records_sent = totals.ack_records_sent,
+            .nack_records_received = totals.nack_records_received,
+            .nack_records_sent = totals.nack_records_sent,
+            .retransmitted_datagrams = totals.retransmitted_datagrams,
+            .malformed_datagrams = self.malformed_datagrams,
+            .dropped_datagrams = self.dropped_datagrams,
+            .recovery_bytes = recovery_bytes,
+            .queued_packets_high_water = totals.queued_packets_high_water,
         };
+    }
+
+    pub fn setAdvertisement(self: *Listener, advertisement: []const u8) !void {
+        if (advertisement.len > self.advertisement.len) return error.AdvertisementTooLarge;
+        @memmove(self.advertisement[0..advertisement.len], advertisement);
+        self.handshake_handler.advertisement = self.advertisement[0..advertisement.len];
     }
     pub fn close(self: *Listener) void {
         if (self.closed) return;
@@ -495,6 +572,7 @@ pub const Listener = struct {
     pub fn processTimers(self: *Listener, now_ms: u64, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         var stats: PollStats = .{};
+        defer self.record(stats);
         self.processTimersInto(now_ms, callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
         return stats;
     }
@@ -502,6 +580,7 @@ pub const Listener = struct {
     pub fn poll(self: *Listener, timeout: std.Io.Timeout, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         var stats: PollStats = .{};
+        defer self.record(stats);
         if (self.pending_message_index == self.pending_message_count) {
             const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
             const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
@@ -539,6 +618,7 @@ pub const Listener = struct {
                 .accepted => |accepted| {
                     if (self.sessions.count() >= self.config.listener.maximum_connections) {
                         stats.rate_limited_or_dropped += 1;
+                        self.capacity_rejections += 1;
                         const response = offline.encodeNoFreeIncomingConnections(self.handshake_handler.server_guid, self.handshake_output) catch continue;
                         try self.socket.send(message.from, response);
                         continue;
@@ -575,6 +655,7 @@ pub const Listener = struct {
                         session.destroy();
                         return err;
                     };
+                    self.handshakes_started += 1;
                 },
             }
         }
@@ -633,6 +714,7 @@ pub const Listener = struct {
             return;
         };
         session.last_seen_ms = now_ms;
+        if (bridge.connected) self.handshakes_completed += 1;
         const incoming = processed_incoming.incoming;
         const extra_work = processed_incoming.work_units -| 1;
         remaining.* -= @min(remaining.*, extra_work);
@@ -724,9 +806,15 @@ pub const Listener = struct {
             };
         }
     }
+    fn record(self: *Listener, stats: PollStats) void {
+        self.malformed_datagrams += stats.malformed;
+        self.dropped_datagrams += stats.rate_limited_or_dropped;
+    }
+
     fn removeSession(self: *Listener, key: EndpointKey, callbacks: Callbacks) void {
         _ = self.deadlines.remove(key);
         const removed = self.sessions.fetchRemove(key) orelse return;
+        self.retired.add(removed.value.statistics());
         if (callbacks.disconnected) |notify| notify(callbacks.context, removed.value);
         removed.value.destroy();
     }
@@ -1001,6 +1089,45 @@ test "graceful session close drains data and retransmits the disconnect until AC
     try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+
+    const stats = listener.statistics();
+    try std.testing.expectEqual(@as(u64, 2), stats.ack_records_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.retransmitted_datagrams);
+    try std.testing.expectEqual(@as(u64, 3), stats.traffic.datagrams_sent);
+    try std.testing.expectEqual(@as(usize, 0), stats.recovery_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.queued_packets_high_water);
+}
+
+test "advertisement updates are bounded and used by the next pong" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;old" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 2048);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+
+    try listener.setAdvertisement("MCPE;Quark;11;1.21;7;100;");
+    var ping: [33]u8 = undefined;
+    var writer: @import("protocol/cursor.zig").Writer = .{ .data = &ping };
+    try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
+    try writer.u64be(1);
+    try writer.bytes(&offline.magic);
+    try writer.u64be(2);
+    try harness.inject(listener, peer.value.address, &ping);
+    var storage: [2048]u8 = undefined;
+    const pong = try peer.value.receive(io, &storage);
+    try std.testing.expectEqualStrings("MCPE;Quark;11;1.21;7;100;", pong.data[35..]);
+
+    const too_large: [2048]u8 = @splat('x');
+    try std.testing.expectError(error.AdvertisementTooLarge, listener.setAdvertisement(&too_large));
+    try listener.setAdvertisement(listener.advertisement[5..8]);
+    try std.testing.expectEqualStrings("Qua", listener.handshake_handler.advertisement);
+
+    const stats = listener.statistics();
+    try std.testing.expectEqual(@as(u64, 1), stats.unconnected_pings);
+    try std.testing.expectEqual(@as(u64, 1), stats.traffic.datagrams_sent);
+    try std.testing.expectEqual(@as(u64, pong.data.len), stats.traffic.bytes_sent);
 }
 
 test "session close is forced when the disconnect is never acknowledged" {

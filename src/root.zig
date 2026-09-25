@@ -25,6 +25,7 @@ pub const advanced = struct {
     pub const net = struct {
         pub const BufferOptions = @import("net/backend.zig").BufferOptions;
         pub const BufferSizes = @import("net/backend.zig").BufferSizes;
+        pub const Traffic = @import("net/backend.zig").Traffic;
         pub const Socket = @import("net/backend.zig").Socket;
     };
     pub const protocol = struct {

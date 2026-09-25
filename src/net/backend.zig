@@ -18,6 +18,13 @@ pub const BufferSizes = struct {
     send_bytes: ?u32,
 };
 
+pub const Traffic = struct {
+    datagrams_received: u64 = 0,
+    datagrams_sent: u64 = 0,
+    bytes_received: u64 = 0,
+    bytes_sent: u64 = 0,
+};
+
 pub const ReceiveBatch = struct {
     messages: []std.Io.net.IncomingMessage,
     dropped_oversize: usize,
@@ -29,6 +36,7 @@ pub const Socket = struct {
     value: std.Io.net.Socket,
     maximum_datagram_size: usize,
     buffer_sizes: BufferSizes,
+    traffic: Traffic = .{},
 
     pub fn bind(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize) !Socket {
         return bindWithBuffers(io, address, maximum_datagram_size, .{});
@@ -44,19 +52,27 @@ pub const Socket = struct {
         self.value.close(self.io);
         self.* = undefined;
     }
-    pub fn send(self: *const Socket, destination: std.Io.net.IpAddress, data: []const u8) !void {
+    pub fn send(self: *Socket, destination: std.Io.net.IpAddress, data: []const u8) !void {
         if (data.len > self.maximum_datagram_size) return error.DatagramTooLarge;
         try self.value.send(self.io, &destination, data);
+        self.traffic.datagrams_sent += 1;
+        self.traffic.bytes_sent += data.len;
     }
-    pub fn sendMany(self: *const Socket, messages: []std.Io.net.OutgoingMessage) !void {
-        for (messages) |message| if (message.data_len > self.maximum_datagram_size) return error.DatagramTooLarge;
+    pub fn sendMany(self: *Socket, messages: []std.Io.net.OutgoingMessage) !void {
+        var bytes: u64 = 0;
+        for (messages) |message| {
+            if (message.data_len > self.maximum_datagram_size) return error.DatagramTooLarge;
+            bytes += message.data_len;
+        }
         try self.value.sendMany(self.io, messages, .{});
+        self.traffic.datagrams_sent += messages.len;
+        self.traffic.bytes_sent += bytes;
     }
     pub fn kernelBufferSizes(self: *const Socket) BufferSizes {
         return self.buffer_sizes;
     }
 
-    pub fn receiveMany(self: *const Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8, timeout: std.Io.Timeout) !ReceiveBatch {
+    pub fn receiveMany(self: *Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8, timeout: std.Io.Timeout) !ReceiveBatch {
         if (messages.len == 0) return error.InvalidConfiguration;
         const required = try std.math.mul(usize, messages.len, self.maximum_datagram_size);
         if (data_storage.len < required) return error.NoSpaceLeft;
@@ -82,7 +98,9 @@ pub const Socket = struct {
             }
             messages[valid] = message;
             valid += 1;
+            self.traffic.bytes_received += message.data.len;
         }
+        self.traffic.datagrams_received += valid;
         return .{ .messages = messages[0..valid], .dropped_oversize = dropped, .trailing_error = actual_failure };
     }
 };

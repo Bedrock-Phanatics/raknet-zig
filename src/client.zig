@@ -185,7 +185,14 @@ pub const Client = struct {
         return self.socket.kernelBufferSizes();
     }
     pub fn statistics(self: *const Client) core_mod.Statistics {
-        return self.core.statistics();
+        var stats = self.core.statistics();
+        stats.ack_records_sent = self.receipts.ack_records_sent;
+        stats.nack_records_sent = self.receipts.nack_records_sent;
+        return stats;
+    }
+
+    pub fn traffic(self: *const Client) backend.Traffic {
+        return self.socket.traffic;
     }
     pub fn close(self: *Client) void {
         if (self.closed or self.closing) return;

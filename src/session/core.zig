@@ -32,6 +32,11 @@ pub const Statistics = struct {
     split_assemblies: usize,
     split_payload_bytes: usize,
     retained_payload_capacity_bytes: usize,
+    queued_packets_high_water: usize,
+    ack_records_received: u64,
+    nack_records_received: u64,
+    ack_records_sent: u64 = 0,
+    nack_records_sent: u64 = 0,
 };
 
 var next_send_owner: std.atomic.Value(u64) = .init(1);
@@ -235,6 +240,8 @@ pub const Core = struct {
     acknowledged_datagrams: u64 = 0,
     lost_datagrams: u64 = 0,
     retransmitted_datagrams: u64 = 0,
+    ack_records_received: u64 = 0,
+    nack_records_received: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, mtu: u16, config: Config) !Core {
         try config.validate();
@@ -242,6 +249,7 @@ pub const Core = struct {
         var receiver_state = try receiver.Receiver.init(allocator, config);
         errdefer receiver_state.deinit();
         var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, mtu);
+        recovery_state.maximum_delay_ms = config.timing.maximum_rto_ms;
         errdefer recovery_state.deinit();
         var outbound_state = try outbound_queue.Queue.init(
             allocator,
@@ -431,6 +439,9 @@ pub const Core = struct {
             .split_assemblies = receiver_state.splits.count(),
             .split_payload_bytes = receiver_state.splits.payloadBytes(),
             .retained_payload_capacity_bytes = recovery_capacity +| ordered_capacity +| split_capacity,
+            .queued_packets_high_water = self.outbound_state.high_water,
+            .ack_records_received = self.ack_records_received,
+            .nack_records_received = self.nack_records_received,
         };
     }
 
@@ -549,6 +560,7 @@ pub const Core = struct {
             },
             .ack => |decoded| blk: {
                 const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
+                self.ack_records_received += decoded.records.len;
                 self.acknowledged_datagrams +|= result.packets;
                 if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes);
                 if (result.rtt_sample_ms) |sample| self.rtt_state.observe(sample);
@@ -556,6 +568,7 @@ pub const Core = struct {
             },
             .nack => |decoded| blk: {
                 const marked = try self.recovery_state.markNack(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
+                self.nack_records_received += decoded.records.len;
                 self.lost_datagrams +|= marked;
                 if (marked != 0) self.congestion_state.lost(self.newest_sent);
                 break :blk .{ .incoming = .{ .nack_marked = marked }, .work_units = 1 + decoded.acknowledged_count };

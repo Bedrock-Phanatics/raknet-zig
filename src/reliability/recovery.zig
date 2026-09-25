@@ -18,6 +18,8 @@ const Slot = struct {
     deadline_ms: u64 = 0,
     in_flight_bytes: u16 = 0,
     transmissions: u8 = 1,
+    timeouts: u8 = 0,
+    nacked: bool = false,
     heap_index: u32 = none,
     active_previous: u32 = none,
     active_next: u32 = none,
@@ -42,6 +44,7 @@ pub const Recovery = struct {
     count_value: usize = 0,
     maximum_bytes: usize,
     maximum_transmissions: u8,
+    maximum_delay_ms: u32 = 5_000,
     mtu: u16,
     storage_policy: StoragePolicy,
     total_bytes: usize = 0,
@@ -180,15 +183,19 @@ pub const Recovery = struct {
                 break;
             }
             const block = &self.blocks[slot.block_index];
+            const timed_out = !slot.nacked;
             output[due_count] = .{
                 .sequence = slot.sequence,
                 .data = block.data[0..slot.data_len],
                 .in_flight_bytes = slot.in_flight_bytes,
-                .timed_out = slot.deadline_ms < now_ms,
+                .timed_out = timed_out,
             };
             due_count += 1;
             slot.transmissions += 1;
-            slot.deadline_ms = time.deadline(now_ms, rto_ms);
+            slot.nacked = false;
+            if (timed_out) slot.timeouts += 1;
+            const backoff = @as(u64, rto_ms) << @intCast(@min(slot.timeouts, 6));
+            slot.deadline_ms = time.deadline(now_ms, @max(rto_ms, @min(backoff, self.maximum_delay_ms)));
             self.siftDown(0);
         }
         return .{ .items = output[0..due_count], .exhausted = exhausted, .inspected = inspected };
@@ -238,6 +245,7 @@ pub const Recovery = struct {
     fn nackSlot(self: *Recovery, slot: *Slot, now_ms: u64) bool {
         if (slot.deadline_ms <= now_ms) return false;
         slot.deadline_ms = now_ms;
+        slot.nacked = true;
         self.siftUp(slot.heap_index);
         return true;
     }
@@ -408,7 +416,25 @@ test "recovery ring, duplicate ACKs, and deadlines" {
     var due: [2]Due = undefined;
     try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(61, 50, &due, 2).items.len);
     try std.testing.expectEqualStrings("two", due[0].data);
-    try std.testing.expectEqual(@as(?u64, 111), recovery.nextDeadline());
+    try std.testing.expectEqual(@as(?u64, 161), recovery.nextDeadline());
+}
+
+test "timeouts back off while NACK retransmits do not" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
+    defer recovery.deinit();
+    recovery.maximum_delay_ms = 300;
+    try recovery.track(0, "data", 4, 0, 50);
+    var due: [1]Due = undefined;
+    for ([_]u64{ 50, 150, 350, 650, 950 }) |deadline| {
+        try std.testing.expectEqual(deadline, recovery.nextDeadline().?);
+        try std.testing.expect(recovery.collectDue(deadline, 50, &due, 1).items[0].timed_out);
+    }
+    const now = recovery.nextDeadline().? - 1;
+    try std.testing.expectEqual(@as(usize, 1), try recovery.markNack(&.{.{ .first = 0, .last = 0 }}, now, 1));
+    try std.testing.expectEqual(@as(usize, 0), try recovery.markNack(&.{.{ .first = 0, .last = 0 }}, now, 1));
+    const nacked = recovery.collectDue(now, 50, &due, 1);
+    try std.testing.expect(!nacked.items[0].timed_out);
+    try std.testing.expectEqual(now + 300, recovery.nextDeadline().?);
 }
 
 test "ring rejects delayed wrap aliases" {
