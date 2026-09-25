@@ -511,76 +511,7 @@ pub const Listener = struct {
             remaining -= 1;
             const key = endpointKey(message.from);
             if (self.sessions.get(key)) |session| {
-                if (isOfflineHandshake(message.data)) {
-                    session.flushReceipts() catch |err| {
-                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.receipt, err).class);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                        continue;
-                    };
-                    const repeated = self.handshake_handler.handle(
-                        message.data,
-                        &key,
-                        std.hash.Wyhash.hash(self.source_secret, &key),
-                        now_ms / 30_000,
-                        now_ms,
-                        self.handshake_output,
-                    );
-                    switch (repeated) {
-                        .drop => stats.rate_limited_or_dropped += 1,
-                        .response => |wire| try self.socket.send(message.from, wire),
-                        .accepted => |accepted| try self.socket.send(message.from, accepted.response),
-                    }
-                    continue;
-                }
-                session.last_seen_ms = now_ms;
-                var bridge: DeliveryBridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
-                const processed_incoming = session.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, DeliveryBridge.deliver) catch |err| {
-                    remaining = 0;
-                    const failure = core_mod.classifyIncomingError(err);
-                    if (failure.disposition == .reject) {
-                        stats.malformed += 1;
-                        continue;
-                    }
-
-                    recordSessionFailure(&stats, failure.class);
-                    session.state = .closed;
-                    self.removeSession(key, callbacks);
-                    continue;
-                };
-                const incoming = processed_incoming.incoming;
-                const extra_work = processed_incoming.work_units -| 1;
-                remaining -= @min(remaining, extra_work);
-                if (incoming == .data) {
-                    session.queueReceipt(incoming.data, now_ms) catch |err| {
-                        const failure = core_mod.classifyTransitionError(.receipt, err);
-                        recordSessionFailure(&stats, failure.class);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                        continue;
-                    };
-                }
-                if (session.state != .closed) {
-                    const flushed = session.flushQueuedAtLimit(now_ms, remaining) catch |err| {
-                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.application_send, err).class);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                        continue;
-                    };
-                    remaining -= @min(remaining, flushed.datagrams);
-                }
-                if (session.state == .closed) {
-                    session.flushReceipts() catch |err| {
-                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.receipt, err).class);
-                    };
-                    self.removeSession(key, callbacks);
-                } else {
-                    session.schedule() catch {
-                        recordSessionFailure(&stats, .internal);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                    };
-                }
+                try self.processExisting(session, key, message, now_ms, callbacks, &stats, &remaining);
                 continue;
             }
 
@@ -636,6 +567,88 @@ pub const Listener = struct {
         }
         self.processTimersInto(now_ms, callbacks, &stats, remaining);
         return stats;
+    }
+
+    fn processExisting(
+        self: *Listener,
+        session: *Session,
+        key: EndpointKey,
+        message: std.Io.net.IncomingMessage,
+        now_ms: u64,
+        callbacks: Callbacks,
+        stats: *PollStats,
+        remaining: *usize,
+    ) !void {
+        if (isOfflineHandshake(message.data)) {
+            session.flushReceipts() catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
+            const repeated = self.handshake_handler.handle(
+                message.data,
+                &key,
+                std.hash.Wyhash.hash(self.source_secret, &key),
+                now_ms / 30_000,
+                now_ms,
+                self.handshake_output,
+            );
+            switch (repeated) {
+                .drop => stats.rate_limited_or_dropped += 1,
+                .response => |wire| try self.socket.send(message.from, wire),
+                .accepted => |accepted| try self.socket.send(message.from, accepted.response),
+            }
+            return;
+        }
+        var bridge: DeliveryBridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
+        const processed_incoming = session.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, DeliveryBridge.deliver) catch |err| {
+            remaining.* = 0;
+            const failure = core_mod.classifyIncomingError(err);
+            if (failure.disposition == .reject) {
+                stats.malformed += 1;
+                return;
+            }
+
+            recordSessionFailure(stats, failure.class);
+            session.state = .closed;
+            self.removeSession(key, callbacks);
+            return;
+        };
+        session.last_seen_ms = now_ms;
+        const incoming = processed_incoming.incoming;
+        const extra_work = processed_incoming.work_units -| 1;
+        remaining.* -= @min(remaining.*, extra_work);
+        if (incoming == .data) {
+            session.queueReceipt(incoming.data, now_ms) catch |err| {
+                const failure = core_mod.classifyTransitionError(.receipt, err);
+                recordSessionFailure(stats, failure.class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
+        }
+        if (session.state != .closed) {
+            const flushed = session.flushQueuedAtLimit(now_ms, remaining.*) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
+            remaining.* -= @min(remaining.*, flushed.datagrams);
+        }
+        if (session.state == .closed) {
+            session.flushReceipts() catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
+            };
+            self.removeSession(key, callbacks);
+        } else {
+            session.schedule() catch {
+                recordSessionFailure(stats, .internal);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+            };
+        }
     }
 
     fn processTimersInto(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats, maximum_work: usize) void {
@@ -812,6 +825,12 @@ test "listener answers an offline ping over loopback" {
     _ = try client.value.receive(io, &response);
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
+
+    scheduled.last_seen_ms = 1;
+    try client.send(listener.socket.value.address, &.{0x80});
+    const malformed_stats = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
+    try std.testing.expectEqual(@as(usize, 1), malformed_stats.malformed);
+    try std.testing.expectEqual(@as(u64, 1), scheduled.last_seen_ms);
 
     const Sender = struct {
         socket: *backend.Socket,

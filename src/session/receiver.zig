@@ -90,7 +90,6 @@ pub const Receiver = struct {
     pub fn process(self: *Receiver, data: []const u8, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !Receipt {
         if (data.len > self.config.protocol.maximum_datagram_size) return error.DatagramTooLarge;
 
-        // Validate the whole datagram before changing state.
         try self.validateDatagram(data);
         var datagram = try frame.decodeDatagram(data);
         if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;

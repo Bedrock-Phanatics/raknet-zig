@@ -34,7 +34,7 @@ pub const Handler = struct {
         };
     }
 
-    /// `endpoint` must be a canonical address+port byte representation; `source_key` should be keyed.
+    /// Pass a canonical address and port for `endpoint` and a keyed hash for `source_key`.
     pub fn handle(self: *Handler, datagram: []const u8, endpoint: []const u8, source_key: u64, epoch: u64, now_ms: u64, output: []u8) Action {
         if (datagram.len == 0 or datagram.len > 65_507) return .drop;
         return switch (datagram[0]) {

@@ -298,13 +298,13 @@ pub const Client = struct {
             remaining -= 1;
             if (!std.meta.eql(message.from, self.server)) continue;
             const now_ms = latest_ms;
-            self.last_seen_ms = now_ms;
             var bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
             const processed_incoming = self.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, PollBridge.deliver) catch |err| {
                 const failure = core_mod.classifyIncomingError(err);
                 if (failure.disposition == .close_session) self.abort();
                 return err;
             };
+            self.last_seen_ms = now_ms;
             const incoming = processed_incoming.incoming;
             const extra_work = processed_incoming.work_units -| 1;
             remaining -= @min(remaining, extra_work);

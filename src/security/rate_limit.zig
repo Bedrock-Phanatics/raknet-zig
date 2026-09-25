@@ -29,7 +29,7 @@ pub const Limiter = struct {
         if (cost == 0 or cost > self.options.burst or cost > self.options.global_burst) return false;
         refill(&self.global_tokens, &self.global_updated_ms, now_ms, self.options.global_tokens_per_second, self.options.global_burst);
         const slot = &self.entries[key % self.entries.len];
-        if (!slot.occupied or slot.key != key) slot.* = .{ .key = key, .tokens = scaled(self.options.burst), .updated_ms = now_ms, .occupied = true };
+        if (!slot.occupied) slot.* = .{ .key = key, .tokens = scaled(self.options.burst), .updated_ms = now_ms, .occupied = true } else slot.key = key;
         refill(&slot.tokens, &slot.updated_ms, now_ms, self.options.tokens_per_second, self.options.burst);
         const needed = scaled(cost);
         if (slot.tokens < needed or self.global_tokens < needed) return false;
@@ -50,7 +50,7 @@ fn refill(tokens: *u64, updated_ms: *u64, now_ms: u64, per_second: u32, burst: u
     updated_ms.* = now_ms;
 }
 
-test "per-source and global buckets are bounded" {
+test "source and global buckets are bounded" {
     var entries: [4]Entry = undefined;
     var limiter = try Limiter.init(&entries, .{ .tokens_per_second = 2, .burst = 2, .global_tokens_per_second = 3, .global_burst = 3 }, 0);
     try std.testing.expect(limiter.allow(1, 1, 0));
@@ -66,4 +66,14 @@ test "long clock advances saturate token refill" {
     var limiter = try Limiter.init(&entries, .{ .tokens_per_second = 1, .burst = 1, .global_tokens_per_second = 1, .global_burst = 1 }, 0);
     try std.testing.expect(limiter.allow(1, 1, 0));
     try std.testing.expect(limiter.allow(1, 1, std.math.maxInt(u64)));
+}
+
+test "colliding sources cannot reset a spent bucket" {
+    var entries: [1]Entry = undefined;
+    var limiter = try Limiter.init(&entries, .{ .tokens_per_second = 1, .burst = 2, .global_tokens_per_second = 100, .global_burst = 100 }, 0);
+    try std.testing.expect(limiter.allow(1, 1, 0));
+    try std.testing.expect(limiter.allow(2, 1, 0));
+    try std.testing.expect(!limiter.allow(1, 1, 0));
+    try std.testing.expect(!limiter.allow(2, 1, 0));
+    try std.testing.expect(limiter.allow(2, 1, 1000));
 }

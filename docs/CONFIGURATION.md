@@ -44,7 +44,7 @@ Default origins are:
 
 | Field | Default | Scope | Origin | Memory and exceed behavior |
 | --- | ---: | --- | --- | --- |
-| `maximum_pending_handshakes` | 4,096 sources | Listener | Policy | Sizes rate-limit state; additional sources replace bounded entries. |
+| `maximum_pending_handshakes` | 4,096 sources | Listener | Policy | Sizes rate-limit state; sources sharing a slot share its budget. |
 | `maximum_connections` | 4,096 sessions | Listener | Policy | Sizes session/deadline tables; new clients receive a capacity response. |
 
 `ServerOptions.maximum_session_memory_bytes` is the listener-wide allocation
