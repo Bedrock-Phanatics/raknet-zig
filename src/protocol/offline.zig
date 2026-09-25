@@ -134,7 +134,7 @@ pub fn encodeOpenConnectionRequest1(protocol_version: u8, mtu: u16, output: []u8
 }
 
 pub const OpenConnectionReply1 = struct { server_guid: u64, cookie: ?u32, mtu: u16 };
-pub fn decodeOpenConnectionReply1(data: []const u8, minimum_mtu: u16, maximum_mtu: u16) !OpenConnectionReply1 {
+pub fn decodeOpenConnectionReply1(data: []const u8) !OpenConnectionReply1 {
     var reader: cursor.Reader = .{ .data = data };
     if (try reader.byte() != @intFromEnum(Id.open_connection_reply_1)) return error.WrongPacket;
     try expectMagic(&reader);
@@ -142,9 +142,7 @@ pub fn decodeOpenConnectionReply1(data: []const u8, minimum_mtu: u16, maximum_mt
     const security = try reader.byte();
     if (security > 1) return error.InvalidBoolean;
     const value = if (security != 0) try reader.u32be() else null;
-    const mtu = try reader.u16be();
-    if (mtu < minimum_mtu or mtu > maximum_mtu) return error.InvalidMtu;
-    return .{ .server_guid = guid, .cookie = value, .mtu = mtu };
+    return .{ .server_guid = guid, .cookie = value, .mtu = try reader.u16be() };
 }
 
 pub fn encodeOpenConnectionRequest2(server_address: Address, cookie: ?u32, mtu: u16, client_guid: u64, output: []u8) ![]u8 {

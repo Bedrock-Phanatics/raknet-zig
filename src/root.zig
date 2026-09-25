@@ -47,6 +47,7 @@ pub const advanced = struct {
         pub const Core = @import("session/core.zig").Core;
         pub const Receiver = @import("session/receiver.zig").Receiver;
         pub const Transmitter = @import("session/transmitter.zig").Transmitter;
+        pub const client_handshake = @import("session/client_handshake.zig");
         pub const deadline_queue = @import("session/deadline_queue.zig");
         pub const offline_handshake = @import("session/offline_handshake.zig");
         pub const receipt_batch = @import("session/receipt_batch.zig");
@@ -55,4 +56,10 @@ pub const advanced = struct {
 
 test {
     std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(minecraft);
+    std.testing.refAllDecls(advanced);
+    std.testing.refAllDecls(advanced.net);
+    std.testing.refAllDecls(advanced.protocol);
+    std.testing.refAllDecls(advanced.reliability);
+    std.testing.refAllDecls(advanced.session);
 }
