@@ -51,6 +51,7 @@ pub const Client = struct {
     pending_message_index: usize = 0,
     pending_message_count: usize = 0,
     pending_receive_error: ?anyerror = null,
+    timer_turn: bool = false,
     closing: bool = false,
     closed: bool = false,
     rejected_datagrams: u64 = 0,
@@ -195,6 +196,8 @@ pub const Client = struct {
     pub fn traffic(self: *const Client) backend.Traffic {
         return self.socket.traffic;
     }
+    /// Starts graceful shutdown. Keep calling poll() or processTimers() until isClosed().
+    /// Use destroy() to close immediately.
     pub fn close(self: *Client) void {
         if (self.closed or self.closing) return;
         self.closing = true;
@@ -311,6 +314,11 @@ pub const Client = struct {
 
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
+        if (self.timer_turn) {
+            self.timer_turn = false;
+            try self.processTimers(time.nowMilliseconds(self.io));
+            return 0;
+        }
         if (self.pending_receive_error) |err| {
             self.pending_receive_error = null;
             return err;
@@ -382,6 +390,9 @@ pub const Client = struct {
         self.advanceClose(latest_ms) catch |err| {
             self.abort();
             return err;
+        };
+        if (remaining == 0) if (self.nextDeadline()) |deadline| {
+            self.timer_turn = deadline <= latest_ms;
         };
         return delivered;
     }

@@ -1,8 +1,8 @@
 # raknet-zig
 
-A RakNet transport library for Minecraft: Bedrock Edition, written for Zig 0.16. It provides client and server connections, reliable and ordered delivery, retransmission, congestion control, and split packet reassembly.
+A RakNet client and server library for Minecraft: Bedrock Edition, written in Zig.
 
-> Version 0.1.0. Public APIs may change before 1.0.
+> Version 0.2.4. Public APIs may change before 1.0.
 
 ## Install
 
@@ -86,19 +86,21 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-Payload bytes are borrowed for the duration of their callback. Call `payload.toOwned(allocator)` to keep them afterward, and release the owned payload when done. Keep each client or listener on one event loop.
+Payloads are valid only during their callback. Use `payload.toOwned(allocator)` to retain a copy and release it when done. Keep each client or listener on one event loop.
 
-`send` queues a copy of the payload. Use `trySend` to reject sends under backpressure, or `queueSend` and `flush` to control queued sends. `cancelSend` can cancel a queued send before transmission.
+`send` sends immediately or queues a copy, returning an error if the queue is full. `trySend` returns `false` under backpressure without queuing. The caller can reuse its buffer after either call.
+
+`Client.close()` starts graceful shutdown. Keep calling `poll()` or `processTimers()` until `isClosed()` is true. `Session.close()` requires continued listener polling. Closing rejects new sends and drains pending data until the shutdown timeout. Use `destroy()` for immediate teardown.
 
 ## Minecraft batches
 
-The optional `raknet.minecraft.batch` codec handles Bedrock packet framing and compression. Decode a batch only after the application has authenticated and decrypted it, and use the compression mode negotiated for that connection. The decoder supports borrowed and owned results with configurable size limits.
+`raknet.minecraft.batch` handles Bedrock packet framing and compression. Decode authenticated, decrypted data using the connection's negotiated compression mode and appropriate size limits.
 
 ## Configuration and scope
 
-Client and server options expose timeouts, connection limits, memory budgets, and per-poll work limits. Defaults are bounded; tune them for your traffic and deployment. See the [configuration guide](docs/CONFIGURATION.md) for the available settings.
+See the [configuration guide](docs/CONFIGURATION.md) for timeouts, connection limits, memory budgets, and per-poll work limits.
 
-The library validates packet structure and bounds allocation and protocol work on untrusted traffic. It implements the RakNet transport, not Bedrock login, authentication, or encryption. Applications remain responsible for those layers.
+Applications handle Bedrock login, authentication, and encryption.
 
 ## Development
 

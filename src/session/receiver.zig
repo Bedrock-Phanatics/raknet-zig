@@ -7,6 +7,7 @@ const frame = @import("../protocol/frame.zig");
 const ordered_store = @import("../reliability/ordered_store.zig");
 const reassembly = @import("../reliability/reassembly.zig");
 const receive_window = @import("../reliability/receive_window.zig");
+const uint24 = @import("../util/uint24.zig");
 
 pub const Receipt = struct {
     acknowledge: ?u32 = null,
@@ -157,7 +158,11 @@ pub const Receiver = struct {
     fn beginDatagram(self: *Receiver, sequence: u32) !?Receipt {
         self.stale = false;
         return switch (self.datagrams.inspect(sequence, self.config.protocol.maximum_acknowledged_datagrams)) {
-            .accepted, .too_far_ahead => null,
+            .accepted => null,
+            .too_far_ahead => if (uint24.distance(self.datagrams.expected, sequence) <= self.config.protocol.maximum_datagram_gap)
+                null
+            else
+                error.DatagramWindowExceeded,
             .stale => {
                 self.stale = true;
                 return null;
@@ -907,6 +912,45 @@ test "ordered and reliable indices cross the 24-bit wrap" {
     const replay = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0xffffff, .order_index = 0xffffff, .order_channel = 0, .payload = "second" }};
     _ = try receiver.process(try testDatagram(1, &replay, &storage), 1, &collector, TestCollector.deliver);
     try std.testing.expectEqual(@as(usize, 3), collector.count);
+}
+
+test "datagram jumps are bounded before delivery including wrap and repeated attacks" {
+    var config: Config = .{};
+    config.protocol.receive_window = 8;
+    config.protocol.maximum_datagram_gap = 32;
+    config.protocol.maximum_acknowledged_datagrams = 4;
+    for ([_]u32{ 0, 0xfffffc }) |initial| {
+        var receiver = try Receiver.init(std.testing.allocator, config);
+        defer receiver.deinit();
+        receiver.datagrams = try receive_window.Window.init(receiver.datagram_storage, initial);
+        var collector: TestCollector = .{};
+        var storage: [128]u8 = undefined;
+        const frames = [_]frame.Frame{.{ .reliability = .unreliable, .payload = "ok" }};
+        var scratch: [1]frame.Frame = undefined;
+        const first = try receiver.process(try testDatagram(initial, &frames, &storage), 0, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(?u32, initial), first.acknowledge);
+        const expected = receiver.datagrams.expected;
+        const next = receiver.datagrams.next;
+        for (0..32) |_| {
+            for ([_]u32{ 33, 0x7fffff }) |gap| {
+                const wire = try testDatagram(uint24.add(expected, gap), &frames, &storage);
+                try std.testing.expectError(error.DatagramWindowExceeded, receiver.process(wire, 1, &collector, TestCollector.deliver));
+                try std.testing.expectError(error.DatagramWindowExceeded, receiver.processWithScratch(wire, 1, &scratch, &collector, TestCollector.deliver));
+            }
+        }
+        try std.testing.expectEqual(expected, receiver.datagrams.expected);
+        try std.testing.expectEqual(next, receiver.datagrams.next);
+        try std.testing.expectEqual(@as(usize, 1), collector.count);
+        const ordinary = try receiver.process(try testDatagram(uint24.add(expected, 2), &frames, &storage), 2, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(usize, 2), ordinary.missing.?.count);
+        const jump = uint24.add(expected, 32);
+        const recovered = try receiver.processWithScratch(try testDatagram(jump, &frames, &storage), 3, &scratch, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(?u32, jump), recovered.acknowledge);
+        try std.testing.expectEqual(@as(usize, 4), recovered.missing.?.count);
+        const stale = try receiver.process(try testDatagram(initial, &frames, &storage), 4, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(?u32, initial), stale.acknowledge);
+        try std.testing.expectEqual(@as(usize, 3), collector.count);
+    }
 }
 
 test "a lost datagram does not block the datagram window" {

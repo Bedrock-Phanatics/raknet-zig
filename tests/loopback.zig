@@ -151,6 +151,20 @@ test "client and server complete a real loopback handshake" {
     try std.testing.expectEqual(retransmission_deadline, client.nextDeadline().?);
     try client.processTimers(retransmission_deadline);
     try std.testing.expect(client.core.nextRetransmissionDeadline().? > retransmission_deadline);
+
+    client.core.config.batching.maximum_packets_per_iteration = 1;
+    try client.receipts.append(.{ .acknowledge = 0 });
+    client.ack_deadline_ms = 0;
+    var invalid = [_]u8{0};
+    for (client.messages[0..3]) |*message| message.* = .{ .from = client.server, .data = &invalid, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+    client.pending_message_index = 0;
+    client.pending_message_count = 3;
+    _ = try client.poll(.none, &collector, ClientCollector.collect);
+    try std.testing.expectEqual(@as(usize, 1), client.pending_message_index);
+    _ = try client.poll(.none, &collector, ClientCollector.collect);
+    try std.testing.expectEqual(@as(usize, 1), client.pending_message_index);
+    try std.testing.expect(client.receipts.isEmpty());
+    while (client.pending_message_count != 0) _ = try client.poll(.none, &collector, ClientCollector.collect);
     try std.testing.expectError(error.Timeout, client.poll(.none, &collector, ClientCollector.collect));
     try std.testing.expectError(error.ConnectionTimedOut, client.processTimers(std.math.maxInt(u64)));
     try std.testing.expect(client.nextDeadline() == null);

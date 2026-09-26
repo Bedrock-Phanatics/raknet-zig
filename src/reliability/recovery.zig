@@ -196,7 +196,7 @@ pub const Recovery = struct {
             const timed_out = !slot.nacked;
             slot.transmissions +|= 1;
             slot.nacked = false;
-            if (timed_out) slot.timeouts += 1;
+            if (timed_out) slot.timeouts +|= 1;
             const backoff = @as(u64, rto_ms) << @intCast(@min(slot.timeouts, 6));
             slot.deadline_ms = time.deadline(now_ms, @max(rto_ms, @min(backoff, self.maximum_delay_ms)));
             const moved = if (next_sequence) |next| self.resequence(self.heap[0], next) else slot;
@@ -539,6 +539,43 @@ test "resends move to a fresh sequence and keep their state" {
     try std.testing.expectEqual(@as(u32, 0xffffff), wrapped.items[0].sequence);
     try std.testing.expectEqual(@as(u32, 0), next);
     try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 0xffffff, .last = 0xffffff }}, 60, 8)).packets);
+}
+
+test "repeated resends survive ring collisions wrap and long abandon timeouts" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
+    defer recovery.deinit();
+    recovery.minimum_abandon_ms = std.math.maxInt(u32);
+    try recovery.track(0xfffffe, "\x84\xfe\xff\xffa", 5, 0, 1);
+    try recovery.track(3, "\x84\x03\x00\x00b", 5, 0, 1);
+    var next: u32 = 0xffffff;
+    var due: [2]Due = undefined;
+    const collision = recovery.collectDueResequenced(1, 1, &due, 2, &next);
+    try std.testing.expectEqual(@as(usize, 2), collision.items.len);
+    try std.testing.expectEqual(@as(u32, 0xffffff), next);
+    // Simulate an unreliable send using the blocked sequence.
+    next = 0;
+    for (0..300) |iteration| {
+        const batch = recovery.collectDueResequenced((iteration + 1) * 5000, 1, &due, 2, &next);
+        try std.testing.expectEqual(@as(usize, 2), batch.items.len);
+        try std.testing.expectEqual(@as(usize, 0), batch.exhausted);
+        try std.testing.expectEqual(@as(usize, 2), recovery.count());
+        try std.testing.expectEqual(@as(usize, 10), recovery.payloadBytes());
+        for (batch.items) |item| {
+            const wire_sequence = @as(u32, item.data[1]) | (@as(u32, item.data[2]) << 8) | (@as(u32, item.data[3]) << 16);
+            try std.testing.expectEqual(item.sequence, wire_sequence);
+        }
+    }
+    const current = due[0].sequence;
+    const previous = recovery.find(current).?.previous;
+    try std.testing.expect(previous != none);
+    try std.testing.expectEqual(@as(usize, 0), try recovery.markNack(&.{.{ .first = previous, .last = previous }}, 1_500_001, 4));
+    const result = try recovery.acknowledge(&.{.{ .first = current, .last = current }}, 1_500_001, 4);
+    try std.testing.expectEqual(@as(usize, 1), result.packets);
+    try std.testing.expectEqual(@as(usize, 5), result.bytes);
+    try std.testing.expectEqual(@as(?u64, null), result.rtt_sample_ms);
+    const other = due[1].sequence;
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = other, .last = other }}, 1_500_001, 4)).packets);
+    try std.testing.expectEqual(@as(usize, 0), recovery.count());
 }
 
 test "a pinned slot is expedited once" {

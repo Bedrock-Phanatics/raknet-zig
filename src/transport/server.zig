@@ -426,6 +426,7 @@ pub const Listener = struct {
     send_batch: backend.SendBatch,
     pending_message_index: usize = 0,
     pending_message_count: usize = 0,
+    timer_turn: bool = false,
     closed: bool = false,
     handshake_timeout_ms: u32,
     ack_capacity: usize,
@@ -592,6 +593,11 @@ pub const Listener = struct {
         defer self.socket.endBatch();
         var stats: PollStats = .{};
         defer self.record(stats);
+        if (self.timer_turn) {
+            self.timer_turn = false;
+            self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
+            return stats;
+        }
         if (self.pending_message_index == self.pending_message_count) {
             const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
             const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
@@ -675,6 +681,9 @@ pub const Listener = struct {
             self.pending_message_count = 0;
         }
         self.processTimersInto(now_ms, callbacks, &stats, remaining);
+        if (remaining == 0) if (self.nextDeadline()) |deadline| {
+            self.timer_turn = deadline <= now_ms;
+        };
         return stats;
     }
 
@@ -1243,6 +1252,34 @@ test "every due session timer runs when several are due together" {
     try std.testing.expectEqual(@as(?u64, null), session.ack_deadline_ms);
     try std.testing.expectEqual(@as(?u64, null), session.outbound_deadline_ms);
     try std.testing.expect(session.core.nextRetransmissionDeadline().? > now);
+}
+
+test "continuous malformed input cannot starve a session close deadline" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var config: Config = .{};
+    config.batching.maximum_packets_per_iteration = 1;
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "test", .config = config });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 2048);
+    defer peer.close();
+    const session = try CloseHarness.open(listener, &peer);
+    session.state = .closing;
+    session.core.close_deadline_ms = 0;
+    try session.schedule();
+    var harness: CloseHarness = .{};
+    var invalid = [_]u8{0};
+    for (listener.messages[0..3]) |*message| message.* = .{ .from = peer.value.address, .data = &invalid, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+    listener.pending_message_count = 3;
+    _ = try listener.poll(.none, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), listener.pending_message_index);
+    try std.testing.expectEqual(@as(usize, 1), listener.sessions.count());
+    _ = try listener.poll(.none, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), listener.pending_message_index);
+    try std.testing.expectEqual(@as(usize, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    _ = try listener.poll(.none, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 2), listener.pending_message_index);
 }
 
 test "global turn budget carries unread batch entries fairly" {

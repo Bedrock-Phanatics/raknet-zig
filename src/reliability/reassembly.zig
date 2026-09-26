@@ -125,10 +125,8 @@ pub const Reassembler = struct {
         if (payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
 
         var slot = self.find(id);
-        if (slot != null and self.assemblies[slot.?].count != count_value) {
-            self.remove(slot.?);
-            slot = null;
-        }
+        // Delayed fragments can reuse an active split ID.
+        if (slot != null and self.assemblies[slot.?].count != count_value) return null;
         var created = false;
         if (slot == null) {
             if (self.assembly_count == self.assemblies.len) return error.TooManyAssemblies;
@@ -357,12 +355,40 @@ test "split assembly handles duplicates conflicts collisions and expiry" {
     try std.testing.expect((try value.push(3, 3, 1, "y", 6)) == null);
     try std.testing.expectEqual(@as(usize, 1), value.count());
     try std.testing.expectEqual(@as(usize, 1), value.total_bytes);
-    try std.testing.expectEqual(@as(usize, 3), value.total_parts);
+    try std.testing.expectEqual(@as(usize, 2), value.total_parts);
     try std.testing.expect((try value.push(4, 2, 0, "z", 7)) == null);
-    try std.testing.expectEqual(@as(?u64, 16), value.nextDeadline());
+    try std.testing.expectEqual(@as(?u64, 15), value.nextDeadline());
     try std.testing.expectEqual(@as(usize, 2), value.expire(100, 2).expired);
     try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
     try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+}
+
+test "conflicting split counts preserve progress deadlines and budgets across ID reuse" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .maximum_total_parts = 4, .timeout_ms = 10 });
+    defer value.deinit();
+    for ([_]u16{ 0xffff, 0, 0xffff }) |id| {
+        try std.testing.expect((try value.push(id, 2, 0, "a", 0)) == null);
+        const capacity = value.retainedCapacity();
+        for (1..10) |now| {
+            try std.testing.expect((try value.push(id, 3, 2, "old", now)) == null);
+            try std.testing.expectEqual(@as(usize, 1), value.count());
+            try std.testing.expectEqual(@as(usize, 1), value.total_bytes);
+            try std.testing.expectEqual(@as(usize, 2), value.total_parts);
+            try std.testing.expectEqual(capacity, value.retainedCapacity());
+            try std.testing.expectEqual(@as(?u64, 10), value.nextDeadline());
+        }
+        const complete = (try value.push(id, 2, 1, "b", 9)).?;
+        defer complete.deinit();
+        try std.testing.expectEqualStrings("ab", complete.bytes);
+        try std.testing.expectEqual(@as(usize, 0), value.count());
+        try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
+        try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+        try std.testing.expect((try value.push(id, 3, 0, "new", 10)) == null);
+        try std.testing.expect((try value.push(id, 2, 1, "delayed", 19)) == null);
+        try std.testing.expectEqual(@as(usize, 1), value.expire(20, 1).expired);
+        try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
+        try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+    }
 }
 
 test "split pressure rejects new work without disturbing existing assemblies" {

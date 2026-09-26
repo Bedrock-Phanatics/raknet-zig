@@ -7,6 +7,7 @@ pub const ProtocolLimits = struct {
     maximum_frame_payload: usize = 8192,
     maximum_acknowledged_datagrams: usize = 4096,
     receive_window: usize = 4096,
+    maximum_datagram_gap: u32 = 65_536,
     reliable_window: usize = 4096,
     maximum_order_channels: usize = 32,
     maximum_split_parts: usize = 8192,
@@ -18,6 +19,7 @@ pub const ProtocolLimits = struct {
         if (self.maximum_frame_payload == 0 or self.maximum_frame_payload > self.maximum_split_bytes) return error.InvalidConfiguration;
         if (self.maximum_acknowledged_datagrams == 0 or self.maximum_acknowledged_datagrams > 0x800000) return error.InvalidConfiguration;
         if (self.receive_window == 0 or self.receive_window > 0x7fffff) return error.InvalidConfiguration;
+        if (self.maximum_datagram_gap < self.receive_window or self.maximum_datagram_gap >= 0x800000) return error.InvalidConfiguration;
         if (self.reliable_window == 0 or self.reliable_window > 0x7fffff) return error.InvalidConfiguration;
         if (self.maximum_order_channels == 0 or self.maximum_order_channels > 256) return error.InvalidConfiguration;
         if (self.maximum_split_parts < 2 or self.maximum_split_bytes == 0) return error.InvalidConfiguration;
@@ -140,4 +142,14 @@ test "default configuration is internally consistent" {
     bad = .{};
     bad.session.reserved_control_queue_bytes = 0;
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+}
+
+test "datagram gap policy stays within modular sequence bounds" {
+    var config: Config = .{};
+    config.protocol.maximum_datagram_gap = @intCast(config.protocol.receive_window);
+    try config.validate();
+    config.protocol.maximum_datagram_gap -= 1;
+    try std.testing.expectError(error.InvalidConfiguration, config.validate());
+    config.protocol.maximum_datagram_gap = 0x800000;
+    try std.testing.expectError(error.InvalidConfiguration, config.validate());
 }

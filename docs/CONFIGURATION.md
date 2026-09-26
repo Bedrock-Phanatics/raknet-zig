@@ -19,11 +19,14 @@ Default origins are:
 | `maximum_datagram_size` | 2,048 B | Endpoint | Policy | Sets each receive slot; larger datagrams are dropped. |
 | `maximum_frame_payload` | 8 KiB | Session | Policy | Oversized decoded frames are rejected. |
 | `maximum_acknowledged_datagrams` | 4,096 | Session | Policy | Bounds ACK/NACK expansion and work. |
-| `receive_window` | 4,096 packets | Session | Reference | Allocates one receive bit per slot; large jumps are rejected. |
-| `reliable_window` | 4,096 packets | Session | Reference | Allocates one reliable bit per slot; large jumps close the session. |
+| `receive_window` | 4,096 packets | Session | Reference | Allocates one boolean per slot; accepted forward jumps slide past older holes. |
+| `maximum_datagram_gap` | 65,536 packets | Session | Policy | Maximum forward distance from the oldest pending datagram; larger jumps are rejected without ACK or state changes. Must be at least `receive_window` and below the 24-bit half-range. |
+| `reliable_window` | 4,096 packets | Session | Reference | Allocates one boolean per slot; large jumps close the session. |
 | `maximum_order_channels` | 32 | Session | Compatibility | Allocates per-channel state; larger channel IDs are rejected. |
 | `maximum_split_parts` | 8,192 | Session | Compatibility | Rejects larger split counts. |
 | `maximum_split_bytes` | 4 MiB | Message | Policy | Rejects larger outbound or reassembled messages. |
+
+The default datagram gap allows recovery across sixteen default receive windows without allocating for the gap. Window advancement stays bounded by `receive_window`, and NACK reporting by `maximum_acknowledged_datagrams`.
 
 ## Session limits
 
@@ -31,7 +34,7 @@ Default origins are:
 | --- | ---: | --- | --- | --- |
 | `maximum_retransmissions` | 1,024 packets | Session | Reference | Preallocates recovery metadata and bounds unacknowledged reliable datagrams; further sends wait for ACKs. |
 | `maximum_recovery_bytes` | 16 MiB | Session | Policy | Independently caps retained wire data; excess sends fail. |
-| `maximum_ordered_packets` | 4,096 packets | Session | Policy | Preallocates ordered metadata; excess packets close the session. |
+| `maximum_ordered_packets` | 4,096 packets | Session | Policy | Ordered metadata grows lazily up to this limit; excess packets close the session. |
 | `maximum_ordered_bytes` | 16 MiB | Session | Policy | Caps buffered out-of-order payload; excess closes the session. |
 | `maximum_concurrent_splits` | 64 | Session | Policy | Preallocates assembly slots; a new assembly beyond it is left unacknowledged for retry. |
 | `maximum_split_bytes_per_connection` | 16 MiB | Session | Policy | Caps all incomplete fragment payloads; excess fragments are left unacknowledged for retry. |

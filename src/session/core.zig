@@ -540,7 +540,7 @@ pub const Core = struct {
         return free;
     }
 
-    /// Copies a reliable datagram into bounded recovery storage before it is handed to the socket.
+    /// Copies wire data so the caller can reuse its buffer.
     pub fn trackSent(self: *Core, sequence: u32, wire: []const u8, in_flight_bytes: usize, now_ms: u64) !void {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         try self.congestion_state.sent(in_flight_bytes);

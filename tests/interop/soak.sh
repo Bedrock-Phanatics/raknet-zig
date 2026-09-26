@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Long-running manual soak. Prints progress lines every 10s so RSS drift is visible.
 # Example: DURATION=3600 CONNECTIONS=100 PAYLOAD=512 bash tests/interop/soak.sh
 set -u
 server_bin=${SERVER_BIN:-./zig-out/bin/raknet-interop}
