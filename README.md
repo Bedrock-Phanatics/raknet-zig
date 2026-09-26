@@ -94,7 +94,7 @@ Payloads are valid only during their callback. Use `payload.toOwned(allocator)` 
 
 ## Minecraft batches
 
-Minecraft batch handling is provided by [Bedwire](https://github.com/Bedrock-Phanatics/bedwire-zig)
+Minecraft batch handling is provided by [Bedwire](https://github.com/Bedrock-Phanatics/bedwire)
 
 ## Configuration and scope
 
