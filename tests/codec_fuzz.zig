@@ -22,19 +22,6 @@ fn exercise(input: []u8) void {
     _ = raknet.advanced.protocol.offline.decodeOpenConnectionReply1(input) catch {};
     _ = raknet.advanced.protocol.offline.decodeOpenConnectionReply2(input, 0, 65535) catch {};
     exerciseHandshakes(input);
-    var batch_decoder = raknet.minecraft.batch.Decoder.init(std.heap.page_allocator, .{
-        .maximum_compressed_bytes = 4096,
-        .maximum_decompressed_bytes = 8192,
-        .maximum_packets = 64,
-        .maximum_retained_capacity = 4096,
-        .maximum_work_bytes_per_window = 16 * 1024,
-    }) catch return;
-    defer batch_decoder.deinit();
-    var unused: u8 = 0;
-    const Discard = struct {
-        fn packet(_: *anyopaque, _: raknet.minecraft.batch.BorrowedPacket) !void {}
-    };
-    _ = batch_decoder.decodeBorrowed(input, .declared, 0, &unused, Discard.packet) catch {};
 }
 
 fn exerciseHandshakes(input: []const u8) void {

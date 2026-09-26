@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const batch_bench = @import("batch.zig");
 const workload_bench = @import("workload.zig");
 const raknet = @import("raknet");
 const ack = raknet.advanced.protocol.ack;
@@ -299,7 +298,6 @@ pub fn main(init: std.process.Init) !void {
             ack_delay_10.datagrams,
         },
     );
-    try batch_bench.run(io);
     try workload_bench.run(io);
     try @import("link.zig").run(io);
     const send_single_ns = try benchmarkSend(io, false);

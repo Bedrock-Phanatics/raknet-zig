@@ -2,7 +2,7 @@
 
 A RakNet client and server library for Minecraft: Bedrock Edition, written in Zig.
 
-> Version 0.2.5. Public APIs may change before 1.0.
+> Version 0.2.6. Public APIs may change before 1.0.
 
 ## Install
 
@@ -94,7 +94,7 @@ Payloads are valid only during their callback. Use `payload.toOwned(allocator)` 
 
 ## Minecraft batches
 
-`raknet.minecraft.batch` handles Bedrock packet framing and compression. Decode authenticated, decrypted data using the connection's negotiated compression mode and appropriate size limits.
+Minecraft batch handling is provided by [Bedwire](https://github.com/Bedrock-Phanatics/bedwire)
 
 ## Configuration and scope
 
