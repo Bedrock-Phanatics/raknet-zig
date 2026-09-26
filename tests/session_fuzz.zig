@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const raknet = @import("raknet");
 
 const Core = raknet.advanced.session.Core;
@@ -45,12 +46,12 @@ fn exercise(input: []const u8) !void {
     while (cursor < input.len) {
         const control = input[cursor];
         cursor += 1;
-        const amount = @min(input.len - cursor, @as(usize, control & 0x3f));
+        const amount = @min(input.len - cursor, @as(usize, control & 0x1f));
         const bytes = input[cursor..][0..amount];
         cursor += amount;
         now +%= control;
 
-        switch (control >> 6) {
+        switch (control >> 5) {
             0 => _ = core.processIncomingCountedWithScratch(bytes, now, &frames, &unused, Sink.deliver) catch {},
             1 => {
                 if (bytes.len != 0) {
@@ -68,7 +69,26 @@ fn exercise(input: []const u8) !void {
                 var due: [8]raknet.advanced.reliability.recovery.Due = undefined;
                 _ = core.collectRetransmissions(now, &due, 8);
             },
-            else => _ = core.expireSplits(now, 8),
+            3 => _ = core.expireSplits(now, 8),
+            4 => if (bytes.len != 0) {
+                _ = core.sendControl(bytes, if (control & 1 == 0) .unreliable else .reliable_ordered, 0, &scratch, now, &unused, Sink.emit) catch {};
+            },
+            5 => {
+                core.beginClose(now);
+                if (core.advanceClose(now) catch null) |step| if (step == .flush) {
+                    _ = core.flushAllOutbound(&scratch, 4, now, &unused, Sink.emit) catch {};
+                };
+            },
+            6 => if (bytes.len >= 4) {
+                const count = @as(u32, bytes[1] % 20) + 1;
+                const pushed = core.receiver_state.splits.push(bytes[0], count, bytes[2] % 24, bytes[3..], now) catch null;
+                if (pushed) |owned| owned.deinit();
+            },
+            else => if (core.recovery_state.count() == 0 and core.outbound_state.countAll() == 0) {
+                core.transmitter_state.datagram_sequence = 0xfffff0;
+                core.transmitter_state.reliable_index = 0xfffff0;
+                core.transmitter_state.order_indices[0] = 0xfffff0;
+            },
         }
     }
 }
@@ -86,7 +106,7 @@ test "fuzz session state-machine entry points" {
 test "deterministic session mutation campaign" {
     var prng = std.Random.DefaultPrng.init(0x5e5510f0);
     var bytes: [256]u8 = undefined;
-    for (0..512) |iteration| {
+    for (0..@max(512, build_options.fuzz_iterations / 20)) |iteration| {
         const length = iteration % (bytes.len + 1);
         prng.random().bytes(bytes[0..length]);
         try exercise(bytes[0..length]);

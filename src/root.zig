@@ -44,6 +44,10 @@ pub const advanced = struct {
         pub const recovery = @import("reliability/recovery.zig");
         pub const rtt = @import("reliability/rtt.zig");
     };
+    pub const security = struct {
+        pub const cookie = @import("security/cookie.zig");
+        pub const rate_limit = @import("security/rate_limit.zig");
+    };
     pub const session = struct {
         pub const Core = @import("session/core.zig").Core;
         pub const Receiver = @import("session/receiver.zig").Receiver;
@@ -62,5 +66,6 @@ test {
     std.testing.refAllDecls(advanced.net);
     std.testing.refAllDecls(advanced.protocol);
     std.testing.refAllDecls(advanced.reliability);
+    std.testing.refAllDecls(advanced.security);
     std.testing.refAllDecls(advanced.session);
 }
