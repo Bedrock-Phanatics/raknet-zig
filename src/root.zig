@@ -14,9 +14,6 @@ pub const ServerOptions = @import("transport/server.zig").Options;
 pub const Session = @import("transport/server.zig").Session;
 pub const SessionStatistics = @import("session/core.zig").Statistics;
 
-pub const minecraft = struct {
-    pub const batch = @import("minecraft/batch.zig");
-};
 
 pub const advanced = struct {
     pub const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
@@ -61,7 +58,6 @@ pub const advanced = struct {
 
 test {
     std.testing.refAllDecls(@This());
-    std.testing.refAllDecls(minecraft);
     std.testing.refAllDecls(advanced);
     std.testing.refAllDecls(advanced.net);
     std.testing.refAllDecls(advanced.protocol);

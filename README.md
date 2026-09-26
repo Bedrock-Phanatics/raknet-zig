@@ -92,10 +92,6 @@ Payloads are valid only during their callback. Use `payload.toOwned(allocator)` 
 
 `Client.close()` starts graceful shutdown. Keep calling `poll()` or `processTimers()` until `isClosed()` is true. `Session.close()` requires continued listener polling. Closing rejects new sends and drains pending data until the shutdown timeout. Use `destroy()` for immediate teardown.
 
-## Minecraft batches
-
-`raknet.minecraft.batch` handles Bedrock packet framing and compression. Decode authenticated, decrypted data using the connection's negotiated compression mode and appropriate size limits.
-
 ## Configuration and scope
 
 See the [configuration guide](docs/CONFIGURATION.md) for timeouts, connection limits, memory budgets, and per-poll work limits.

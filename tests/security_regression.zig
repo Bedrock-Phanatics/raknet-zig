@@ -57,41 +57,8 @@ test "sequence windows reject huge jumps and cross 24-bit wrap" {
     try std.testing.expect(window.add(0, 8) == .duplicate);
 }
 
-test "borrowed batch storage is reusable and owned batches stay independent" {
-    const Capture = struct {
-        copy: [3]u8 = undefined,
-        fn packet(raw: *anyopaque, packet_value: raknet.minecraft.batch.BorrowedPacket) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            @memcpy(&self.copy, packet_value.bytes);
-        }
-    };
-    const first = [_]u8{ 0xfe, 1, 4, 0x0c, 3, 'a', 'b', 'c' };
-    const second = [_]u8{ 0xfe, 1, 4, 0x0c, 3, 'x', 'y', 'z' };
-    var decoder = try raknet.minecraft.batch.Decoder.init(std.testing.allocator, .{ .maximum_retained_capacity = 64 });
-    defer decoder.deinit();
-    var capture: Capture = .{};
-    _ = try decoder.decodeBorrowed(&first, .declared, 0, &capture, Capture.packet);
-    try std.testing.expectEqualStrings("abc", &capture.copy);
-    _ = try decoder.decodeBorrowed(&second, .declared, 1000, &capture, Capture.packet);
-    try std.testing.expectEqualStrings("xyz", &capture.copy);
-
-    var owned = try decoder.decodeOwned(&first, .declared, 2000);
-    defer owned.deinit();
-    _ = try decoder.decodeBorrowed(&second, .declared, 3000, &capture, Capture.packet);
-    try std.testing.expectEqualStrings("abc", owned.packet(0));
-}
-
-test "repeated session and batch lifetimes do not leak or retain bursts" {
-    const wire = [_]u8{ 0xfe, 1, 4, 0x0c, 3, 'a', 'b', 'c' };
-    var decoder = try raknet.minecraft.batch.Decoder.init(std.testing.allocator, .{ .maximum_retained_capacity = 2 });
-    defer decoder.deinit();
-    var unused: u8 = 0;
-    const Packet = struct {
-        fn discard(_: *anyopaque, _: raknet.minecraft.batch.BorrowedPacket) !void {}
-    };
-    for (0..2000) |iteration| {
-        _ = try decoder.decodeBorrowed(&wire, .declared, iteration * 1000, &unused, Packet.discard);
-        try std.testing.expectEqual(@as(usize, 0), decoder.retainedCapacity());
+test "repeated session lifetimes do not leak or retain bursts" {
+    for (0..2000) |_| {
         var core = try Core.init(std.testing.allocator, 576, .{});
         _ = try core.enqueueOutbound(.application, "x", .reliable, 0);
         core.deinit();
