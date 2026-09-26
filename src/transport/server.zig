@@ -1,24 +1,24 @@
 const std = @import("std");
 
-const Config = @import("config.zig").Config;
-const net_address = @import("net/address.zig");
-const backend = @import("net/backend.zig");
-const connected = @import("protocol/connected.zig");
-const frame = @import("protocol/frame.zig");
-const offline = @import("protocol/offline.zig");
-const recovery = @import("reliability/recovery.zig");
-const cookie = @import("security/cookie.zig");
-const rate = @import("security/rate_limit.zig");
-const core_mod = @import("session/core.zig");
-const deadline_queue = @import("session/deadline_queue.zig");
+const Config = @import("../config.zig").Config;
+const net_address = @import("address.zig");
+const backend = @import("socket.zig");
+const connected = @import("../protocol/connected.zig");
+const frame = @import("../protocol/frame.zig");
+const offline = @import("../protocol/offline.zig");
+const recovery = @import("../reliability/recovery.zig");
+const cookie = @import("../security/cookie.zig");
+const rate = @import("../security/rate_limit.zig");
+const core_mod = @import("../session/core.zig");
+const deadline_queue = @import("../session/deadline_queue.zig");
 const EndpointKey = deadline_queue.Key;
-const handshake = @import("session/offline_handshake.zig");
-const receipt_batch = @import("session/receipt_batch.zig");
-const receiver = @import("session/receiver.zig");
-const socket_emitter = @import("session/socket_emitter.zig");
-const transmitter_mod = @import("session/transmitter.zig");
-const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
-const time = @import("util/time.zig");
+const handshake = @import("../session/offline_handshake.zig");
+const receipt_batch = @import("receipt_batch.zig");
+const receiver = @import("../session/receiver.zig");
+const socket_emitter = @import("socket_emitter.zig");
+const transmitter_mod = @import("../session/transmitter.zig");
+const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
+const time = @import("../util/time.zig");
 
 const State = enum { connecting, connected, closing, closed };
 
@@ -892,7 +892,7 @@ test "listener answers an offline ping over loopback" {
     var client = try backend.Socket.bind(io, address, 2048);
     defer client.close();
     var ping: [33]u8 = undefined;
-    var writer: @import("protocol/cursor.zig").Writer = .{ .data = &ping };
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
     try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
     try writer.u64be(123);
     try writer.bytes(&offline.magic);
@@ -925,7 +925,7 @@ test "listener answers an offline ping over loopback" {
     const mtu = std.mem.readInt(u16, reply1.data[30..32], .big);
 
     var request2_buffer: [64]u8 = undefined;
-    var request2: @import("protocol/cursor.zig").Writer = .{ .data = &request2_buffer };
+    var request2: @import("../protocol/cursor.zig").Writer = .{ .data = &request2_buffer };
     try request2.byte(@intFromEnum(offline.Id.open_connection_request_2));
     try request2.bytes(&offline.magic);
     try request2.u32be(cookie_value);
@@ -976,8 +976,8 @@ test "listener answers an offline ping over loopback" {
     for (0..4) |_| {
         const accepted_datagram = try client.value.receive(io, &response);
         if (accepted_datagram.data[0] & 0x40 != 0) continue;
-        var decoded_datagram = try @import("protocol/frame.zig").decodeDatagram(accepted_datagram.data);
-        const accepted_frame = try @import("protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
+        var decoded_datagram = try @import("../protocol/frame.zig").decodeDatagram(accepted_datagram.data);
+        const accepted_frame = try @import("../protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
         if ((try connected.decode(accepted_frame.payload)) == .connection_request_accepted) {
             accepted = true;
             break;
@@ -991,8 +991,8 @@ test "listener answers an offline ping over loopback" {
     for (0..4) |_| {
         const repeated_accepted = try client.value.receive(io, &response);
         if (repeated_accepted.data[0] & 0x40 != 0) continue;
-        var repeated_datagram = try @import("protocol/frame.zig").decodeDatagram(repeated_accepted.data);
-        const repeated_frame = try @import("protocol/frame.zig").decodeOne(&repeated_datagram.frames, 8192, 2048);
+        var repeated_datagram = try @import("../protocol/frame.zig").decodeDatagram(repeated_accepted.data);
+        const repeated_frame = try @import("../protocol/frame.zig").decodeOne(&repeated_datagram.frames, 8192, 2048);
         if ((try connected.decode(repeated_frame.payload)) == .connection_request_accepted) {
             accepted = true;
             break;
@@ -1059,7 +1059,7 @@ const CloseHarness = struct {
 
     fn ack(self: *@This(), listener: *Listener, peer: *backend.Socket, sequence: u32) !void {
         var wire: [32]u8 = undefined;
-        try self.inject(listener, peer.value.address, try @import("protocol/datagram.zig").encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire));
+        try self.inject(listener, peer.value.address, try @import("../protocol/datagram.zig").encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire));
     }
 };
 
@@ -1119,7 +1119,7 @@ test "advertisement updates are bounded and used by the next pong" {
 
     try listener.setAdvertisement("MCPE;Quark;11;1.21;7;100;");
     var ping: [33]u8 = undefined;
-    var writer: @import("protocol/cursor.zig").Writer = .{ .data = &ping };
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
     try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
     try writer.u64be(1);
     try writer.bytes(&offline.magic);
@@ -1256,7 +1256,7 @@ test "global turn budget carries unread batch entries fairly" {
     defer peer.close();
 
     var ping: [33]u8 = undefined;
-    var writer: @import("protocol/cursor.zig").Writer = .{ .data = &ping };
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
     try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
     try writer.u64be(1);
     try writer.bytes(&offline.magic);

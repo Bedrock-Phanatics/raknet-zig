@@ -2,16 +2,16 @@ const std = @import("std");
 
 pub const BorrowedPayload = @import("payload.zig").BorrowedPayload;
 pub const CancelResult = @import("session/core.zig").CancelResult;
-pub const Client = @import("client.zig").Client;
-pub const ClientOptions = @import("client.zig").Options;
+pub const Client = @import("transport/client.zig").Client;
+pub const ClientOptions = @import("transport/client.zig").Options;
 pub const Config = @import("config.zig").Config;
 pub const FlushResult = @import("session/core.zig").FlushResult;
-pub const ListenerStatistics = @import("server.zig").ListenerStatistics;
+pub const ListenerStatistics = @import("transport/server.zig").ListenerStatistics;
 pub const OwnedPayload = @import("payload.zig").OwnedPayload;
 pub const SendHandle = @import("session/core.zig").SendHandle;
-pub const Server = @import("server.zig").Listener;
-pub const ServerOptions = @import("server.zig").Options;
-pub const Session = @import("server.zig").Session;
+pub const Server = @import("transport/server.zig").Listener;
+pub const ServerOptions = @import("transport/server.zig").Options;
+pub const Session = @import("transport/server.zig").Session;
 pub const SessionStatistics = @import("session/core.zig").Statistics;
 
 pub const minecraft = struct {
@@ -23,10 +23,10 @@ pub const advanced = struct {
     pub const uint24 = @import("util/uint24.zig");
 
     pub const net = struct {
-        pub const BufferOptions = @import("net/backend.zig").BufferOptions;
-        pub const BufferSizes = @import("net/backend.zig").BufferSizes;
-        pub const Traffic = @import("net/backend.zig").Traffic;
-        pub const Socket = @import("net/backend.zig").Socket;
+        pub const BufferOptions = @import("transport/socket.zig").BufferOptions;
+        pub const BufferSizes = @import("transport/socket.zig").BufferSizes;
+        pub const Traffic = @import("transport/socket.zig").Traffic;
+        pub const Socket = @import("transport/socket.zig").Socket;
     };
     pub const protocol = struct {
         pub const ack = @import("protocol/ack.zig");
@@ -55,7 +55,7 @@ pub const advanced = struct {
         pub const client_handshake = @import("session/client_handshake.zig");
         pub const deadline_queue = @import("session/deadline_queue.zig");
         pub const offline_handshake = @import("session/offline_handshake.zig");
-        pub const receipt_batch = @import("session/receipt_batch.zig");
+        pub const receipt_batch = @import("transport/receipt_batch.zig");
     };
 };
 

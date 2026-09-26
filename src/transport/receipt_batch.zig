@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const backend = @import("../net/backend.zig");
+const backend = @import("socket.zig");
 const ack = @import("../protocol/ack.zig");
 const datagram = @import("../protocol/datagram.zig");
-const receiver = @import("receiver.zig");
+const receiver = @import("../session/receiver.zig");
 
 pub const Batch = struct {
     allocator: std.mem.Allocator,
