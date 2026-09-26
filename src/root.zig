@@ -14,7 +14,6 @@ pub const ServerOptions = @import("transport/server.zig").Options;
 pub const Session = @import("transport/server.zig").Session;
 pub const SessionStatistics = @import("session/core.zig").Statistics;
 
-
 pub const advanced = struct {
     pub const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
     pub const uint24 = @import("util/uint24.zig");
