@@ -109,7 +109,6 @@ pub fn classifyIncomingError(err: anyerror) IncomingFailure {
         error.InvalidRecordType,
         error.ReversedRange,
         error.TooManyAcknowledgements,
-        error.OverlappingRanges,
         error.TrailingData,
         error.InvalidFrameFlags,
         error.EmptyPayload,

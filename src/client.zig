@@ -53,6 +53,7 @@ pub const Client = struct {
     pending_receive_error: ?anyerror = null,
     closing: bool = false,
     closed: bool = false,
+    rejected_datagrams: u64 = 0,
 
     const PollBridge = struct {
         client: *Client,
@@ -341,8 +342,11 @@ pub const Client = struct {
             const now_ms = latest_ms;
             var bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
             const processed_incoming = self.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, PollBridge.deliver) catch |err| {
-                const failure = core_mod.classifyIncomingError(err);
-                if (failure.disposition == .close_session) self.abort();
+                if (core_mod.incomingErrorDisposition(err) == .reject) {
+                    self.rejected_datagrams += 1;
+                    continue;
+                }
+                self.abort();
                 return err;
             };
             self.last_seen_ms = now_ms;
@@ -678,6 +682,11 @@ test "client and server complete a real loopback handshake" {
         if (collector.len != 0) break;
     }
     try std.testing.expectEqualStrings("\xfeworld", collector.data[0..collector.len]);
+
+    try listener.socket.send(client.socket.value.address, &.{ 0x84, 0 });
+    _ = try client.poll(.none, &collector, ClientCollector.collect);
+    try std.testing.expectEqual(@as(u64, 1), client.rejected_datagrams);
+    try std.testing.expect(!client.isClosed());
 
     harness.fail_messages = true;
     try client.send("\xfefail", .reliable_ordered, 0);

@@ -24,7 +24,6 @@ pub fn decode(data: []const u8, storage: []Record, maximum_records: usize, maxim
 
     var count: usize = 0;
     var acknowledged: usize = 0;
-    var previous: ?Record = null;
     while (count < advertised) : (count += 1) {
         const kind = try reader.byte();
         const first = try reader.u24le();
@@ -37,16 +36,32 @@ pub fn decode(data: []const u8, storage: []Record, maximum_records: usize, maxim
         const record: Record = .{ .first = first, .last = last };
         const n: usize = record.count();
         if (n > maximum_acknowledged -| acknowledged) return error.TooManyAcknowledgements;
-
-        if (previous) |last_record| {
-            if (record.first <= last_record.last) return error.OverlappingRanges;
-        }
         storage[count] = record;
-        previous = record;
         acknowledged += n;
     }
     if (reader.remaining() != 0) return error.TrailingData;
-    return .{ .records = storage[0..count], .acknowledged_count = acknowledged };
+    return normalize(storage[0..count]);
+}
+
+fn normalize(records: []Record) Decoded {
+    const less = struct {
+        fn than(_: void, left: Record, right: Record) bool {
+            return left.first < right.first;
+        }
+    }.than;
+    std.mem.sort(Record, records, {}, less);
+    var count: usize = 0;
+    var acknowledged: usize = 0;
+    for (records) |record| {
+        if (count != 0 and record.first <= records[count - 1].last +| 1) {
+            records[count - 1].last = @max(records[count - 1].last, record.last);
+            continue;
+        }
+        records[count] = record;
+        count += 1;
+    }
+    for (records[0..count]) |record| acknowledged += record.count();
+    return .{ .records = records[0..count], .acknowledged_count = acknowledged };
 }
 
 pub fn encodedSize(records: []const Record) !usize {
@@ -114,6 +129,15 @@ test "bounded ACK ranges round trip without expansion" {
     const decoded = try decode(bytes, &records, 4, 8);
     try std.testing.expectEqual(@as(usize, 6), decoded.acknowledged_count);
     try std.testing.expectEqualSlices(Record, &input, decoded.records);
+}
+
+test "duplicate and unsorted records are merged like RakNet range lists" {
+    var records: [4]Record = undefined;
+    const duplicated = try decode(&.{ 0, 3, 1, 5, 0, 0, 1, 5, 0, 0, 0, 3, 0, 0, 4, 0, 0 }, &records, 4, 16);
+    try std.testing.expectEqualSlices(Record, &.{.{ .first = 3, .last = 5 }}, duplicated.records);
+    try std.testing.expectEqual(@as(usize, 3), duplicated.acknowledged_count);
+    const unsorted = try decode(&.{ 0, 2, 1, 9, 0, 0, 1, 2, 0, 0 }, &records, 4, 16);
+    try std.testing.expectEqualSlices(Record, &.{ .{ .first = 2, .last = 2 }, .{ .first = 9, .last = 9 } }, unsorted.records);
 }
 
 test "malformed and amplification records fail cheaply" {
