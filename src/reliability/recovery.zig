@@ -45,6 +45,7 @@ pub const Recovery = struct {
     maximum_bytes: usize,
     maximum_transmissions: u8,
     maximum_delay_ms: u32 = 5_000,
+    minimum_abandon_ms: u32 = 0,
     mtu: u16,
     storage_policy: StoragePolicy,
     total_bytes: usize = 0,
@@ -178,7 +179,7 @@ pub const Recovery = struct {
             const slot = &self.slots[self.heap[0]];
             if (slot.deadline_ms > now_ms) break;
             inspected += 1;
-            if (slot.transmissions >= self.maximum_transmissions) {
+            if (slot.transmissions >= self.maximum_transmissions and time.elapsed(now_ms, slot.sent_ms) >= self.minimum_abandon_ms) {
                 exhausted = 1;
                 break;
             }
@@ -191,7 +192,7 @@ pub const Recovery = struct {
                 .timed_out = timed_out,
             };
             due_count += 1;
-            slot.transmissions += 1;
+            slot.transmissions +|= 1;
             slot.nacked = false;
             if (timed_out) slot.timeouts += 1;
             const backoff = @as(u64, rto_ms) << @intCast(@min(slot.timeouts, 6));
@@ -517,6 +518,24 @@ test "deadline heap inspects only due records" {
     try std.testing.expectEqual(@as(usize, 1), first.inspected);
     try std.testing.expectEqual(@as(u32, 0), first.items[0].sequence);
     try std.testing.expectEqual(@as(?u64, 11), recovery.nextDeadline());
+}
+
+test "exhaustion waits for the minimum abandon age" {
+    var recovery = try Recovery.init(std.testing.allocator, 1, 576, 2, 576);
+    defer recovery.deinit();
+    recovery.minimum_abandon_ms = 1000;
+    try recovery.track(1, "x", 1, 0, 50);
+    var due: [1]Due = undefined;
+    var now: u64 = 0;
+    for (0..6) |_| {
+        now = recovery.nextDeadline().?;
+        const batch = recovery.collectDue(now, 50, &due, 1);
+        if (now >= 1000) break;
+        try std.testing.expectEqual(@as(usize, 0), batch.exhausted);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+    }
+    try std.testing.expect(now >= 1000);
+    try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(now, 50, &due, 1).exhausted);
 }
 
 test "retransmission exhaustion and clock saturation" {

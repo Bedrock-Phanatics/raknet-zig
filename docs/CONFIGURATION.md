@@ -61,7 +61,7 @@ All timing values use monotonic milliseconds.
 | --- | ---: | --- | --- | --- |
 | `maximum_ack_delay_ms` | 0 ms | Session | Policy | Values above 10 ms are invalid; zero flushes after the input batch. |
 | `split_timeout_ms` | 15,000 ms | Session | Reference | Expired incomplete assemblies are released. |
-| `idle_timeout_ms` | 10,000 ms | Session | Policy | Idle sessions are closed. |
+| `idle_timeout_ms` | 10,000 ms | Session | Policy | Idle sessions, and reliable datagrams unacknowledged for this long, are closed. |
 | `minimum_rto_ms` | 50 ms | Session | Compatibility | Lower RTT estimates are clamped. |
 | `maximum_rto_ms` | 5,000 ms | Session | Compatibility | Higher retransmission delays are clamped. |
 | `shutdown_timeout_ms` | 5,000 ms | Session | Compatibility | A local close that is not acknowledged by then is forced. |

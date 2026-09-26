@@ -249,6 +249,7 @@ pub const Core = struct {
         errdefer receiver_state.deinit();
         var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, mtu);
         recovery_state.maximum_delay_ms = config.timing.maximum_rto_ms;
+        recovery_state.minimum_abandon_ms = config.timing.idle_timeout_ms;
         errdefer recovery_state.deinit();
         var outbound_state = try outbound_queue.Queue.init(
             allocator,

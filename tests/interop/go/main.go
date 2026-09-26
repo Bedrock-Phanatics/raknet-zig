@@ -99,6 +99,14 @@ func server(address string, seconds int) {
 			}(conn.(*raknet.Conn))
 		}
 	}()
+	if seconds >= 60 {
+		go func() {
+			for range time.Tick(10 * time.Second) {
+				p := sample()
+				fmt.Fprintf(os.Stderr, "progress impl=go role=server sessions=%d echoed=%d cpu_ms=%d rss_kb=%d\n", active.Load(), echoed.Load(), p.cpuMs-baseline.cpuMs, p.rssKb)
+			}
+		}()
+	}
 	time.Sleep(time.Duration(seconds) * time.Second)
 	metrics := raknet.MetricsSnapshot()
 	p := sample()
@@ -111,7 +119,7 @@ const maximumSamples = 2048
 
 type connection struct {
 	setupUs, messages, bytes, mismatches uint64
-	failed                               bool
+	failed, incomplete                   bool
 	samples                              []uint64
 }
 
@@ -154,10 +162,13 @@ func client(address string, connections, payloadSize, seconds, warmupMs int) {
 	done.Wait()
 
 	var setup, rtt []uint64
-	var messages, bytes, failures, mismatches uint64
+	var messages, bytes, failures, incomplete, mismatches uint64
 	for _, r := range results {
 		if r.failed {
 			failures++
+		}
+		if r.incomplete {
+			incomplete++
 		}
 		if r.setupUs != 0 {
 			setup = append(setup, r.setupUs)
@@ -171,10 +182,10 @@ func client(address string, connections, payloadSize, seconds, warmupMs int) {
 	sort.Slice(rtt, func(i, j int) bool { return rtt[i] < rtt[j] })
 	p := sample()
 	metrics := raknet.MetricsSnapshot()
-	fmt.Fprintf(os.Stderr, "client impl=go connections=%d payload=%d setup_p50_us=%d setup_p95_us=%d setup_p99_us=%d rtt_p50_us=%d rtt_p95_us=%d rtt_p99_us=%d msgs_per_s=%.0f mib_per_s=%.2f cpu_ms=%d rss_kb=%d peak_rss_kb=%d kb_per_conn=%d retransmits=%d mismatches=%d failures=%d\n",
+	fmt.Fprintf(os.Stderr, "client impl=go connections=%d payload=%d setup_p50_us=%d setup_p95_us=%d setup_p99_us=%d rtt_p50_us=%d rtt_p95_us=%d rtt_p99_us=%d msgs_per_s=%.0f mib_per_s=%.2f cpu_ms=%d rss_kb=%d peak_rss_kb=%d kb_per_conn=%d retransmits=%d mismatches=%d incomplete=%d failures=%d\n",
 		connections, payloadSize, pct(setup, .5), pct(setup, .95), pct(setup, .99), pct(rtt, .5), pct(rtt, .95), pct(rtt, .99),
 		float64(messages)/float64(seconds), float64(bytes)/float64(seconds)/(1024*1024), p.cpuMs-baseline.cpuMs, p.rssKb, p.peakRssKb,
-		(connectedRss-min(connectedRss, baseline.rssKb))/uint64(max(connections, 1)), metrics.Retransmits, mismatches, failures)
+		(connectedRss-min(connectedRss, baseline.rssKb))/uint64(max(connections, 1)), metrics.Retransmits, mismatches, incomplete, failures)
 }
 
 func pct(values []uint64, fraction float64) uint64 {
@@ -247,7 +258,7 @@ func run(conn *raknet.Conn, result *connection, size int, measureFrom, duration 
 		time.Sleep(time.Millisecond)
 	}
 	if outstanding.Load() != 0 {
-		result.failed = true
+		result.incomplete = true
 	}
 	_ = conn.Close()
 	<-readerDone

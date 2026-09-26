@@ -93,9 +93,16 @@ fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32) !void {
     var state: Server = .{};
     const deadline = nowNs(io) + @as(u64, seconds) * std.time.ns_per_s;
     var peak_sessions: usize = 0;
+    var next_progress = nowNs(io) + progress_interval_ns;
     while (nowNs(io) < deadline) {
         _ = listener.poll(wait(50), .{ .context = &state, .connected = Server.onConnect, .message = Server.onMessage }) catch |err| std.debug.print("poll error: {s}\n", .{@errorName(err)});
         peak_sessions = @max(peak_sessions, listener.sessions.count());
+        if (seconds >= 60 and nowNs(io) >= next_progress) {
+            next_progress += progress_interval_ns;
+            const progress = Process.sample();
+            const live = listener.statistics();
+            std.debug.print("progress impl=zig role=server sessions={d} echoed={d} recovery_bytes={d} session_memory_bytes={d} cpu_ms={d} rss_kb={d}\n", .{ live.active_sessions, state.echoed, live.recovery_bytes, live.session_memory_bytes, progress.cpu_ms - baseline.cpu_ms, progress.rss_kb });
+        }
     }
     const stats = listener.statistics();
     const process = Process.sample();
@@ -123,11 +130,13 @@ const ClientOptions = struct {
 };
 
 const maximum_samples = 2048;
+const progress_interval_ns = 10 * std.time.ns_per_s;
 
 const Shared = struct {
     io: std.Io,
     options: ClientOptions,
     ready: std.atomic.Value(usize) = .init(0),
+    finished: std.atomic.Value(usize) = .init(0),
     start_ns: std.atomic.Value(u64) = .init(0),
 };
 
@@ -135,6 +144,7 @@ const Connection = struct {
     shared: *Shared,
     setup_us: u64 = 0,
     failed: bool = false,
+    incomplete: bool = false,
     mismatches: u64 = 0,
     messages: u64 = 0,
     bytes: u64 = 0,
@@ -168,6 +178,7 @@ const Connection = struct {
     }
 
     fn run(self: *Connection) void {
+        defer _ = self.shared.finished.fetchAdd(1, .release);
         self.runInner() catch |err| {
             std.debug.print("connection error: {s}\n", .{@errorName(err)});
             self.failed = true;
@@ -214,7 +225,7 @@ const Connection = struct {
             _ = connection.poll(wait(5), self, onMessage) catch |err| if (err != error.Timeout) return err;
         }
         self.retransmits = connection.statistics().retransmitted_datagrams;
-        if (self.outstanding != 0) self.failed = true;
+        if (self.outstanding != 0) self.incomplete = true;
     }
 };
 
@@ -240,6 +251,16 @@ fn client(io: std.Io, options: ClientOptions) !void {
     while (shared.ready.load(.acquire) < options.connections) try io.sleep(.fromMilliseconds(5), .awake);
     const connected_rss = Process.sample().rss_kb;
     shared.start_ns.store(nowNs(io), .release);
+    if (options.seconds >= 60) {
+        var next_progress = nowNs(io) + progress_interval_ns;
+        while (shared.finished.load(.acquire) < options.connections) {
+            try io.sleep(.fromMilliseconds(100), .awake);
+            if (nowNs(io) < next_progress) continue;
+            next_progress += progress_interval_ns;
+            const progress = Process.sample();
+            std.debug.print("progress impl=zig role=client running={d} cpu_ms={d} rss_kb={d}\n", .{ options.connections - shared.finished.load(.acquire), progress.cpu_ms - baseline.cpu_ms, progress.rss_kb });
+        }
+    }
     for (futures) |*future| future.await(io);
 
     var setup: std.ArrayList(u64) = .empty;
@@ -249,10 +270,12 @@ fn client(io: std.Io, options: ClientOptions) !void {
     var messages: u64 = 0;
     var bytes: u64 = 0;
     var failures: u64 = 0;
+    var incomplete: u64 = 0;
     var mismatches: u64 = 0;
     var retransmits: u64 = 0;
     for (connections) |*connection| {
         if (connection.failed) failures += 1;
+        if (connection.incomplete) incomplete += 1;
         if (connection.setup_us != 0) try setup.append(allocator, connection.setup_us);
         try rtt.appendSlice(allocator, connection.samples[0..connection.sample_count]);
         messages += connection.messages;
@@ -264,7 +287,7 @@ fn client(io: std.Io, options: ClientOptions) !void {
     std.mem.sort(u64, rtt.items, {}, std.sort.asc(u64));
     const process = Process.sample();
     const seconds: f64 = @floatFromInt(options.seconds);
-    std.debug.print("client impl=zig connections={d} payload={d} setup_p50_us={d} setup_p95_us={d} setup_p99_us={d} rtt_p50_us={d} rtt_p95_us={d} rtt_p99_us={d} msgs_per_s={d:.0} mib_per_s={d:.2} cpu_ms={d} rss_kb={d} peak_rss_kb={d} kb_per_conn={d} retransmits={d} mismatches={d} failures={d}\n", .{
+    std.debug.print("client impl=zig connections={d} payload={d} setup_p50_us={d} setup_p95_us={d} setup_p99_us={d} rtt_p50_us={d} rtt_p95_us={d} rtt_p99_us={d} msgs_per_s={d:.0} mib_per_s={d:.2} cpu_ms={d} rss_kb={d} peak_rss_kb={d} kb_per_conn={d} retransmits={d} mismatches={d} incomplete={d} failures={d}\n", .{
         options.connections,
         options.payload,
         percentile(setup.items, 0.50),
@@ -281,6 +304,7 @@ fn client(io: std.Io, options: ClientOptions) !void {
         (connected_rss -| baseline.rss_kb) / @max(options.connections, 1),
         retransmits,
         mismatches,
+        incomplete,
         failures,
     });
 }
