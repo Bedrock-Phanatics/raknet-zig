@@ -423,6 +423,7 @@ pub const Listener = struct {
     frame_scratch: []frame.Frame,
     timer_entries: []deadline_queue.Entry,
     handshake_output: []u8,
+    send_batch: backend.SendBatch,
     pending_message_index: usize = 0,
     pending_message_count: usize = 0,
     closed: bool = false,
@@ -462,6 +463,8 @@ pub const Listener = struct {
         errdefer allocator.free(frame_scratch);
         const timer_entries = try allocator.alloc(deadline_queue.Entry, options.config.batching.maximum_packets_per_iteration);
         errdefer allocator.free(timer_entries);
+        var send_batch = try backend.SendBatch.init(allocator, 64, options.config.protocol.maximum_datagram_size);
+        errdefer send_batch.deinit();
         var deadlines = try deadline_queue.Queue.init(allocator, options.config.listener.maximum_connections);
         errdefer deadlines.deinit();
         var random: [80]u8 = undefined;
@@ -484,6 +487,7 @@ pub const Listener = struct {
             .frame_scratch = frame_scratch,
             .timer_entries = timer_entries,
             .handshake_output = handshake_output,
+            .send_batch = send_batch,
             .handshake_timeout_ms = options.handshake_timeout_ms,
             .ack_capacity = options.config.batching.maximum_ack_records,
         };
@@ -555,6 +559,7 @@ pub const Listener = struct {
         self.sessions.deinit(self.session_quota.allocator());
         std.debug.assert(self.session_quota.used_bytes == 0);
         self.deadlines.deinit();
+        self.send_batch.deinit();
         self.allocator.free(self.timer_entries);
         self.allocator.free(self.frame_scratch);
         self.allocator.free(self.handshake_output);
@@ -573,6 +578,8 @@ pub const Listener = struct {
 
     pub fn processTimers(self: *Listener, now_ms: u64, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
+        self.socket.beginBatch(&self.send_batch);
+        defer self.socket.endBatch();
         var stats: PollStats = .{};
         defer self.record(stats);
         self.processTimersInto(now_ms, callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
@@ -581,6 +588,8 @@ pub const Listener = struct {
 
     pub fn poll(self: *Listener, timeout: std.Io.Timeout, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
+        self.socket.beginBatch(&self.send_batch);
+        defer self.socket.endBatch();
         var stats: PollStats = .{};
         defer self.record(stats);
         if (self.pending_message_index == self.pending_message_count) {

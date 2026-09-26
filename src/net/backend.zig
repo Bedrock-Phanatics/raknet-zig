@@ -26,6 +26,32 @@ pub const Traffic = struct {
     send_drops: u64 = 0,
 };
 
+pub const SendBatch = struct {
+    allocator: std.mem.Allocator,
+    messages: []std.Io.net.OutgoingMessage,
+    addresses: []std.Io.net.IpAddress,
+    storage: []u8,
+    stride: usize,
+    len: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize, maximum_datagram_size: usize) !SendBatch {
+        if (capacity == 0) return error.InvalidConfiguration;
+        const messages = try allocator.alloc(std.Io.net.OutgoingMessage, capacity);
+        errdefer allocator.free(messages);
+        const addresses = try allocator.alloc(std.Io.net.IpAddress, capacity);
+        errdefer allocator.free(addresses);
+        const storage = try allocator.alloc(u8, try std.math.mul(usize, capacity, maximum_datagram_size));
+        return .{ .allocator = allocator, .messages = messages, .addresses = addresses, .storage = storage, .stride = maximum_datagram_size };
+    }
+
+    pub fn deinit(self: *SendBatch) void {
+        self.allocator.free(self.storage);
+        self.allocator.free(self.addresses);
+        self.allocator.free(self.messages);
+        self.* = undefined;
+    }
+};
+
 pub const ReceiveBatch = struct {
     messages: []std.Io.net.IncomingMessage,
     dropped_oversize: usize,
@@ -38,6 +64,7 @@ pub const Socket = struct {
     maximum_datagram_size: usize,
     buffer_sizes: BufferSizes,
     traffic: Traffic = .{},
+    batch: ?*SendBatch = null,
 
     pub fn bind(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize) !Socket {
         return bindWithBuffers(io, address, maximum_datagram_size, .{});
@@ -57,8 +84,46 @@ pub const Socket = struct {
         self.value.close(self.io);
         self.* = undefined;
     }
+    pub fn beginBatch(self: *Socket, batch: *SendBatch) void {
+        if (builtin.os.tag != .linux or batch.stride < self.maximum_datagram_size) return;
+        batch.len = 0;
+        self.batch = batch;
+    }
+    pub fn endBatch(self: *Socket) void {
+        self.flushBatch();
+        self.batch = null;
+    }
+    fn queue(self: *Socket, batch: *SendBatch, destination: std.Io.net.IpAddress, data: []const u8) void {
+        if (batch.len == batch.messages.len) self.flushBatch();
+        const slot = batch.len;
+        const storage = batch.storage[slot * batch.stride ..][0..data.len];
+        @memcpy(storage, data);
+        batch.addresses[slot] = destination;
+        batch.messages[slot] = .{ .address = &batch.addresses[slot], .data_ptr = storage.ptr, .data_len = data.len };
+        batch.len += 1;
+    }
+    fn flushBatch(self: *Socket) void {
+        const batch = self.batch orelse return;
+        var offset: usize = 0;
+        while (offset < batch.len) {
+            const pending = batch.messages[offset..batch.len];
+            const failure, const sent = self.io.vtable.netSend(self.io.userdata, self.value.handle, pending, .{});
+            for (pending[0..sent]) |message| self.traffic.bytes_sent += message.data_len;
+            self.traffic.datagrams_sent += sent;
+            offset += sent;
+            if (failure == null) break;
+            if (failure.? == error.Canceled) {
+                self.traffic.send_drops += batch.len - offset;
+                break;
+            }
+            self.traffic.send_drops += 1;
+            offset += 1;
+        }
+        batch.len = 0;
+    }
     pub fn send(self: *Socket, destination: std.Io.net.IpAddress, data: []const u8) !void {
         if (data.len > self.maximum_datagram_size) return error.DatagramTooLarge;
+        if (self.batch) |batch| return self.queue(batch, destination, data);
         self.value.send(self.io, &destination, data) catch |err| switch (err) {
             error.SystemResources => {
                 self.traffic.send_drops += 1;
@@ -74,6 +139,10 @@ pub const Socket = struct {
         for (messages) |message| {
             if (message.data_len > self.maximum_datagram_size) return error.DatagramTooLarge;
             bytes += message.data_len;
+        }
+        if (self.batch) |batch| {
+            for (messages) |message| self.queue(batch, message.address.*, message.data_ptr[0..message.data_len]);
+            return;
         }
         self.value.sendMany(self.io, messages, .{}) catch |err| switch (err) {
             error.SystemResources => {
@@ -194,6 +263,32 @@ test "batched backend receives available loopback datagrams without filling batc
     const result = try server.receiveMany(&messages, &data, .none);
     try std.testing.expect(result.messages.len >= 1);
     try std.testing.expectEqualStrings("hello", result.messages[0].data);
+}
+
+test "batched sends are flushed together and keep their destinations" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var first = try Socket.bind(io, address, 64);
+    defer first.close();
+    var second = try Socket.bind(io, address, 64);
+    defer second.close();
+    var sender = try Socket.bind(io, address, 64);
+    defer sender.close();
+    var batch = try SendBatch.init(std.testing.allocator, 2, 64);
+    defer batch.deinit();
+    sender.beginBatch(&batch);
+    var buffer: [4]u8 = "one!".*;
+    try sender.send(first.value.address, &buffer);
+    buffer = "two!".*;
+    try sender.send(second.value.address, &buffer);
+    buffer = "3rd!".*;
+    try sender.send(first.value.address, &buffer);
+    sender.endBatch();
+    try std.testing.expectEqual(@as(u64, 3), sender.traffic.datagrams_sent);
+    var storage: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("one!", (try first.value.receive(io, &storage)).data);
+    try std.testing.expectEqualStrings("3rd!", (try first.value.receive(io, &storage)).data);
+    try std.testing.expectEqualStrings("two!", (try second.value.receive(io, &storage)).data);
 }
 
 test "listeners can share a port with reuse_port" {
