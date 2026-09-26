@@ -1,26 +1,26 @@
 const std = @import("std");
 
-const Config = @import("config.zig").Config;
-const net_address = @import("net/address.zig");
-const backend = @import("net/backend.zig");
-const connected = @import("protocol/connected.zig");
-const frame = @import("protocol/frame.zig");
-const offline = @import("protocol/offline.zig");
-const recovery = @import("reliability/recovery.zig");
-const cookie = @import("security/cookie.zig");
-const rate = @import("security/rate_limit.zig");
-const core_mod = @import("session/core.zig");
-const deadline_queue = @import("session/deadline_queue.zig");
+const Config = @import("../config.zig").Config;
+const net_address = @import("address.zig");
+const backend = @import("socket.zig");
+const connected = @import("../protocol/connected.zig");
+const frame = @import("../protocol/frame.zig");
+const offline = @import("../protocol/offline.zig");
+const recovery = @import("../reliability/recovery.zig");
+const cookie = @import("../security/cookie.zig");
+const rate = @import("../security/rate_limit.zig");
+const core_mod = @import("../session/core.zig");
+const deadline_queue = @import("../session/deadline_queue.zig");
 const EndpointKey = deadline_queue.Key;
-const handshake = @import("session/offline_handshake.zig");
-const receipt_batch = @import("session/receipt_batch.zig");
-const receiver = @import("session/receiver.zig");
-const socket_emitter = @import("session/socket_emitter.zig");
-const transmitter_mod = @import("session/transmitter.zig");
-const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;
-const time = @import("util/time.zig");
+const handshake = @import("../session/offline_handshake.zig");
+const receipt_batch = @import("receipt_batch.zig");
+const receiver = @import("../session/receiver.zig");
+const socket_emitter = @import("socket_emitter.zig");
+const transmitter_mod = @import("../session/transmitter.zig");
+const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
+const time = @import("../util/time.zig");
 
-const State = enum { connecting, connected, closed };
+const State = enum { connecting, connected, closing, closed };
 
 pub const Options = struct {
     config: Config = .{},
@@ -29,21 +29,19 @@ pub const Options = struct {
     advertisement: []const u8,
     receive_batch_size: usize = 32,
     socket_buffers: backend.BufferOptions = .{},
+    reuse_port: bool = false,
     offline_rate_per_second: u32 = 20,
     offline_burst: u32 = 40,
     global_offline_rate_per_second: u32 = 20_000,
     global_offline_burst: u32 = 40_000,
-    /// Caps the session table and all remote session state.
     maximum_session_memory_bytes: usize = 512 * 1024 * 1024,
     handshake_timeout_ms: u32 = 5_000,
-    /// Kept for compatibility. Exact deadlines ignore it.
     maintenance_interval_ms: u32 = 10,
 };
 
 pub const Callbacks = struct {
     context: *anyopaque,
     connected: *const fn (context: *anyopaque, session: *Session) core_mod.ApplicationCallbackError!void,
-    /// The payload is valid only during the callback.
     message: *const fn (context: *anyopaque, session: *Session, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void,
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
 };
@@ -52,6 +50,7 @@ const DeliveryBridge = struct {
     callbacks: Callbacks,
     session: *Session,
     now_ms: u64,
+    connected: bool = false,
 
     fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
         const self: *DeliveryBridge = @ptrCast(@alignCast(raw));
@@ -65,13 +64,14 @@ const DeliveryBridge = struct {
             .connection_request => |request| {
                 var wire: [1024]u8 = undefined;
                 const remote = net_address.toRakNet(self.session.address);
-                var systems: [20]offline.Address = @splat(emptyAddress(remote));
+                var systems: [20]offline.Address = @splat(net_address.unspecified(remote));
                 const accepted = connected.encodeAddressList(.accepted, remote, 0, &systems, request.request_time, self.now_ms, &wire) catch return error.InternalFailure;
                 self.session.sendControl(accepted, .reliable_ordered, self.now_ms) catch |err| return core_mod.deliverySendFailure(err);
             },
             .new_incoming_connection => {
                 if (self.session.state == .connecting) {
                     self.session.state = .connected;
+                    self.connected = true;
                     self.callbacks.connected(self.callbacks.context, self.session) catch return error.ApplicationFailure;
                 }
             },
@@ -108,6 +108,40 @@ pub const ListenerStatistics = struct {
     session_memory_bytes: usize,
     maximum_session_memory_bytes: usize,
     socket_buffers: backend.BufferSizes,
+    traffic: backend.Traffic,
+    unconnected_pings: u64,
+    open_connection_requests_1: u64,
+    open_connection_requests_2: u64,
+    handshakes_started: u64,
+    handshakes_completed: u64,
+    handshakes_rejected: u64,
+    ack_records_received: u64,
+    ack_records_sent: u64,
+    nack_records_received: u64,
+    nack_records_sent: u64,
+    retransmitted_datagrams: u64,
+    malformed_datagrams: u64,
+    dropped_datagrams: u64,
+    recovery_bytes: usize,
+    queued_packets_high_water: usize,
+};
+
+const SessionTotals = struct {
+    ack_records_received: u64 = 0,
+    ack_records_sent: u64 = 0,
+    nack_records_received: u64 = 0,
+    nack_records_sent: u64 = 0,
+    retransmitted_datagrams: u64 = 0,
+    queued_packets_high_water: usize = 0,
+
+    fn add(self: *SessionTotals, stats: core_mod.Statistics) void {
+        self.ack_records_received += stats.ack_records_received;
+        self.ack_records_sent += stats.ack_records_sent;
+        self.nack_records_received += stats.nack_records_received;
+        self.nack_records_sent += stats.nack_records_sent;
+        self.retransmitted_datagrams += stats.retransmitted_datagrams;
+        self.queued_packets_high_water = @max(self.queued_packets_high_water, stats.queued_packets_high_water);
+    }
 };
 
 pub const Session = struct {
@@ -177,19 +211,41 @@ pub const Session = struct {
         return self.state == .connected;
     }
     pub fn statistics(self: *const Session) core_mod.Statistics {
-        return self.core.statistics();
+        var stats = self.core.statistics();
+        stats.ack_records_sent = self.receipts.ack_records_sent;
+        stats.nack_records_sent = self.receipts.nack_records_sent;
+        return stats;
     }
     pub fn close(self: *Session) void {
-        if (self.state == .closed) return;
         const now_ms = time.nowMilliseconds(self.socket.io);
-        if (self.state == .connected) {
+        switch (self.state) {
+            .closing, .closed => return,
+            .connecting => return self.closeAt(now_ms),
+            .connected => {},
+        }
+        self.state = .closing;
+        self.core.beginClose(now_ms);
+        self.advanceClose(now_ms) catch return self.closeAt(now_ms);
+        self.schedule() catch self.closeAt(now_ms);
+    }
+    fn closeNow(self: *Session) void {
+        const now_ms = time.nowMilliseconds(self.socket.io);
+        if ((self.state == .connected or self.state == .closing) and !self.core.disconnect_queued) {
             const payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
             self.sendControl(&payload, .reliable_ordered, now_ms) catch {};
         }
         self.closeAt(now_ms);
     }
+    fn advanceClose(self: *Session, now_ms: u64) !void {
+        if (self.state != .closing) return;
+        switch (try self.core.advanceClose(now_ms)) {
+            .pending => {},
+            .flush => _ = try self.flushQueuedAt(now_ms),
+            .done => self.closeAt(now_ms),
+        }
+    }
     pub fn send(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
-        if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
+        if (!try self.trySend(payload, reliability, channel)) _ = try self.queueSend(payload, reliability, channel);
     }
     pub fn trySend(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
         if (self.state != .connected) return error.NotConnected;
@@ -241,6 +297,7 @@ pub const Session = struct {
             try self.core.sendControl(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit)
         else
             try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit);
+        if (control and self.core.outboundCount(.control) != 0) self.outbound_deadline_ms = now_ms;
         try self.schedule();
         return emitter.count;
     }
@@ -253,8 +310,8 @@ pub const Session = struct {
     fn flushQueuedAtLimit(self: *Session, now_ms: u64, maximum_datagrams: usize) !core_mod.FlushResult {
         var emitter: socket_emitter.Emitter = .{ .socket = self.socket, .address = self.address };
         self.outbound_deadline_ms = null;
-        const sent = try self.core.flushOutbound(.application, self.scratch, maximum_datagrams, now_ms, &emitter, socket_emitter.Emitter.emit);
-        if (sent.datagrams == maximum_datagrams and self.core.outboundCount(.application) != 0) self.outbound_deadline_ms = now_ms;
+        const sent = try self.core.flushAllOutbound(self.scratch, maximum_datagrams, now_ms, &emitter, socket_emitter.Emitter.emit);
+        if (sent.datagrams == maximum_datagrams and self.core.outbound_state.countAll() != 0) self.outbound_deadline_ms = now_ms;
         if (sent.datagrams != 0) try self.schedule();
         return sent;
     }
@@ -284,11 +341,12 @@ pub const Session = struct {
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
+        if (self.core.close_deadline_ms) |close_deadline| deadline = @min(deadline, close_deadline);
         try self.deadlines.upsert(self.key, deadline);
     }
     fn processDueTimers(self: *Session, now_ms: u64, maximum_work: usize) !usize {
         var remaining = maximum_work;
-        var active: usize = @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms) +
+        var active: usize = @as(usize, @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms)) +
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
             @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
@@ -351,6 +409,12 @@ pub const Listener = struct {
     deadlines: deadline_queue.Queue,
     advertisement: []u8,
     rate_entries: []rate.Entry,
+    retired: SessionTotals = .{},
+    handshakes_started: u64 = 0,
+    handshakes_completed: u64 = 0,
+    capacity_rejections: u64 = 0,
+    malformed_datagrams: u64 = 0,
+    dropped_datagrams: u64 = 0,
     limiter: rate.Limiter,
     handshake_handler: handshake.Handler,
     source_secret: u64,
@@ -359,8 +423,10 @@ pub const Listener = struct {
     frame_scratch: []frame.Frame,
     timer_entries: []deadline_queue.Entry,
     handshake_output: []u8,
+    send_batch: backend.SendBatch,
     pending_message_index: usize = 0,
     pending_message_count: usize = 0,
+    timer_turn: bool = false,
     closed: bool = false,
     handshake_timeout_ms: u32,
     ack_capacity: usize,
@@ -369,10 +435,11 @@ pub const Listener = struct {
         try validateOptions(options);
         const self = try allocator.create(Listener);
         errdefer allocator.destroy(self);
-        var socket = try backend.Socket.bindWithBuffers(io, address, options.config.protocol.maximum_datagram_size, options.socket_buffers);
+        var socket = try backend.Socket.bindWithOptions(io, address, options.config.protocol.maximum_datagram_size, options.socket_buffers, options.reuse_port);
         errdefer socket.close();
-        const advertisement = try allocator.dupe(u8, options.advertisement);
+        const advertisement = try allocator.alloc(u8, options.config.protocol.maximum_datagram_size - 35);
         errdefer allocator.free(advertisement);
+        @memcpy(advertisement[0..options.advertisement.len], options.advertisement);
         const limiter_count = @min(options.config.listener.maximum_pending_handshakes, 65_536);
         const rate_entries = try allocator.alloc(rate.Entry, limiter_count);
         errdefer allocator.free(rate_entries);
@@ -397,6 +464,8 @@ pub const Listener = struct {
         errdefer allocator.free(frame_scratch);
         const timer_entries = try allocator.alloc(deadline_queue.Entry, options.config.batching.maximum_packets_per_iteration);
         errdefer allocator.free(timer_entries);
+        var send_batch = try backend.SendBatch.init(allocator, 64, options.config.protocol.maximum_datagram_size);
+        errdefer send_batch.deinit();
         var deadlines = try deadline_queue.Queue.init(allocator, options.config.listener.maximum_connections);
         errdefer deadlines.deinit();
         var random: [80]u8 = undefined;
@@ -419,6 +488,7 @@ pub const Listener = struct {
             .frame_scratch = frame_scratch,
             .timer_entries = timer_entries,
             .handshake_output = handshake_output,
+            .send_batch = send_batch,
             .handshake_timeout_ms = options.handshake_timeout_ms,
             .ack_capacity = options.config.batching.maximum_ack_records,
         };
@@ -427,7 +497,7 @@ pub const Listener = struct {
             options.protocol_version,
             options.config.protocol.minimum_mtu,
             options.config.protocol.maximum_mtu,
-            self.advertisement,
+            self.advertisement[0..options.advertisement.len],
             .{ .current_key = random[8..40].*, .previous_key = random[40..72].* },
             &self.limiter,
         );
@@ -438,17 +508,48 @@ pub const Listener = struct {
         return self.socket.kernelBufferSizes();
     }
     pub fn statistics(self: *const Listener) ListenerStatistics {
+        var totals = self.retired;
+        var recovery_bytes: usize = 0;
+        var iterator = self.sessions.valueIterator();
+        while (iterator.next()) |session| {
+            const stats = session.*.statistics();
+            totals.add(stats);
+            recovery_bytes += stats.recovery_payload_bytes;
+        }
+        const handshake_counters = self.handshake_handler.counters;
         return .{
             .active_sessions = self.sessions.count(),
             .session_memory_bytes = self.session_quota.used_bytes,
             .maximum_session_memory_bytes = self.session_quota.maximum_bytes,
             .socket_buffers = self.socket.kernelBufferSizes(),
+            .traffic = self.socket.traffic,
+            .unconnected_pings = handshake_counters.unconnected_pings,
+            .open_connection_requests_1 = handshake_counters.open_connection_requests_1,
+            .open_connection_requests_2 = handshake_counters.open_connection_requests_2,
+            .handshakes_started = self.handshakes_started,
+            .handshakes_completed = self.handshakes_completed,
+            .handshakes_rejected = handshake_counters.rejected + self.capacity_rejections,
+            .ack_records_received = totals.ack_records_received,
+            .ack_records_sent = totals.ack_records_sent,
+            .nack_records_received = totals.nack_records_received,
+            .nack_records_sent = totals.nack_records_sent,
+            .retransmitted_datagrams = totals.retransmitted_datagrams,
+            .malformed_datagrams = self.malformed_datagrams,
+            .dropped_datagrams = self.dropped_datagrams,
+            .recovery_bytes = recovery_bytes,
+            .queued_packets_high_water = totals.queued_packets_high_water,
         };
+    }
+
+    pub fn setAdvertisement(self: *Listener, advertisement: []const u8) !void {
+        if (advertisement.len > self.advertisement.len) return error.AdvertisementTooLarge;
+        @memmove(self.advertisement[0..advertisement.len], advertisement);
+        self.handshake_handler.advertisement = self.advertisement[0..advertisement.len];
     }
     pub fn close(self: *Listener) void {
         if (self.closed) return;
         var iterator = self.sessions.valueIterator();
-        while (iterator.next()) |session| session.*.close();
+        while (iterator.next()) |session| session.*.closeNow();
         self.closed = true;
         self.socket.close();
     }
@@ -459,6 +560,7 @@ pub const Listener = struct {
         self.sessions.deinit(self.session_quota.allocator());
         std.debug.assert(self.session_quota.used_bytes == 0);
         self.deadlines.deinit();
+        self.send_batch.deinit();
         self.allocator.free(self.timer_entries);
         self.allocator.free(self.frame_scratch);
         self.allocator.free(self.handshake_output);
@@ -477,14 +579,25 @@ pub const Listener = struct {
 
     pub fn processTimers(self: *Listener, now_ms: u64, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
+        self.socket.beginBatch(&self.send_batch);
+        defer self.socket.endBatch();
         var stats: PollStats = .{};
+        defer self.record(stats);
         self.processTimersInto(now_ms, callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
         return stats;
     }
 
     pub fn poll(self: *Listener, timeout: std.Io.Timeout, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
+        self.socket.beginBatch(&self.send_batch);
+        defer self.socket.endBatch();
         var stats: PollStats = .{};
+        defer self.record(stats);
+        if (self.timer_turn) {
+            self.timer_turn = false;
+            self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
+            return stats;
+        }
         if (self.pending_message_index == self.pending_message_count) {
             const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
             const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
@@ -511,76 +624,7 @@ pub const Listener = struct {
             remaining -= 1;
             const key = endpointKey(message.from);
             if (self.sessions.get(key)) |session| {
-                if (isOfflineHandshake(message.data)) {
-                    session.flushReceipts() catch |err| {
-                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.receipt, err).class);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                        continue;
-                    };
-                    const repeated = self.handshake_handler.handle(
-                        message.data,
-                        &key,
-                        std.hash.Wyhash.hash(self.source_secret, &key),
-                        now_ms / 30_000,
-                        now_ms,
-                        self.handshake_output,
-                    );
-                    switch (repeated) {
-                        .drop => stats.rate_limited_or_dropped += 1,
-                        .response => |wire| try self.socket.send(message.from, wire),
-                        .accepted => |accepted| try self.socket.send(message.from, accepted.response),
-                    }
-                    continue;
-                }
-                session.last_seen_ms = now_ms;
-                var bridge: DeliveryBridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
-                const processed_incoming = session.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, DeliveryBridge.deliver) catch |err| {
-                    remaining = 0;
-                    const failure = core_mod.classifyIncomingError(err);
-                    if (failure.disposition == .reject) {
-                        stats.malformed += 1;
-                        continue;
-                    }
-
-                    recordSessionFailure(&stats, failure.class);
-                    session.state = .closed;
-                    self.removeSession(key, callbacks);
-                    continue;
-                };
-                const incoming = processed_incoming.incoming;
-                const extra_work = processed_incoming.work_units -| 1;
-                remaining -= @min(remaining, extra_work);
-                if (incoming == .data) {
-                    session.queueReceipt(incoming.data, now_ms) catch |err| {
-                        const failure = core_mod.classifyTransitionError(.receipt, err);
-                        recordSessionFailure(&stats, failure.class);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                        continue;
-                    };
-                }
-                if (session.state != .closed) {
-                    const flushed = session.flushQueuedAtLimit(now_ms, remaining) catch |err| {
-                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.application_send, err).class);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                        continue;
-                    };
-                    remaining -= @min(remaining, flushed.datagrams);
-                }
-                if (session.state == .closed) {
-                    session.flushReceipts() catch |err| {
-                        recordSessionFailure(&stats, core_mod.classifyTransitionError(.receipt, err).class);
-                    };
-                    self.removeSession(key, callbacks);
-                } else {
-                    session.schedule() catch {
-                        recordSessionFailure(&stats, .internal);
-                        session.state = .closed;
-                        self.removeSession(key, callbacks);
-                    };
-                }
+                try self.processExisting(session, key, message, now_ms, callbacks, &stats, &remaining);
                 continue;
             }
 
@@ -591,6 +635,7 @@ pub const Listener = struct {
                 .accepted => |accepted| {
                     if (self.sessions.count() >= self.config.listener.maximum_connections) {
                         stats.rate_limited_or_dropped += 1;
+                        self.capacity_rejections += 1;
                         const response = offline.encodeNoFreeIncomingConnections(self.handshake_handler.server_guid, self.handshake_output) catch continue;
                         try self.socket.send(message.from, response);
                         continue;
@@ -627,6 +672,7 @@ pub const Listener = struct {
                         session.destroy();
                         return err;
                     };
+                    self.handshakes_started += 1;
                 },
             }
         }
@@ -635,7 +681,99 @@ pub const Listener = struct {
             self.pending_message_count = 0;
         }
         self.processTimersInto(now_ms, callbacks, &stats, remaining);
+        if (remaining == 0) if (self.nextDeadline()) |deadline| {
+            self.timer_turn = deadline <= now_ms;
+        };
         return stats;
+    }
+
+    fn processExisting(
+        self: *Listener,
+        session: *Session,
+        key: EndpointKey,
+        message: std.Io.net.IncomingMessage,
+        now_ms: u64,
+        callbacks: Callbacks,
+        stats: *PollStats,
+        remaining: *usize,
+    ) !void {
+        if (isOfflineHandshake(message.data)) {
+            session.flushReceipts() catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
+            const repeated = self.handshake_handler.handle(
+                message.data,
+                &key,
+                std.hash.Wyhash.hash(self.source_secret, &key),
+                now_ms / 30_000,
+                now_ms,
+                self.handshake_output,
+            );
+            switch (repeated) {
+                .drop => stats.rate_limited_or_dropped += 1,
+                .response => |wire| try self.socket.send(message.from, wire),
+                .accepted => |accepted| try self.socket.send(message.from, accepted.response),
+            }
+            return;
+        }
+        var bridge: DeliveryBridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
+        const processed_incoming = session.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, DeliveryBridge.deliver) catch |err| {
+            remaining.* = 0;
+            const failure = core_mod.classifyIncomingError(err);
+            if (failure.disposition == .reject) {
+                if (failure.class == .resource) stats.rate_limited_or_dropped += 1 else stats.malformed += 1;
+                return;
+            }
+
+            recordSessionFailure(stats, failure.class);
+            session.state = .closed;
+            self.removeSession(key, callbacks);
+            return;
+        };
+        session.last_seen_ms = now_ms;
+        if (bridge.connected) self.handshakes_completed += 1;
+        const incoming = processed_incoming.incoming;
+        const extra_work = processed_incoming.work_units -| 1;
+        remaining.* -= @min(remaining.*, extra_work);
+        if (incoming == .data) {
+            session.queueReceipt(incoming.data, now_ms) catch |err| {
+                const failure = core_mod.classifyTransitionError(.receipt, err);
+                recordSessionFailure(stats, failure.class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
+        }
+        if (session.state != .closed) {
+            const flushed = session.flushQueuedAtLimit(now_ms, remaining.*) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
+            remaining.* -= @min(remaining.*, flushed.datagrams);
+            session.advanceClose(now_ms) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+                return;
+            };
+        }
+        if (session.state == .closed) {
+            session.flushReceipts() catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
+            };
+            self.removeSession(key, callbacks);
+        } else {
+            session.schedule() catch {
+                recordSessionFailure(stats, .internal);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+            };
+        }
     }
 
     fn processTimersInto(self: *Listener, now_ms: u64, callbacks: Callbacks, stats: *PollStats, maximum_work: usize) void {
@@ -673,6 +811,14 @@ pub const Listener = struct {
                 continue;
             };
             remaining -= @min(remaining, @max(@as(usize, 1), used));
+            session.advanceClose(now_ms) catch |err| {
+                recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
+                session.state = .closed;
+            };
+            if (session.state == .closed) {
+                self.removeSession(entry.key, callbacks);
+                continue;
+            }
             session.schedule() catch {
                 recordSessionFailure(stats, .internal);
                 session.state = .closed;
@@ -680,9 +826,15 @@ pub const Listener = struct {
             };
         }
     }
+    fn record(self: *Listener, stats: PollStats) void {
+        self.malformed_datagrams += stats.malformed;
+        self.dropped_datagrams += stats.rate_limited_or_dropped;
+    }
+
     fn removeSession(self: *Listener, key: EndpointKey, callbacks: Callbacks) void {
         _ = self.deadlines.remove(key);
         const removed = self.sessions.fetchRemove(key) orelse return;
+        self.retired.add(removed.value.statistics());
         if (callbacks.disconnected) |notify| notify(callbacks.context, removed.value);
         removed.value.destroy();
     }
@@ -709,13 +861,6 @@ fn isOfflineHandshake(data: []const u8) bool {
         @intFromEnum(offline.Id.open_connection_request_2),
         => true,
         else => false,
-    };
-}
-
-fn emptyAddress(address: offline.Address) offline.Address {
-    return switch (address) {
-        .ipv4 => .{ .ipv4 = .{ .octets = .{ 0, 0, 0, 0 }, .port = 0 } },
-        .ipv6 => .{ .ipv6 = .{ .octets = @splat(0), .port = 0 } },
     };
 }
 
@@ -747,7 +892,6 @@ fn endpointKey(address: std.Io.net.IpAddress) EndpointKey {
     return key;
 }
 test "listener answers an offline ping over loopback" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
     const io = io_instance.io();
@@ -757,7 +901,7 @@ test "listener answers an offline ping over loopback" {
     var client = try backend.Socket.bind(io, address, 2048);
     defer client.close();
     var ping: [33]u8 = undefined;
-    var writer: @import("protocol/cursor.zig").Writer = .{ .data = &ping };
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
     try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
     try writer.u64be(123);
     try writer.bytes(&offline.magic);
@@ -790,7 +934,7 @@ test "listener answers an offline ping over loopback" {
     const mtu = std.mem.readInt(u16, reply1.data[30..32], .big);
 
     var request2_buffer: [64]u8 = undefined;
-    var request2: @import("protocol/cursor.zig").Writer = .{ .data = &request2_buffer };
+    var request2: @import("../protocol/cursor.zig").Writer = .{ .data = &request2_buffer };
     try request2.byte(@intFromEnum(offline.Id.open_connection_request_2));
     try request2.bytes(&offline.magic);
     try request2.u32be(cookie_value);
@@ -812,6 +956,12 @@ test "listener answers an offline ping over loopback" {
     _ = try client.value.receive(io, &response);
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
+
+    scheduled.last_seen_ms = 1;
+    try client.send(listener.socket.value.address, &.{0x80});
+    const malformed_stats = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
+    try std.testing.expectEqual(@as(usize, 1), malformed_stats.malformed);
+    try std.testing.expectEqual(@as(u64, 1), scheduled.last_seen_ms);
 
     const Sender = struct {
         socket: *backend.Socket,
@@ -835,8 +985,8 @@ test "listener answers an offline ping over loopback" {
     for (0..4) |_| {
         const accepted_datagram = try client.value.receive(io, &response);
         if (accepted_datagram.data[0] & 0x40 != 0) continue;
-        var decoded_datagram = try @import("protocol/frame.zig").decodeDatagram(accepted_datagram.data);
-        const accepted_frame = try @import("protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
+        var decoded_datagram = try @import("../protocol/frame.zig").decodeDatagram(accepted_datagram.data);
+        const accepted_frame = try @import("../protocol/frame.zig").decodeOne(&decoded_datagram.frames, 8192, 2048);
         if ((try connected.decode(accepted_frame.payload)) == .connection_request_accepted) {
             accepted = true;
             break;
@@ -850,8 +1000,8 @@ test "listener answers an offline ping over loopback" {
     for (0..4) |_| {
         const repeated_accepted = try client.value.receive(io, &response);
         if (repeated_accepted.data[0] & 0x40 != 0) continue;
-        var repeated_datagram = try @import("protocol/frame.zig").decodeDatagram(repeated_accepted.data);
-        const repeated_frame = try @import("protocol/frame.zig").decodeOne(&repeated_datagram.frames, 8192, 2048);
+        var repeated_datagram = try @import("../protocol/frame.zig").decodeDatagram(repeated_accepted.data);
+        const repeated_frame = try @import("../protocol/frame.zig").decodeOne(&repeated_datagram.frames, 8192, 2048);
         if ((try connected.decode(repeated_frame.payload)) == .connection_request_accepted) {
             accepted = true;
             break;
@@ -873,29 +1023,197 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expect(listener.nextDeadline() == null);
 }
 
-test "closing a connected session sends a disconnect" {
+const CloseHarness = struct {
+    disconnected: usize = 0,
+
+    fn onConnect(_: *anyopaque, _: *Session) !void {}
+    fn onMessage(_: *anyopaque, _: *Session, _: receiver.BorrowedPayload) !void {}
+    fn onDisconnect(raw: *anyopaque, _: *Session) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.disconnected += 1;
+    }
+    fn callbacks(self: *@This()) Callbacks {
+        return .{ .context = self, .connected = onConnect, .message = onMessage, .disconnected = onDisconnect };
+    }
+
+    fn open(listener: *Listener, peer: *backend.Socket) !*Session {
+        const key = endpointKey(peer.value.address);
+        const allocator = listener.session_quota.allocator();
+        const session = try Session.create(allocator, &listener.socket, &listener.deadlines, peer.value.address, key, 1, 576, time.nowMilliseconds(listener.io), 1000, 8, listener.config);
+        errdefer session.destroy();
+        try listener.sessions.put(allocator, key, session);
+        session.state = .connected;
+        try session.schedule();
+        return session;
+    }
+
+    fn inject(self: *@This(), listener: *Listener, from: std.Io.net.IpAddress, wire: []u8) !void {
+        listener.messages[0] = .{ .from = from, .data = wire, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+        listener.pending_message_index = 0;
+        listener.pending_message_count = 1;
+        _ = try listener.poll(.none, self.callbacks());
+    }
+
+    const Received = struct { sequence: u32, disconnect: bool };
+    fn receive(peer: *backend.Socket) !Received {
+        var storage: [576]u8 = undefined;
+        while (true) {
+            const message = try peer.value.receive(peer.io, &storage);
+            if (message.data[0] & 0x40 != 0) continue;
+            var decoded = try frame.decodeDatagram(message.data);
+            const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
+            return .{ .sequence = decoded.sequence, .disconnect = value.payload[0] == @intFromEnum(offline.Id.disconnect_notification) };
+        }
+    }
+
+    fn ack(self: *@This(), listener: *Listener, peer: *backend.Socket, sequence: u32) !void {
+        var wire: [32]u8 = undefined;
+        try self.inject(listener, peer.value.address, try @import("../protocol/datagram.zig").encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire));
+    }
+};
+
+test "graceful session close drains data and retransmits the disconnect until ACKed" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
-    var socket = try backend.Socket.bind(io, address, 576);
-    defer socket.close();
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
     var peer = try backend.Socket.bind(io, address, 576);
     defer peer.close();
-    var deadlines = try deadline_queue.Queue.init(std.testing.allocator, 1);
-    defer deadlines.deinit();
-    const key = endpointKey(peer.value.address);
-    const session = try Session.create(std.testing.allocator, &socket, &deadlines, peer.value.address, key, 1, 576, 100, 1000, 8, .{});
-    defer session.destroy();
-    session.state = .connected;
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
 
+    _ = try session.queueSend("\xfefinal", .reliable_ordered, 0);
+    session.close();
+    session.close();
+    try std.testing.expectEqual(State.closing, session.state);
+    try std.testing.expectError(error.NotConnected, session.queueSend("\xfelate", .reliable_ordered, 0));
+    try std.testing.expectError(error.NotConnected, session.send("\xfelate", .reliable_ordered, 0));
+
+    try std.testing.expectEqual(@as(usize, 1), session.core.outbound_state.countAll());
+    _ = try listener.processTimers(session.outbound_deadline_ms.?, harness.callbacks());
+    const data = try CloseHarness.receive(&peer);
+    try std.testing.expect(!data.disconnect);
+    try std.testing.expect(!session.core.disconnect_queued);
+    try harness.ack(listener, &peer, data.sequence);
+    const disconnect = try CloseHarness.receive(&peer);
+    try std.testing.expect(disconnect.disconnect);
+
+    _ = try listener.processTimers(session.core.nextRetransmissionDeadline().?, harness.callbacks());
+    const resent = try CloseHarness.receive(&peer);
+    try std.testing.expect(resent.disconnect);
+    try std.testing.expect(resent.sequence != disconnect.sequence);
+    try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+
+    try harness.ack(listener, &peer, resent.sequence);
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+
+    const stats = listener.statistics();
+    try std.testing.expectEqual(@as(u64, 2), stats.ack_records_received);
+    try std.testing.expectEqual(@as(u64, 1), stats.retransmitted_datagrams);
+    try std.testing.expectEqual(@as(u64, 3), stats.traffic.datagrams_sent);
+    try std.testing.expectEqual(@as(usize, 0), stats.recovery_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.queued_packets_high_water);
+}
+
+test "advertisement updates are bounded and used by the next pong" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;old" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 2048);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+
+    try listener.setAdvertisement("MCPE;Quark;11;1.21;7;100;");
+    var ping: [33]u8 = undefined;
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
+    try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
+    try writer.u64be(1);
+    try writer.bytes(&offline.magic);
+    try writer.u64be(2);
+    try harness.inject(listener, peer.value.address, &ping);
+    var storage: [2048]u8 = undefined;
+    const pong = try peer.value.receive(io, &storage);
+    try std.testing.expectEqualStrings("MCPE;Quark;11;1.21;7;100;", pong.data[35..]);
+
+    const too_large: [2048]u8 = @splat('x');
+    try std.testing.expectError(error.AdvertisementTooLarge, listener.setAdvertisement(&too_large));
+    try listener.setAdvertisement(listener.advertisement[5..8]);
+    try std.testing.expectEqualStrings("Qua", listener.handshake_handler.advertisement);
+
+    const stats = listener.statistics();
+    try std.testing.expectEqual(@as(u64, 1), stats.unconnected_pings);
+    try std.testing.expectEqual(@as(u64, 1), stats.traffic.datagrams_sent);
+    try std.testing.expectEqual(@as(u64, pong.data.len), stats.traffic.bytes_sent);
+}
+
+test "session close is forced when the disconnect is never acknowledged" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
+    session.close();
+    try std.testing.expect((try CloseHarness.receive(&peer)).disconnect);
+    const deadline = session.core.close_deadline_ms.?;
+    _ = try listener.processTimers(deadline - 1, harness.callbacks());
+    try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+    _ = try listener.processTimers(deadline, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+}
+
+test "remote disconnect during a local close removes the session promptly" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
+    _ = try session.queueSend("\xfeunacked", .reliable_ordered, 0);
+    session.close();
+
+    const Collector = struct {
+        wire: [576]u8 = undefined,
+        len: usize = 0,
+        fn emit(raw: *anyopaque, _: u32, _: bool, wire: []const u8) transmitter_mod.EmitError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(self.wire[0..wire.len], wire);
+            self.len = wire.len;
+        }
+    };
+    var remote = try transmitter_mod.Transmitter.init(576, .{});
+    var collector: Collector = .{};
+    var scratch: [576]u8 = undefined;
+    _ = try remote.send(&.{@intFromEnum(offline.Id.disconnect_notification)}, .reliable_ordered, 0, &scratch, &collector, Collector.emit);
+    try harness.inject(listener, peer.value.address, collector.wire[0..collector.len]);
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+}
+
+test "closing a connecting session is immediate" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;close" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
+    session.state = .connecting;
     session.close();
     try std.testing.expectEqual(State.closed, session.state);
-    try std.testing.expectEqual(@as(usize, 1), deadlines.count());
-
-    var storage: [576]u8 = undefined;
-    const message = try peer.value.receive(io, &storage);
-    var decoded = try @import("protocol/frame.zig").decodeDatagram(message.data);
-    const value = try @import("protocol/frame.zig").decodeOne(&decoded.frames, 8192, 2048);
-    try std.testing.expectEqual(@intFromEnum(offline.Id.disconnect_notification), value.payload[0]);
+    _ = try listener.processTimers(time.nowMilliseconds(io), harness.callbacks());
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
 }
 
 test "ACK delay schedules while NACK remains urgent" {
@@ -916,6 +1234,54 @@ test "ACK delay schedules while NACK remains urgent" {
     try std.testing.expectEqual(@as(?u64, 102), session.ack_deadline_ms);
 }
 
+test "every due session timer runs when several are due together" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var socket = try backend.Socket.bind(io, address, 576);
+    defer socket.close();
+    var deadlines = try deadline_queue.Queue.init(std.testing.allocator, 1);
+    defer deadlines.deinit();
+    const key = endpointKey(socket.value.address);
+    const session = try Session.create(std.testing.allocator, &socket, &deadlines, socket.value.address, key, 1, 576, 0, 1000, 8, .{});
+    defer session.destroy();
+    try session.core.trackSent(0, "\x84\x00\x00\x00\x00\x00\x08\x01", 8, 0);
+    try session.queueReceipt(.{ .acknowledge = 1 }, 0);
+    session.outbound_deadline_ms = 0;
+    const now = session.core.nextRetransmissionDeadline().?;
+    _ = try session.processDueTimers(now, 16);
+    try std.testing.expectEqual(@as(?u64, null), session.ack_deadline_ms);
+    try std.testing.expectEqual(@as(?u64, null), session.outbound_deadline_ms);
+    try std.testing.expect(session.core.nextRetransmissionDeadline().? > now);
+}
+
+test "continuous malformed input cannot starve a session close deadline" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var config: Config = .{};
+    config.batching.maximum_packets_per_iteration = 1;
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "test", .config = config });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 2048);
+    defer peer.close();
+    const session = try CloseHarness.open(listener, &peer);
+    session.state = .closing;
+    session.core.close_deadline_ms = 0;
+    try session.schedule();
+    var harness: CloseHarness = .{};
+    var invalid = [_]u8{0};
+    for (listener.messages[0..3]) |*message| message.* = .{ .from = peer.value.address, .data = &invalid, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+    listener.pending_message_count = 3;
+    _ = try listener.poll(.none, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), listener.pending_message_index);
+    try std.testing.expectEqual(@as(usize, 1), listener.sessions.count());
+    _ = try listener.poll(.none, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), listener.pending_message_index);
+    try std.testing.expectEqual(@as(usize, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    _ = try listener.poll(.none, harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 2), listener.pending_message_index);
+}
+
 test "global turn budget carries unread batch entries fairly" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
@@ -927,7 +1293,7 @@ test "global turn budget carries unread batch entries fairly" {
     defer peer.close();
 
     var ping: [33]u8 = undefined;
-    var writer: @import("protocol/cursor.zig").Writer = .{ .data = &ping };
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
     try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
     try writer.u64be(1);
     try writer.bytes(&offline.magic);

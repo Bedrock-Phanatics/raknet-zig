@@ -34,7 +34,6 @@ pub const Reliability = enum(u3) {
 
 pub const Split = struct { count: u32, id: u16, index: u32 };
 
-/// All slices borrow the input datagram and must not outlive its receive buffer.
 pub const Frame = struct {
     reliability: Reliability,
     reliable_index: ?u32 = null,
@@ -51,7 +50,6 @@ pub fn decodeOne(reader: *cursor.Reader, maximum_payload: usize, maximum_split_p
     const split_flag = flags & 0x10 != 0;
     if (flags & 0x0f != 0) return error.InvalidFrameFlags;
     const bit_length = try reader.u16be();
-    if (bit_length == 0) return error.EmptyPayload;
     const payload_len: usize = (@as(usize, bit_length) + 7) / 8;
     if (payload_len > maximum_payload) return error.PayloadTooLarge;
 

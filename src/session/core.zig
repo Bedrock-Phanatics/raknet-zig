@@ -4,10 +4,12 @@ const Config = @import("../config.zig").Config;
 const ack = @import("../protocol/ack.zig");
 const datagram = @import("../protocol/datagram.zig");
 const frame = @import("../protocol/frame.zig");
+const offline = @import("../protocol/offline.zig");
 const congestion = @import("../reliability/congestion.zig");
 const reassembly = @import("../reliability/reassembly.zig");
 const recovery = @import("../reliability/recovery.zig");
 const rtt = @import("../reliability/rtt.zig");
+const uint24 = @import("../util/uint24.zig");
 const outbound_queue = @import("outbound_queue.zig");
 const receiver = @import("receiver.zig");
 const transmitter = @import("transmitter.zig");
@@ -31,6 +33,11 @@ pub const Statistics = struct {
     split_assemblies: usize,
     split_payload_bytes: usize,
     retained_payload_capacity_bytes: usize,
+    queued_packets_high_water: usize,
+    ack_records_received: u64,
+    nack_records_received: u64,
+    ack_records_sent: u64 = 0,
+    nack_records_sent: u64 = 0,
 };
 
 var next_send_owner: std.atomic.Value(u64) = .init(1);
@@ -40,6 +47,8 @@ pub const Incoming = union(enum) {
     acknowledged: recovery.Acknowledged,
     nack_marked: usize,
 };
+
+pub const CloseStep = enum { pending, flush, done };
 
 pub const ProcessedIncoming = struct {
     incoming: Incoming,
@@ -101,7 +110,6 @@ pub fn classifyIncomingError(err: anyerror) IncomingFailure {
         error.InvalidRecordType,
         error.ReversedRange,
         error.TooManyAcknowledgements,
-        error.OverlappingRanges,
         error.TrailingData,
         error.InvalidFrameFlags,
         error.EmptyPayload,
@@ -112,16 +120,18 @@ pub fn classifyIncomingError(err: anyerror) IncomingFailure {
         error.DatagramWindowExceeded,
         => .{ .class = .protocol, .disposition = .reject },
 
+        error.TooManyAssemblies,
+        error.SplitBudgetExceeded,
+        => .{ .class = .resource, .disposition = .reject },
+
         error.PeerProtocolFailure,
         error.ReliableWindowExceeded,
         error.OrderWindowExceeded,
-        error.SplitIdCollision,
         error.ConflictingFragment,
         => .{ .class = .protocol, .disposition = .close_session },
 
         error.OutOfMemory,
         error.ResourceLimitFailure,
-        error.TooManyAssemblies,
         error.ReassemblyLimitExceeded,
         error.OrderQueueFull,
         error.OrderBytesExceeded,
@@ -225,9 +235,13 @@ pub const Core = struct {
     send_owner: u64,
     terminal_send_failure: bool = false,
     newest_sent: u32 = 0,
+    close_deadline_ms: ?u64 = null,
+    disconnect_queued: bool = false,
     acknowledged_datagrams: u64 = 0,
     lost_datagrams: u64 = 0,
     retransmitted_datagrams: u64 = 0,
+    ack_records_received: u64 = 0,
+    nack_records_received: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, mtu: u16, config: Config) !Core {
         try config.validate();
@@ -235,6 +249,8 @@ pub const Core = struct {
         var receiver_state = try receiver.Receiver.init(allocator, config);
         errdefer receiver_state.deinit();
         var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, mtu);
+        recovery_state.maximum_delay_ms = config.timing.maximum_rto_ms;
+        recovery_state.minimum_abandon_ms = config.timing.idle_timeout_ms;
         errdefer recovery_state.deinit();
         var outbound_state = try outbound_queue.Queue.init(
             allocator,
@@ -282,7 +298,13 @@ pub const Core = struct {
         context: *anyopaque,
         emit: SendFn,
     ) !transmitter.Sent {
-        return self.sendImmediate(.control, payload, reliability, channel, scratch, now_ms, context, emit);
+        return self.sendImmediate(.control, payload, reliability, channel, scratch, now_ms, context, emit) catch |err| switch (err) {
+            error.CongestionWindowFull, error.OutboundQueuePending => {
+                _ = try self.enqueueOutbound(.control, payload, reliability, channel);
+                return .{ .datagrams = 0, .wire_bytes = 0 };
+            },
+            else => return err,
+        };
     }
 
     fn sendImmediate(
@@ -300,6 +322,10 @@ pub const Core = struct {
         const wire_bytes = try self.transmitter_state.estimateWireBytes(payload.len, reliability, channel);
         if (self.outbound_state.count(lane) != 0) return error.OutboundQueuePending;
         if (wire_bytes > self.congestion_state.available()) return error.CongestionWindowFull;
+        if (reliability.hasReliableIndex()) {
+            const fragments = try self.transmitter_state.fragmentCount(payload.len, reliability, channel);
+            if (self.recoverySlots(fragments, now_ms) < fragments) return error.CongestionWindowFull;
+        }
         var packetization = try self.transmitter_state.beginPacketization(payload.len, reliability, channel);
         const sent = try self.sendAvailable(&packetization, payload, scratch, std.math.maxInt(usize), now_ms, context, emit);
         if (!packetization.complete()) return error.CongestionWindowFull;
@@ -338,8 +364,12 @@ pub const Core = struct {
             }
         };
         var bridge: Bridge = .{ .core = self, .user_context = context, .user_emit = emit, .now_ms = now_ms };
+        const datagrams = if (packetization.reliability.hasReliableIndex())
+            self.recoverySlots(@min(maximum_datagrams, packetization.fragment_count - packetization.next_fragment), now_ms)
+        else
+            maximum_datagrams;
         const available = std.math.cast(usize, self.congestion_state.available()) orelse std.math.maxInt(usize);
-        return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, maximum_datagrams, &bridge, Bridge.forward) catch |err| {
+        return self.transmitter_state.sendAvailable(packetization, payload, scratch, available, datagrams, &bridge, Bridge.forward) catch |err| {
             if (err == error.PartialSendFailure) self.terminal_send_failure = true;
             return err;
         };
@@ -362,6 +392,7 @@ pub const Core = struct {
             }
         };
         var bridge: Bridge = .{ .core = self, .user_context = context, .user_emit = emit, .now_ms = now_ms };
+        if (self.recoverySlots(1, now_ms) == 0) return .{};
         const available = std.math.cast(usize, self.congestion_state.available()) orelse std.math.maxInt(usize);
         return self.transmitter_state.pack(
             QueuedMessages{ .iterator = self.outbound_state.iterator(lane) },
@@ -424,6 +455,9 @@ pub const Core = struct {
             .split_assemblies = receiver_state.splits.count(),
             .split_payload_bytes = receiver_state.splits.payloadBytes(),
             .retained_payload_capacity_bytes = recovery_capacity +| ordered_capacity +| split_capacity,
+            .queued_packets_high_water = self.outbound_state.high_water,
+            .ack_records_received = self.ack_records_received,
+            .nack_records_received = self.nack_records_received,
         };
     }
 
@@ -476,7 +510,37 @@ pub const Core = struct {
         }
         return total;
     }
-    /// Copies a reliable datagram into bounded recovery storage before it is handed to the socket.
+    pub fn flushAllOutbound(self: *Core, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
+        const control = try self.flushOutbound(.control, scratch, maximum_datagrams, now_ms, context, emit);
+        const application = try self.flushOutbound(.application, scratch, maximum_datagrams - control.datagrams, now_ms, context, emit);
+        return .{ .datagrams = control.datagrams + application.datagrams, .wire_bytes = control.wire_bytes + application.wire_bytes };
+    }
+
+    pub fn beginClose(self: *Core, now_ms: u64) void {
+        if (self.close_deadline_ms == null) self.close_deadline_ms = now_ms +| self.config.timing.shutdown_timeout_ms;
+    }
+
+    pub fn advanceClose(self: *Core, now_ms: u64) !CloseStep {
+        const deadline = self.close_deadline_ms orelse return .pending;
+        if (now_ms >= deadline) return .done;
+        if (self.outbound_state.countAll() != 0 or self.recovery_state.count() != 0) return .pending;
+        if (self.disconnect_queued) return .done;
+        _ = try self.enqueueOutbound(.control, &.{@intFromEnum(offline.Id.disconnect_notification)}, .reliable_ordered, 0);
+        self.disconnect_queued = true;
+        return .flush;
+    }
+
+    fn recoverySlots(self: *Core, needed: usize, now_ms: u64) usize {
+        const first = self.transmitter_state.datagram_sequence;
+        const free = self.recovery_state.freeSlots(first, needed);
+        if (free < needed and self.recovery_state.expedite(first, free, now_ms)) {
+            self.lost_datagrams +|= 1;
+            self.congestion_state.lost(self.newest_sent);
+        }
+        return free;
+    }
+
+    /// Copies wire data so the caller can reuse its buffer.
     pub fn trackSent(self: *Core, sequence: u32, wire: []const u8, in_flight_bytes: usize, now_ms: u64) !void {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         try self.congestion_state.sent(in_flight_bytes);
@@ -522,6 +586,7 @@ pub const Core = struct {
             },
             .ack => |decoded| blk: {
                 const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
+                self.ack_records_received += decoded.records.len;
                 self.acknowledged_datagrams +|= result.packets;
                 if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes);
                 if (result.rtt_sample_ms) |sample| self.rtt_state.observe(sample);
@@ -529,6 +594,7 @@ pub const Core = struct {
             },
             .nack => |decoded| blk: {
                 const marked = try self.recovery_state.markNack(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
+                self.nack_records_received += decoded.records.len;
                 self.lost_datagrams +|= marked;
                 if (marked != 0) self.congestion_state.lost(self.newest_sent);
                 break :blk .{ .incoming = .{ .nack_marked = marked }, .work_units = 1 + decoded.acknowledged_count };
@@ -548,7 +614,8 @@ pub const Core = struct {
     }
 
     pub fn collectRetransmissions(self: *Core, now_ms: u64, output: []recovery.Due, maximum_work: usize) recovery.DueBatch {
-        const batch = self.recovery_state.collectDue(now_ms, self.rtt_state.rto(), output, maximum_work);
+        const batch = self.recovery_state.collectDueResequenced(now_ms, self.rtt_state.rto(), output, maximum_work, &self.transmitter_state.datagram_sequence);
+        if (batch.items.len != 0) self.newest_sent = uint24.sub(self.transmitter_state.datagram_sequence, 1);
         self.retransmitted_datagrams +|= batch.items.len;
         var timed_out: usize = 0;
         for (batch.items) |item| if (item.timed_out) {
@@ -741,6 +808,69 @@ test "queued send cancellation is explicit and ownership safe" {
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
 }
 
+test "recovery slot collisions apply backpressure instead of failing sends" {
+    const Collector = struct {
+        count: usize = 0,
+        fn emit(raw: *anyopaque, _: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var config: Config = .{};
+    config.session.maximum_retransmissions = 4;
+    var core = try Core.init(std.testing.allocator, 576, config);
+    defer core.deinit();
+    var scratch: [576]u8 = undefined;
+    var collector: Collector = .{};
+    _ = try core.send("pinned", .reliable, 0, &scratch, 0, &collector, Collector.emit);
+    var unused: u8 = 0;
+    const Discard = struct {
+        fn deliver(_: *anyopaque, _: receiver.BorrowedPayload) !void {}
+    };
+    for (1..4) |sequence| {
+        _ = try core.send("acked", .reliable, 0, &scratch, 0, &collector, Collector.emit);
+        var wire: [32]u8 = undefined;
+        const seq: u32 = @intCast(sequence);
+        _ = try core.processIncoming(try datagram.encodeControl(.ack, &.{.{ .first = seq, .last = seq }}, &wire), 1, &unused, Discard.deliver);
+    }
+    const order_index = core.transmitter_state.order_indices[0];
+    try std.testing.expectError(error.CongestionWindowFull, core.send("blocked", .reliable_ordered, 0, &scratch, 1, &collector, Collector.emit));
+    try std.testing.expectEqual(order_index, core.transmitter_state.order_indices[0]);
+    try std.testing.expectEqual(@as(?u64, 1), core.nextRetransmissionDeadline());
+    try std.testing.expectEqual(@as(u64, 1), core.lost_datagrams);
+    var large: [1200]u8 = @splat(1);
+    _ = try core.enqueueOutbound(.application, &large, .reliable_ordered, 0);
+    try std.testing.expectEqual(@as(usize, 0), (try core.flushOutbound(.application, &scratch, 8, 1, &collector, Collector.emit)).datagrams);
+    try std.testing.expect(!core.terminal_send_failure);
+    var wire: [32]u8 = undefined;
+    _ = try core.processIncoming(try datagram.encodeControl(.ack, &.{.{ .first = 0, .last = 0 }}, &wire), 2, &unused, Discard.deliver);
+    try std.testing.expect((try core.flushOutbound(.application, &scratch, 8, 2, &collector, Collector.emit)).datagrams >= 3);
+    try std.testing.expectEqual(@as(usize, 0), core.outboundCount(.application));
+}
+
+test "control replies queue instead of failing when the window is full" {
+    const Collector = struct {
+        count: usize = 0,
+        fn emit(raw: *anyopaque, _: []const u8) SendError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+        }
+    };
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    var scratch: [576]u8 = undefined;
+    var collector: Collector = .{};
+    core.congestion_state.in_flight = core.congestion_state.window;
+    const queued = try core.sendControl("pong", .unreliable, 0, &scratch, 0, &collector, Collector.emit);
+    try std.testing.expectEqual(@as(usize, 0), queued.datagrams);
+    try std.testing.expectEqual(@as(usize, 1), core.outboundCount(.control));
+    try std.testing.expectError(error.CongestionWindowFull, core.send("data", .reliable, 0, &scratch, 0, &collector, Collector.emit));
+    core.congestion_state.in_flight = 0;
+    try std.testing.expectEqual(@as(usize, 1), (try core.flushAllOutbound(&scratch, 8, 1, &collector, Collector.emit)).datagrams);
+    try std.testing.expectEqual(@as(usize, 0), core.outboundCount(.control));
+    try std.testing.expectEqual(@as(usize, 1), collector.count);
+}
+
 test "immediate application sends cannot bypass queued progress" {
     const Collector = struct {
         count: usize = 0,
@@ -824,6 +954,10 @@ test "incoming failures keep their origin and commit safety" {
     try std.testing.expectEqual(IncomingErrorDisposition.reject, incomingErrorDisposition(error.DatagramWindowExceeded));
     try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ReliableWindowExceeded));
     try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.OrderQueueFull));
+    try std.testing.expectEqual(IncomingFailure{ .class = .resource, .disposition = .reject }, classifyIncomingError(error.TooManyAssemblies));
+    try std.testing.expectEqual(IncomingFailure{ .class = .resource, .disposition = .reject }, classifyIncomingError(error.SplitBudgetExceeded));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ReassemblyLimitExceeded));
+    try std.testing.expectEqual(IncomingErrorDisposition.close_session, incomingErrorDisposition(error.ConflictingFragment));
 
     try std.testing.expect(deliverySendFailure(error.OutOfMemory) == error.ResourceLimitFailure);
     try std.testing.expect(deliverySendFailure(error.TransportFailure) == error.TransportFailure);
@@ -857,4 +991,126 @@ test "transition policy distinguishes rejection, retry, and closure" {
     try std.testing.expectEqual(IncomingErrorClass.transport, classifyTransitionError(.retransmission, error.RetransmissionLimitExceeded).class);
     try std.testing.expectEqual(IncomingErrorClass.protocol, classifyTransitionError(.handshake, error.IncompatibleProtocol).class);
     try std.testing.expectEqual(IncomingErrorClass.transport, classifyTransitionError(.handshake, error.Timeout).class);
+}
+
+const ClosePeer = struct {
+    sequences: [16]u32 = undefined,
+    disconnects: [16]bool = undefined,
+    count: usize = 0,
+
+    fn emit(raw: *anyopaque, wire: []const u8) SendError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
+        var disconnect = false;
+        while (decoded.frames.remaining() != 0) {
+            const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
+            disconnect = disconnect or value.payload[0] == @intFromEnum(offline.Id.disconnect_notification);
+        }
+        self.sequences[self.count] = decoded.sequence;
+        self.disconnects[self.count] = disconnect;
+        self.count += 1;
+    }
+
+    fn acknowledge(self: *@This(), core: *Core, index: usize, now_ms: u64) !void {
+        const Discard = struct {
+            fn deliver(_: *anyopaque, _: receiver.BorrowedPayload) !void {}
+        };
+        var wire: [32]u8 = undefined;
+        const sequence = self.sequences[index];
+        var unused: u8 = 0;
+        _ = try core.processIncoming(try datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire), now_ms, &unused, Discard.deliver);
+    }
+
+    fn step(self: *@This(), core: *Core, now_ms: u64) !CloseStep {
+        const result = try core.advanceClose(now_ms);
+        var scratch: [576]u8 = undefined;
+        if (result == .flush) _ = try core.flushAllOutbound(&scratch, 8, now_ms, self, emit);
+        return result;
+    }
+};
+
+fn expectClosedClean(core: *const Core) !void {
+    try std.testing.expectEqual(@as(usize, 0), core.recovery_state.count());
+    try std.testing.expectEqual(@as(usize, 0), core.outbound_state.countAll());
+    try std.testing.expectEqual(@as(?u64, null), core.nextRetransmissionDeadline());
+    try std.testing.expectEqual(@as(u64, 0), core.congestion_state.in_flight);
+}
+
+test "close with empty queues sends a reliable disconnect and finishes on its ACK" {
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    var peer: ClosePeer = .{};
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 0));
+    core.beginClose(0);
+    core.beginClose(1_000);
+    try std.testing.expectEqual(@as(?u64, 5_000), core.close_deadline_ms);
+    try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 0));
+    try std.testing.expectEqual(@as(usize, 1), peer.count);
+    try std.testing.expect(peer.disconnects[0]);
+    try std.testing.expectEqual(@as(usize, 1), core.recovery_state.count());
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 1));
+    try peer.acknowledge(&core, 0, 2);
+    try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 2));
+    try std.testing.expectEqual(@as(usize, 1), peer.count);
+    try expectClosedClean(&core);
+}
+
+test "close drains queued application and control data before the disconnect" {
+    for ([_][]const outbound_queue.Lane{ &.{.application}, &.{.control}, &.{ .control, .application } }) |lanes| {
+        var core = try Core.init(std.testing.allocator, 576, .{});
+        defer core.deinit();
+        var peer: ClosePeer = .{};
+        for (lanes) |lane| _ = try core.enqueueOutbound(lane, "\xfequeued", .reliable_ordered, 0);
+        core.beginClose(0);
+        try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 0));
+        var scratch: [576]u8 = undefined;
+        _ = try core.flushAllOutbound(&scratch, 8, 0, &peer, ClosePeer.emit);
+        try std.testing.expect(peer.count != 0 and !peer.disconnects[0]);
+        try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 1));
+        for (0..peer.count) |index| try peer.acknowledge(&core, index, 2);
+        const data_datagrams = peer.count;
+        try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 2));
+        try std.testing.expect(peer.disconnects[data_datagrams]);
+        try std.testing.expect(peer.sequences[data_datagrams] > peer.sequences[data_datagrams - 1]);
+        try peer.acknowledge(&core, data_datagrams, 3);
+        try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 3));
+        try expectClosedClean(&core);
+    }
+}
+
+test "close waits for outstanding reliable data and retransmits a lost disconnect" {
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    var peer: ClosePeer = .{};
+    var scratch: [576]u8 = undefined;
+    _ = try core.send("\xfeinflight", .reliable_ordered, 0, &scratch, 0, &peer, ClosePeer.emit);
+    core.beginClose(0);
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 0));
+    try peer.acknowledge(&core, 0, 10);
+    try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 10));
+    try std.testing.expect(peer.disconnects[1]);
+
+    const deadline = core.nextRetransmissionDeadline().?;
+    var due: [4]recovery.Due = undefined;
+    const batch = core.collectRetransmissions(deadline, &due, 4);
+    try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+    try ClosePeer.emit(&peer, batch.items[0].data);
+    try std.testing.expect(peer.disconnects[2]);
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, deadline));
+    try peer.acknowledge(&core, 2, deadline + 1);
+    try std.testing.expectEqual(CloseStep.done, try peer.step(&core, deadline + 1));
+    try expectClosedClean(&core);
+}
+
+test "close is forced at the shutdown deadline when the ACK never arrives" {
+    var config: Config = .{};
+    config.timing.shutdown_timeout_ms = 100;
+    var core = try Core.init(std.testing.allocator, 576, config);
+    defer core.deinit();
+    var peer: ClosePeer = .{};
+    core.beginClose(0);
+    try std.testing.expectEqual(CloseStep.flush, try peer.step(&core, 0));
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 99));
+    try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 100));
+    try std.testing.expectEqual(@as(usize, 1), peer.count);
 }

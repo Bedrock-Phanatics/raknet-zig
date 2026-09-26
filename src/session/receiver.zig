@@ -7,6 +7,7 @@ const frame = @import("../protocol/frame.zig");
 const ordered_store = @import("../reliability/ordered_store.zig");
 const reassembly = @import("../reliability/reassembly.zig");
 const receive_window = @import("../reliability/receive_window.zig");
+const uint24 = @import("../util/uint24.zig");
 
 pub const Receipt = struct {
     acknowledge: ?u32 = null,
@@ -25,10 +26,8 @@ pub const DeliveryError = error{
     ApplicationFailure,
     InternalFailure,
 };
-/// The payload is valid only during the callback.
 pub const DeliverFn = *const fn (context: *anyopaque, payload: BorrowedPayload) DeliveryError!void;
 
-/// Retains no slices into processed datagrams.
 pub const Receiver = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -39,6 +38,7 @@ pub const Receiver = struct {
     splits: reassembly.Reassembler,
     ordered: ordered_store.Store,
     sequenced: []ordered_store.Sequenced,
+    stale: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Receiver {
         try config.validate();
@@ -51,6 +51,7 @@ pub const Receiver = struct {
             .maximum_bytes = config.protocol.maximum_split_bytes,
             .maximum_concurrent = config.session.maximum_concurrent_splits,
             .maximum_total_bytes = config.session.maximum_split_bytes_per_connection,
+            .maximum_total_parts = config.session.maximum_split_parts_per_connection,
             .timeout_ms = config.timing.split_timeout_ms,
         });
         errdefer splits.deinit();
@@ -90,7 +91,6 @@ pub const Receiver = struct {
     pub fn process(self: *Receiver, data: []const u8, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !Receipt {
         if (data.len > self.config.protocol.maximum_datagram_size) return error.DatagramTooLarge;
 
-        // Validate the whole datagram before changing state.
         try self.validateDatagram(data);
         var datagram = try frame.decodeDatagram(data);
         if (try self.beginDatagram(datagram.sequence)) |receipt| return receipt;
@@ -155,26 +155,36 @@ pub const Receiver = struct {
         }
     }
 
-    fn beginDatagram(self: *const Receiver, sequence: u32) !?Receipt {
+    fn beginDatagram(self: *Receiver, sequence: u32) !?Receipt {
+        self.stale = false;
         return switch (self.datagrams.inspect(sequence, self.config.protocol.maximum_acknowledged_datagrams)) {
             .accepted => null,
-            .duplicate, .stale => .{ .acknowledge = sequence },
-            .too_far_ahead, .ambiguous => error.DatagramWindowExceeded,
+            .too_far_ahead => if (uint24.distance(self.datagrams.expected, sequence) <= self.config.protocol.maximum_datagram_gap)
+                null
+            else
+                error.DatagramWindowExceeded,
+            .stale => {
+                self.stale = true;
+                return null;
+            },
+            .duplicate => .{ .acknowledge = sequence },
+            .ambiguous => error.DatagramWindowExceeded,
         };
     }
 
     fn commitDatagram(self: *Receiver, sequence: u32, receipt: Receipt) !Receipt {
         var committed = receipt;
+        committed.acknowledge = sequence;
+        if (self.stale) return committed;
+        self.datagrams.skipTo(sequence);
         switch (self.datagrams.add(sequence, self.config.protocol.maximum_acknowledged_datagrams)) {
-            .accepted => |gap| {
-                committed.acknowledge = sequence;
-                committed.missing = gap;
-            },
+            .accepted => |gap| committed.missing = gap,
             else => return error.InternalInvariant,
         }
         return committed;
     }
     fn processFrame(self: *Receiver, value: frame.Frame, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !usize {
+        if (self.stale and value.reliable_index == null) return 0;
         if (!try self.previewReliable(value.reliable_index)) return 0;
 
         var payload = value.payload;
@@ -224,6 +234,7 @@ pub const Receiver = struct {
     }
 
     fn deliverPayload(context: *anyopaque, payload: []const u8, deliver: DeliverFn) !void {
+        if (payload.len == 0) return;
         try deliver(context, .init(payload));
     }
     fn previewReliable(self: *const Receiver, reliable_index: ?u32) !bool {
@@ -787,4 +798,181 @@ fn checkSplitReceiveAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "split receive state survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSplitReceiveAllocationFailures, .{});
+}
+
+const TestCollector = struct {
+    values: [8][16]u8 = undefined,
+    lengths: [8]usize = @splat(0),
+    count: usize = 0,
+    fn deliver(raw: *anyopaque, payload: BorrowedPayload) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (payload.bytes.len == 0) return error.ApplicationFailure;
+        @memcpy(self.values[self.count][0..payload.bytes.len], payload.bytes);
+        self.lengths[self.count] = payload.bytes.len;
+        self.count += 1;
+    }
+    fn get(self: *const @This(), index: usize) []const u8 {
+        return self.values[index][0..self.lengths[index]];
+    }
+};
+
+fn testDatagram(sequence: u32, frames: []const frame.Frame, storage: []u8) ![]u8 {
+    var writer: @import("../protocol/cursor.zig").Writer = .{ .data = storage };
+    try writer.byte(0x84);
+    try writer.u24le(sequence);
+    for (frames) |value| {
+        if (value.payload.len != 0) {
+            try frame.encode(value, &writer);
+            continue;
+        }
+        const start = writer.offset;
+        var padded = value;
+        padded.payload = "x";
+        try frame.encode(padded, &writer);
+        writer.offset -= 1;
+        storage[start + 1] = 0;
+        storage[start + 2] = 0;
+    }
+    return writer.written();
+}
+
+test "split pressure leaves the datagram unacknowledged so the sender can retry" {
+    var config: Config = .{};
+    config.protocol.maximum_split_parts = 4;
+    config.session.maximum_concurrent_splits = 1;
+    var receiver = try Receiver.init(std.testing.allocator, config);
+    defer receiver.deinit();
+    var collector: TestCollector = .{};
+    var storage: [128]u8 = undefined;
+
+    const first = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .split = .{ .count = 2, .id = 1, .index = 0 }, .payload = "ab" }};
+    _ = try receiver.process(try testDatagram(0, &first, &storage), 0, &collector, TestCollector.deliver);
+    const second = [_]frame.Frame{
+        .{ .reliability = .reliable, .reliable_index = 1, .payload = "\xfeside" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 2, .order_index = 1, .order_channel = 0, .split = .{ .count = 2, .id = 2, .index = 0 }, .payload = "cd" },
+    };
+    var second_storage: [128]u8 = undefined;
+    const second_wire = try testDatagram(1, &second, &second_storage);
+    try std.testing.expectError(error.TooManyAssemblies, receiver.process(second_wire, 1, &collector, TestCollector.deliver));
+    try std.testing.expectEqual(@as(u32, 1), receiver.datagrams.expected);
+    try std.testing.expectEqual(@as(usize, 1), receiver.splits.count());
+
+    const finish = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 3, .order_index = 0, .order_channel = 0, .split = .{ .count = 2, .id = 1, .index = 1 }, .payload = "!" }};
+    _ = try receiver.process(try testDatagram(2, &finish, &storage), 2, &collector, TestCollector.deliver);
+    _ = try receiver.process(second_wire, 3, &collector, TestCollector.deliver);
+    const last = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 4, .order_index = 1, .order_channel = 0, .split = .{ .count = 2, .id = 2, .index = 1 }, .payload = "e" }};
+    _ = try receiver.process(try testDatagram(3, &last, &storage), 4, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(usize, 3), collector.count);
+    try std.testing.expectEqualStrings("\xfeside", collector.get(0));
+    try std.testing.expectEqualStrings("ab!", collector.get(1));
+    try std.testing.expectEqualStrings("cde", collector.get(2));
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.count());
+}
+
+test "zero-length frames consume ordering state without delivery" {
+    var receiver = try Receiver.init(std.testing.allocator, .{});
+    defer receiver.deinit();
+    var collector: TestCollector = .{};
+    var storage: [128]u8 = undefined;
+    const frames = [_]frame.Frame{
+        .{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 1, .order_channel = 0, .payload = "after" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .payload = "" },
+        .{ .reliability = .unreliable, .payload = "" },
+        .{ .reliability = .reliable, .reliable_index = 2, .split = .{ .count = 2, .id = 3, .index = 0 }, .payload = "" },
+        .{ .reliability = .reliable, .reliable_index = 3, .split = .{ .count = 2, .id = 3, .index = 1 }, .payload = "split" },
+    };
+    const receipt = try receiver.process(try testDatagram(0, &frames, &storage), 0, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(?u32, 0), receipt.acknowledge);
+    try std.testing.expectEqual(@as(usize, 2), collector.count);
+    try std.testing.expectEqualStrings("after", collector.get(0));
+    try std.testing.expectEqualStrings("split", collector.get(1));
+    try std.testing.expectEqual(@as(u32, 2), try receiver.ordered.expectedIndex(0));
+    try std.testing.expectEqual(@as(u32, 4), receiver.reliable.expected);
+}
+
+test "ordered and reliable indices cross the 24-bit wrap" {
+    var receiver = try Receiver.init(std.testing.allocator, .{});
+    defer receiver.deinit();
+    receiver.reliable = try receive_window.Window.init(receiver.reliable_storage, 0xfffffe);
+    receiver.ordered.channels[0].expected = 0xfffffe;
+    var collector: TestCollector = .{};
+    var storage: [128]u8 = undefined;
+    const frames = [_]frame.Frame{
+        .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .payload = "third" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 0xffffff, .order_index = 0xffffff, .order_channel = 0, .payload = "second" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 0xfffffe, .order_index = 0xfffffe, .order_channel = 0, .payload = "first" },
+    };
+    _ = try receiver.process(try testDatagram(0, &frames, &storage), 0, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(usize, 3), collector.count);
+    try std.testing.expectEqualStrings("first", collector.get(0));
+    try std.testing.expectEqualStrings("second", collector.get(1));
+    try std.testing.expectEqualStrings("third", collector.get(2));
+    try std.testing.expectEqual(@as(u32, 1), try receiver.ordered.expectedIndex(0));
+    try std.testing.expectEqual(@as(u32, 1), receiver.reliable.expected);
+    const replay = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = 0xffffff, .order_index = 0xffffff, .order_channel = 0, .payload = "second" }};
+    _ = try receiver.process(try testDatagram(1, &replay, &storage), 1, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(usize, 3), collector.count);
+}
+
+test "datagram jumps are bounded before delivery including wrap and repeated attacks" {
+    var config: Config = .{};
+    config.protocol.receive_window = 8;
+    config.protocol.maximum_datagram_gap = 32;
+    config.protocol.maximum_acknowledged_datagrams = 4;
+    for ([_]u32{ 0, 0xfffffc }) |initial| {
+        var receiver = try Receiver.init(std.testing.allocator, config);
+        defer receiver.deinit();
+        receiver.datagrams = try receive_window.Window.init(receiver.datagram_storage, initial);
+        var collector: TestCollector = .{};
+        var storage: [128]u8 = undefined;
+        const frames = [_]frame.Frame{.{ .reliability = .unreliable, .payload = "ok" }};
+        var scratch: [1]frame.Frame = undefined;
+        const first = try receiver.process(try testDatagram(initial, &frames, &storage), 0, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(?u32, initial), first.acknowledge);
+        const expected = receiver.datagrams.expected;
+        const next = receiver.datagrams.next;
+        for (0..32) |_| {
+            for ([_]u32{ 33, 0x7fffff }) |gap| {
+                const wire = try testDatagram(uint24.add(expected, gap), &frames, &storage);
+                try std.testing.expectError(error.DatagramWindowExceeded, receiver.process(wire, 1, &collector, TestCollector.deliver));
+                try std.testing.expectError(error.DatagramWindowExceeded, receiver.processWithScratch(wire, 1, &scratch, &collector, TestCollector.deliver));
+            }
+        }
+        try std.testing.expectEqual(expected, receiver.datagrams.expected);
+        try std.testing.expectEqual(next, receiver.datagrams.next);
+        try std.testing.expectEqual(@as(usize, 1), collector.count);
+        const ordinary = try receiver.process(try testDatagram(uint24.add(expected, 2), &frames, &storage), 2, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(usize, 2), ordinary.missing.?.count);
+        const jump = uint24.add(expected, 32);
+        const recovered = try receiver.processWithScratch(try testDatagram(jump, &frames, &storage), 3, &scratch, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(?u32, jump), recovered.acknowledge);
+        try std.testing.expectEqual(@as(usize, 4), recovered.missing.?.count);
+        const stale = try receiver.process(try testDatagram(initial, &frames, &storage), 4, &collector, TestCollector.deliver);
+        try std.testing.expectEqual(@as(?u32, initial), stale.acknowledge);
+        try std.testing.expectEqual(@as(usize, 3), collector.count);
+    }
+}
+
+test "a lost datagram does not block the datagram window" {
+    var config: Config = .{};
+    config.protocol.receive_window = 8;
+    var receiver = try Receiver.init(std.testing.allocator, config);
+    defer receiver.deinit();
+    var collector: TestCollector = .{};
+    var storage: [128]u8 = undefined;
+    const far = [_]frame.Frame{.{ .reliability = .reliable, .reliable_index = 1, .payload = "far" }};
+    const receipt = try receiver.process(try testDatagram(20, &far, &storage), 0, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(?u32, 20), receipt.acknowledge);
+    try std.testing.expectEqualStrings("far", collector.get(0));
+
+    const late = [_]frame.Frame{
+        .{ .reliability = .reliable, .reliable_index = 0, .payload = "late" },
+        .{ .reliability = .unreliable, .payload = "stale" },
+        .{ .reliability = .reliable, .reliable_index = 1, .payload = "far" },
+    };
+    const stale = try receiver.process(try testDatagram(0, &late, &storage), 1, &collector, TestCollector.deliver);
+    try std.testing.expectEqual(@as(?u32, 0), stale.acknowledge);
+    try std.testing.expectEqual(@as(?receive_window.Gap, null), stale.missing);
+    try std.testing.expectEqual(@as(usize, 2), collector.count);
+    try std.testing.expectEqualStrings("late", collector.get(1));
 }

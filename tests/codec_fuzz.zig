@@ -19,6 +19,9 @@ fn exercise(input: []u8) void {
     _ = raknet.advanced.protocol.offline.decodeOpenConnectionRequest1(input, 576, 1492) catch {};
     _ = raknet.advanced.protocol.offline.decodeOpenConnectionRequest2(input, false, 576, 1492) catch {};
     _ = raknet.advanced.protocol.offline.decodeOpenConnectionRequest2(input, true, 576, 1492) catch {};
+    _ = raknet.advanced.protocol.offline.decodeOpenConnectionReply1(input) catch {};
+    _ = raknet.advanced.protocol.offline.decodeOpenConnectionReply2(input, 0, 65535) catch {};
+    exerciseHandshakes(input);
     var batch_decoder = raknet.minecraft.batch.Decoder.init(std.heap.page_allocator, .{
         .maximum_compressed_bytes = 4096,
         .maximum_decompressed_bytes = 8192,
@@ -32,6 +35,31 @@ fn exercise(input: []u8) void {
         fn packet(_: *anyopaque, _: raknet.minecraft.batch.BorrowedPacket) !void {}
     };
     _ = batch_decoder.decodeBorrowed(input, .declared, 0, &unused, Discard.packet) catch {};
+}
+
+fn exerciseHandshakes(input: []const u8) void {
+    const rate = raknet.advanced.security.rate_limit;
+    var entries: [4]rate.Entry = undefined;
+    var limiter = rate.Limiter.init(&entries, .{ .tokens_per_second = 1000, .burst = 1000, .global_tokens_per_second = 1000, .global_burst = 1000 }, 0) catch return;
+    const jar: raknet.advanced.security.cookie.Jar = .{ .current_key = @splat(1), .previous_key = @splat(2) };
+    var handler = raknet.advanced.session.offline_handshake.Handler.init(7, 11, 576, 1492, "MCPE;fuzz", jar, &limiter) catch return;
+    var output: [1500]u8 = undefined;
+    _ = handler.handle(input, "127.0.0.1:19132", 1, 0, 0, &output);
+
+    const address: raknet.advanced.protocol.offline.Address = .{ .ipv4 = .{ .octets = .{ 127, 0, 0, 1 }, .port = 19132 } };
+    var negotiator: raknet.advanced.session.client_handshake.Negotiator = .init(.{
+        .protocol_version = 11,
+        .mtus = &.{ 1492, 1200, 576 },
+        .minimum_mtu = 576,
+        .retry_ms = 500,
+        .client_guid = 9,
+        .server_address = address,
+    });
+    var chunks = std.mem.window(u8, input, 64, 64);
+    while (chunks.next()) |chunk| {
+        _ = negotiator.receive(chunk) catch break;
+        while (negotiator.poll(0, &output) catch null) |_| {}
+    }
 }
 
 fn fuzzOne(_: void, smith: *std.testing.Smith) !void {

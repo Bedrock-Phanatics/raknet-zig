@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const backend = @import("../net/backend.zig");
-const session_core = @import("core.zig");
+const backend = @import("socket.zig");
+const session_core = @import("../session/core.zig");
 
 pub const Emitter = struct {
     socket: *backend.Socket,

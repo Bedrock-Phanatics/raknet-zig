@@ -5,6 +5,7 @@ const time = @import("../util/time.zig");
 
 const none = std.math.maxInt(u32);
 const class_sizes = [_]usize{ 64, 256, 576, 1200 };
+const retained_block_parts = 256;
 
 const Fragment = struct {
     data: ?[]u8 = null,
@@ -43,12 +44,13 @@ pub const Limits = struct {
     maximum_bytes: usize,
     maximum_concurrent: usize,
     maximum_total_bytes: usize,
+    maximum_total_parts: usize,
     timeout_ms: u32,
 
     pub fn validate(self: Limits) !void {
         if (self.maximum_parts < 2 or self.maximum_parts > std.math.maxInt(u32) or self.maximum_bytes == 0 or self.maximum_concurrent == 0 or
             self.maximum_concurrent > std.math.maxInt(u32) or self.maximum_total_bytes < self.maximum_bytes or self.timeout_ms == 0) return error.InvalidConfiguration;
-        if (self.maximum_parts > std.math.maxInt(usize) / self.maximum_concurrent) return error.InvalidConfiguration;
+        if (self.maximum_total_parts < self.maximum_parts) return error.InvalidConfiguration;
     }
 };
 
@@ -63,6 +65,7 @@ pub const Reassembler = struct {
     assembly_count: usize = 0,
     heap_len: usize = 0,
     total_bytes: usize = 0,
+    total_parts: usize = 0,
     retained_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Reassembler {
@@ -102,14 +105,12 @@ pub const Reassembler = struct {
         return self.retained_bytes;
     }
 
-    /// Returns one contiguous owned payload.
     pub fn push(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?OwnedPayload {
         const slot = try self.retain(id, count_value, index, payload, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return null;
         return try self.finish(slot.?);
     }
 
-    /// Borrows fragments and skips the final copy.
     pub fn pushScatter(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64, context: *anyopaque, consume: ScatterFn) !bool {
         const slot = try self.retain(id, count_value, index, payload, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return false;
@@ -121,27 +122,28 @@ pub const Reassembler = struct {
 
     fn retain(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?usize {
         if (count_value < 2 or count_value > self.limits.maximum_parts or index >= count_value) return error.InvalidSplit;
-        if (payload.len == 0 or payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
+        if (payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
 
         var slot = self.find(id);
+        // Delayed fragments can reuse an active split ID.
+        if (slot != null and self.assemblies[slot.?].count != count_value) return null;
         var created = false;
         if (slot == null) {
             if (self.assembly_count == self.assemblies.len) return error.TooManyAssemblies;
+            if (count_value > self.limits.maximum_total_parts - self.total_parts) return error.SplitBudgetExceeded;
+            if (payload.len > self.limits.maximum_total_bytes - self.total_bytes) return error.SplitBudgetExceeded;
             slot = self.freeSlot() orelse return error.InternalInvariant;
             try self.ensureFragmentBlock(slot.?, count_value);
             const deadline_ms = time.deadline(now_ms, self.limits.timeout_ms);
             self.assemblies[slot.?] = .{ .active = true, .id = id, .count = count_value, .deadline_ms = deadline_ms };
             self.assembly_count += 1;
+            self.total_parts += count_value;
             self.heapInsert(slot.?);
             created = true;
         }
         errdefer if (created) self.remove(slot.?);
 
         const assembly = &self.assemblies[slot.?];
-        if (assembly.count != count_value) {
-            self.remove(slot.?);
-            return error.SplitIdCollision;
-        }
         const fragment = &self.fragmentSlice(slot.?)[index];
         if (fragment.data) |existing| {
             if (!std.mem.eql(u8, existing, payload)) {
@@ -151,11 +153,12 @@ pub const Reassembler = struct {
             self.updateDeadline(slot.?, now_ms);
             return slot;
         }
-        if (payload.len > self.limits.maximum_bytes -| assembly.bytes or payload.len > self.limits.maximum_total_bytes -| self.total_bytes) {
+        if (payload.len > self.limits.maximum_bytes - assembly.bytes) {
             self.remove(slot.?);
             return error.ReassemblyLimitExceeded;
         }
-        try self.ensureFragmentStorage(fragment, payload.len);
+        if (payload.len > self.limits.maximum_total_bytes - self.total_bytes) return error.SplitBudgetExceeded;
+        if (payload.len != 0) try self.ensureFragmentStorage(fragment, payload.len);
         @memcpy(fragment.storage[0..payload.len], payload);
         fragment.data = fragment.storage[0..payload.len];
         assembly.received += 1;
@@ -249,8 +252,18 @@ pub const Reassembler = struct {
         if (!self.assemblies[slot].active) return;
         self.heapRemove(self.assemblies[slot].heap_index);
         self.freeFragments(slot);
+        self.total_parts -= self.assemblies[slot].count;
         self.assemblies[slot] = .{};
         self.assembly_count -= 1;
+        const block = self.fragment_blocks[slot];
+        if (block.len > retained_block_parts) {
+            for (block) |fragment| if (fragment.storage.len != 0) {
+                self.retained_bytes -= fragment.storage.len;
+                self.allocator.free(fragment.storage);
+            };
+            self.allocator.free(block);
+            self.fragment_blocks[slot] = &.{};
+        }
     }
 
     fn freeFragments(self: *Reassembler, slot: usize) void {
@@ -329,7 +342,7 @@ fn storageCapacity(len: usize) usize {
 }
 
 test "split assembly handles duplicates conflicts collisions and expiry" {
-    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 16, .maximum_concurrent = 2, .maximum_total_bytes = 24, .timeout_ms = 10 });
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 16, .maximum_concurrent = 2, .maximum_total_bytes = 24, .maximum_total_parts = 1 << 16, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expect((try value.push(1, 2, 1, "world", 0)) == null);
     try std.testing.expect((try value.push(1, 2, 1, "world", 1)) == null);
@@ -339,15 +352,107 @@ test "split assembly handles duplicates conflicts collisions and expiry" {
     defer complete.deinit();
     try std.testing.expectEqualStrings("hello world", complete.bytes);
     try std.testing.expect((try value.push(3, 2, 0, "x", 5)) == null);
-    try std.testing.expectError(error.SplitIdCollision, value.push(3, 3, 1, "y", 6));
+    try std.testing.expect((try value.push(3, 3, 1, "y", 6)) == null);
+    try std.testing.expectEqual(@as(usize, 1), value.count());
+    try std.testing.expectEqual(@as(usize, 1), value.total_bytes);
+    try std.testing.expectEqual(@as(usize, 2), value.total_parts);
     try std.testing.expect((try value.push(4, 2, 0, "z", 7)) == null);
-    try std.testing.expectEqual(@as(?u64, 17), value.nextDeadline());
-    try std.testing.expectEqual(@as(usize, 1), value.expire(100, 2).expired);
+    try std.testing.expectEqual(@as(?u64, 15), value.nextDeadline());
+    try std.testing.expectEqual(@as(usize, 2), value.expire(100, 2).expired);
     try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
+    try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+}
+
+test "conflicting split counts preserve progress deadlines and budgets across ID reuse" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .maximum_total_parts = 4, .timeout_ms = 10 });
+    defer value.deinit();
+    for ([_]u16{ 0xffff, 0, 0xffff }) |id| {
+        try std.testing.expect((try value.push(id, 2, 0, "a", 0)) == null);
+        const capacity = value.retainedCapacity();
+        for (1..10) |now| {
+            try std.testing.expect((try value.push(id, 3, 2, "old", now)) == null);
+            try std.testing.expectEqual(@as(usize, 1), value.count());
+            try std.testing.expectEqual(@as(usize, 1), value.total_bytes);
+            try std.testing.expectEqual(@as(usize, 2), value.total_parts);
+            try std.testing.expectEqual(capacity, value.retainedCapacity());
+            try std.testing.expectEqual(@as(?u64, 10), value.nextDeadline());
+        }
+        const complete = (try value.push(id, 2, 1, "b", 9)).?;
+        defer complete.deinit();
+        try std.testing.expectEqualStrings("ab", complete.bytes);
+        try std.testing.expectEqual(@as(usize, 0), value.count());
+        try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
+        try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+        try std.testing.expect((try value.push(id, 3, 0, "new", 10)) == null);
+        try std.testing.expect((try value.push(id, 2, 1, "delayed", 19)) == null);
+        try std.testing.expectEqual(@as(usize, 1), value.expire(20, 1).expired);
+        try std.testing.expectEqual(@as(usize, 0), value.total_bytes);
+        try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+    }
+}
+
+test "split pressure rejects new work without disturbing existing assemblies" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 8, .maximum_bytes = 8, .maximum_concurrent = 4, .maximum_total_bytes = 10, .maximum_total_parts = 10, .timeout_ms = 10 });
+    defer value.deinit();
+    try std.testing.expect((try value.push(1, 8, 0, "aaaa", 0)) == null);
+    try std.testing.expectError(error.SplitBudgetExceeded, value.push(2, 3, 0, "b", 0));
+    try std.testing.expect((try value.push(2, 2, 0, "bbbb", 0)) == null);
+    try std.testing.expectError(error.SplitBudgetExceeded, value.push(1, 8, 1, "aaa", 0));
+    try std.testing.expectEqual(@as(usize, 2), value.count());
+    try std.testing.expectEqual(@as(usize, 8), value.total_bytes);
+    try std.testing.expectEqual(@as(usize, 10), value.total_parts);
+    const complete = (try value.push(2, 2, 1, "bb", 1)).?;
+    complete.deinit();
+    try std.testing.expect((try value.push(1, 8, 1, "aaa", 2)) == null);
+    try std.testing.expectEqual(@as(usize, 7), value.total_bytes);
+}
+
+test "zero-length fragments are accepted without storage" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 8, .maximum_concurrent = 1, .maximum_total_bytes = 8, .maximum_total_parts = 4, .timeout_ms = 10 });
+    defer value.deinit();
+    try std.testing.expect((try value.push(1, 3, 1, "", 0)) == null);
+    try std.testing.expect((try value.push(1, 3, 1, "", 0)) == null);
+    try std.testing.expectError(error.ConflictingFragment, value.push(1, 3, 1, "x", 0));
+    try std.testing.expect((try value.push(2, 2, 0, "ab", 0)) == null);
+    const complete = (try value.push(2, 2, 1, "", 0)).?;
+    defer complete.deinit();
+    try std.testing.expectEqualStrings("ab", complete.bytes);
+}
+
+test "large split counts are bounded and their metadata is released" {
+    var value = try Reassembler.init(std.testing.allocator, .{
+        .maximum_parts = 8192,
+        .maximum_bytes = 4 * 1024 * 1024,
+        .maximum_concurrent = 4,
+        .maximum_total_bytes = 4 * 1024 * 1024,
+        .maximum_total_parts = 12_000,
+        .timeout_ms = 10,
+    });
+    defer value.deinit();
+    for (0..8191) |index| try std.testing.expect((try value.push(1, 8192, @intCast(index), "x", 0)) == null);
+    try std.testing.expectError(error.SplitBudgetExceeded, value.push(2, 8192, 0, "y", 0));
+    const complete = (try value.push(1, 8192, 8191, "x", 0)).?;
+    defer complete.deinit();
+    try std.testing.expectEqual(@as(usize, 8192), complete.bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+    for (value.fragment_blocks) |block| try std.testing.expect(block.len <= retained_block_parts);
+    try std.testing.expectEqual(@as(usize, 0), value.retainedCapacity());
+}
+
+test "split IDs wrap and are reused after completion" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 8, .maximum_concurrent = 2, .maximum_total_bytes = 8, .maximum_total_parts = 4, .timeout_ms = 10 });
+    defer value.deinit();
+    for ([_]u16{ 65534, 65535, 0, 1, 65535 }) |id| {
+        try std.testing.expect((try value.push(id, 2, 1, "b", 0)) == null);
+        const complete = (try value.push(id, 2, 0, "a", 0)).?;
+        defer complete.deinit();
+        try std.testing.expectEqualStrings("ab", complete.bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), value.count());
 }
 
 test "scatter completion avoids a final allocation" {
-    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .timeout_ms = 10 });
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .maximum_total_parts = 1 << 16, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expect((try value.push(7, 2, 0, "tiny", 0)) == null);
     const Consumer = struct {
@@ -369,7 +474,7 @@ test "scatter completion avoids a final allocation" {
 }
 
 test "small fragments detach from large receive buffers" {
-    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .timeout_ms = 10 });
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .maximum_total_parts = 1 << 16, .timeout_ms = 10 });
     defer value.deinit();
     var source: [4096]u8 = @splat(0);
     @memcpy(source[100..104], "tiny");
@@ -386,7 +491,7 @@ test "fragment classes are reused and oversized storage is evicted" {
         fn consume(_: *anyopaque, _: ScatterPayload) error{ApplicationFailure}!void {}
     };
     var quota = QuotaAllocator.init(std.testing.allocator, std.math.maxInt(usize));
-    var value = try Reassembler.init(quota.allocator(), .{ .maximum_parts = 2, .maximum_bytes = 4096, .maximum_concurrent = 1, .maximum_total_bytes = 4096, .timeout_ms = 10 });
+    var value = try Reassembler.init(quota.allocator(), .{ .maximum_parts = 2, .maximum_bytes = 4096, .maximum_concurrent = 1, .maximum_total_bytes = 4096, .maximum_total_parts = 1 << 16, .timeout_ms = 10 });
     defer value.deinit();
     var unused: u8 = 0;
     try std.testing.expect((try value.push(1, 2, 0, "a", 0)) == null);
@@ -405,7 +510,7 @@ test "fragment classes are reused and oversized storage is evicted" {
 }
 
 test "split limits reject before payload allocation" {
-    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 8, .maximum_concurrent = 1, .maximum_total_bytes = 8, .timeout_ms = 10 });
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 8, .maximum_concurrent = 1, .maximum_total_bytes = 8, .maximum_total_parts = 1 << 16, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expectError(error.InvalidSplit, value.push(1, 1, 0, "x", 0));
     try std.testing.expectError(error.InvalidSplit, value.push(1, 5, 0, "x", 0));
@@ -420,6 +525,7 @@ test "advertised split size does not reserve final payload" {
         .maximum_bytes = 4 * 1024 * 1024,
         .maximum_concurrent = 1,
         .maximum_total_bytes = 4 * 1024 * 1024,
+        .maximum_total_parts = 1 << 16,
         .timeout_ms = 10,
     });
     defer value.deinit();
@@ -429,7 +535,7 @@ test "advertised split size does not reserve final payload" {
 }
 
 fn checkReassemblyAllocationFailures(allocator: std.mem.Allocator) !void {
-    var value = try Reassembler.init(allocator, .{ .maximum_parts = 4, .maximum_bytes = 32, .maximum_concurrent = 2, .maximum_total_bytes = 64, .timeout_ms = 10 });
+    var value = try Reassembler.init(allocator, .{ .maximum_parts = 4, .maximum_bytes = 32, .maximum_concurrent = 2, .maximum_total_bytes = 64, .maximum_total_parts = 1 << 16, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expect((try value.push(1, 2, 0, "hello ", 0)) == null);
     const complete = (try value.push(1, 2, 1, "world", 1)).?;
@@ -449,6 +555,7 @@ test "expiry inspects only due assemblies" {
         .maximum_bytes = count,
         .maximum_concurrent = count,
         .maximum_total_bytes = count,
+        .maximum_total_parts = 1 << 16,
         .timeout_ms = 10,
     });
     defer value.deinit();
@@ -462,7 +569,7 @@ test "expiry inspects only due assemblies" {
 }
 
 test "split expiry honors a saturated deadline" {
-    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 1, .maximum_concurrent = 1, .maximum_total_bytes = 1, .timeout_ms = 10 });
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 1, .maximum_concurrent = 1, .maximum_total_bytes = 1, .maximum_total_parts = 1 << 16, .timeout_ms = 10 });
     defer value.deinit();
     try std.testing.expect((try value.push(1, 2, 0, "x", std.math.maxInt(u64) - 5)) == null);
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), value.nextDeadline());
@@ -476,6 +583,7 @@ test "split boundaries and abandoned IDs can be reused" {
         .maximum_bytes = 16,
         .maximum_concurrent = 2,
         .maximum_total_bytes = 16,
+        .maximum_total_parts = 1 << 16,
         .timeout_ms = 10,
     });
     defer value.deinit();

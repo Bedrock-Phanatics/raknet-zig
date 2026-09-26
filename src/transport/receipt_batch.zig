@@ -1,9 +1,9 @@
 const std = @import("std");
 
-const backend = @import("../net/backend.zig");
+const backend = @import("socket.zig");
 const ack = @import("../protocol/ack.zig");
 const datagram = @import("../protocol/datagram.zig");
-const receiver = @import("receiver.zig");
+const receiver = @import("../session/receiver.zig");
 
 pub const Batch = struct {
     allocator: std.mem.Allocator,
@@ -17,6 +17,8 @@ pub const Batch = struct {
     ack_count: usize = 0,
     nack_count: usize = 0,
     nack_sequences: usize = 0,
+    ack_records_sent: u64 = 0,
+    nack_records_sent: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize, mtu: usize, maximum_sequences: usize) !Batch {
         if (capacity == 0 or capacity > 65_535 or mtu < 8 or maximum_sequences == 0 or maximum_sequences > 0x800000) return error.InvalidConfiguration;
@@ -87,27 +89,33 @@ pub const Batch = struct {
         }
     }
 
-    pub fn flush(self: *Batch, socket: *const backend.Socket, destination: *const std.Io.net.IpAddress, maximum_work: usize) !usize {
+    pub fn flush(self: *Batch, socket: *backend.Socket, destination: *const std.Io.net.IpAddress, maximum_work: usize) !usize {
         if (maximum_work == 0 or self.isEmpty()) return 0;
         const nack_take = @min(self.nack_count, maximum_work);
         const ack_take = @min(self.ack_count, maximum_work - nack_take);
         var nack_sequences_sent: usize = 0;
         for (self.nack_values[0..nack_take]) |record| nack_sequences_sent += record.count();
         var message_count: usize = 0;
+        var ack_records: usize = 0;
+        var nack_records: usize = 0;
 
         if (ack_take != 0) {
             const canonical = canonicalizeValues(self.ack_values[0..ack_take], self.records);
+            ack_records = canonical.len;
             const wire = datagram.encodeControl(.ack, canonical, self.wire_storage[0..self.mtu]) catch return error.InternalFailure;
             self.messages[message_count] = .{ .address = destination, .data_ptr = wire.ptr, .data_len = wire.len };
             message_count += 1;
         }
         if (nack_take != 0) {
             const canonical = canonicalizeRanges(self.nack_values[0..nack_take], self.records);
+            nack_records = canonical.len;
             const wire = datagram.encodeControl(.nack, canonical, self.wire_storage[self.mtu .. self.mtu * 2]) catch return error.InternalFailure;
             self.messages[message_count] = .{ .address = destination, .data_ptr = wire.ptr, .data_len = wire.len };
             message_count += 1;
         }
         socket.sendMany(self.messages[0..message_count]) catch return error.TransportFailure;
+        self.ack_records_sent += ack_records;
+        self.nack_records_sent += nack_records;
         removePrefix(u32, self.ack_values, &self.ack_count, ack_take);
         removePrefix(ack.Record, self.nack_values, &self.nack_count, nack_take);
         self.nack_sequences -= nack_sequences_sent;

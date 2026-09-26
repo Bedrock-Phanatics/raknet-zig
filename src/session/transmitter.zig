@@ -44,7 +44,6 @@ pub const Packetization = struct {
     }
 };
 
-/// Emitted bytes borrow caller scratch.
 pub const Transmitter = struct {
     config: Config,
     mtu: u16,
@@ -60,7 +59,6 @@ pub const Transmitter = struct {
         return .{ .config = config, .mtu = mtu };
     }
 
-    /// Close the connection if emission fails after the first fragment.
     pub fn send(self: *Transmitter, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, context: *anyopaque, emit: EmitFn) !Sent {
         var packetization = try self.beginPacketization(payload.len, reliability, channel);
         return self.sendAvailable(&packetization, payload, scratch, std.math.maxInt(usize), std.math.maxInt(usize), context, emit);
@@ -215,6 +213,10 @@ pub const Transmitter = struct {
         const packet_layout = try self.layout(payload_len, reliability, channel);
         const overhead = @as(usize, self.mtu) - packet_layout.capacity;
         return try std.math.add(usize, payload_len, try std.math.mul(usize, packet_layout.fragment_count, overhead));
+    }
+
+    pub fn fragmentCount(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !usize {
+        return (try self.layout(payload_len, reliability, channel)).fragment_count;
     }
 
     fn layout(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !Layout {

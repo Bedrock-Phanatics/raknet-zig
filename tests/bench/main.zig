@@ -301,6 +301,7 @@ pub fn main(init: std.process.Init) !void {
     );
     try batch_bench.run(io);
     try workload_bench.run(io);
+    try @import("link.zig").run(io);
     const send_single_ns = try benchmarkSend(io, false);
     const send_many_ns = try benchmarkSend(io, true);
     std.debug.print("send_single_2: {d:.2} ns/message\nsend_many_2: {d:.2} ns/message\n", .{

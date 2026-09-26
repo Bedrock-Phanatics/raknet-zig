@@ -40,6 +40,7 @@ pub const Queue = struct {
     reserved_control_messages: usize,
     reserved_control_bytes: usize,
     total_bytes: usize = 0,
+    high_water: usize = 0,
     bytes: [2]usize = @splat(0),
     free_head: u32,
     heads: [2]u32 = @splat(none),
@@ -112,10 +113,10 @@ pub const Queue = struct {
         self.bytes[lane_index] += payload.len;
         self.total_bytes += payload.len;
         self.next_id += 1;
+        self.high_water = @max(self.high_water, self.countAll());
         return id;
     }
 
-    /// Transfers payload ownership to the caller.
     pub fn pop(self: *Queue, lane: Lane) ?Message {
         const lane_index = @intFromEnum(lane);
         const index = self.heads[lane_index];

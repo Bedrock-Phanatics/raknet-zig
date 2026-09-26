@@ -7,28 +7,56 @@ pub const ProtocolLimits = struct {
     maximum_frame_payload: usize = 8192,
     maximum_acknowledged_datagrams: usize = 4096,
     receive_window: usize = 4096,
+    maximum_datagram_gap: u32 = 65_536,
     reliable_window: usize = 4096,
     maximum_order_channels: usize = 32,
-    maximum_split_parts: usize = 2048,
+    maximum_split_parts: usize = 8192,
     maximum_split_bytes: usize = 4 * 1024 * 1024,
+
+    fn validate(self: ProtocolLimits) !void {
+        if (self.minimum_mtu < 400 or self.minimum_mtu > self.maximum_mtu) return error.InvalidConfiguration;
+        if (self.maximum_datagram_size < self.maximum_mtu or self.maximum_datagram_size > 65_507) return error.InvalidConfiguration;
+        if (self.maximum_frame_payload == 0 or self.maximum_frame_payload > self.maximum_split_bytes) return error.InvalidConfiguration;
+        if (self.maximum_acknowledged_datagrams == 0 or self.maximum_acknowledged_datagrams > 0x800000) return error.InvalidConfiguration;
+        if (self.receive_window == 0 or self.receive_window > 0x7fffff) return error.InvalidConfiguration;
+        if (self.maximum_datagram_gap < self.receive_window or self.maximum_datagram_gap >= 0x800000) return error.InvalidConfiguration;
+        if (self.reliable_window == 0 or self.reliable_window > 0x7fffff) return error.InvalidConfiguration;
+        if (self.maximum_order_channels == 0 or self.maximum_order_channels > 256) return error.InvalidConfiguration;
+        if (self.maximum_split_parts < 2 or self.maximum_split_bytes == 0) return error.InvalidConfiguration;
+    }
 };
 
 pub const SessionLimits = struct {
-    maximum_retransmissions: usize = 4096,
+    maximum_retransmissions: usize = 1024,
     maximum_recovery_bytes: usize = 16 * 1024 * 1024,
     maximum_ordered_packets: usize = 4096,
     maximum_ordered_bytes: usize = 16 * 1024 * 1024,
-    maximum_concurrent_splits: usize = 16,
+    maximum_concurrent_splits: usize = 64,
     maximum_split_bytes_per_connection: usize = 16 * 1024 * 1024,
+    maximum_split_parts_per_connection: usize = 16384,
     maximum_queued_outbound_packets: usize = 256,
     maximum_queued_outbound_bytes: usize = 16 * 1024 * 1024,
     reserved_control_queue_packets: usize = 16,
     reserved_control_queue_bytes: usize = 64 * 1024,
+
+    fn validate(self: SessionLimits) !void {
+        if (self.maximum_retransmissions == 0 or self.maximum_recovery_bytes == 0) return error.InvalidConfiguration;
+        if (self.maximum_ordered_packets == 0 or self.maximum_ordered_bytes == 0 or self.maximum_concurrent_splits == 0) return error.InvalidConfiguration;
+        if (self.maximum_queued_outbound_packets == 0 or
+            self.maximum_queued_outbound_packets >= std.math.maxInt(u32) or
+            self.maximum_queued_outbound_bytes == 0) return error.InvalidConfiguration;
+        if (self.reserved_control_queue_packets == 0 or self.reserved_control_queue_packets >= self.maximum_queued_outbound_packets) return error.InvalidConfiguration;
+        if (self.reserved_control_queue_bytes == 0 or self.reserved_control_queue_bytes >= self.maximum_queued_outbound_bytes) return error.InvalidConfiguration;
+    }
 };
 
 pub const ListenerLimits = struct {
     maximum_pending_handshakes: usize = 4096,
     maximum_connections: usize = 4096,
+
+    fn validate(self: ListenerLimits) !void {
+        if (self.maximum_pending_handshakes == 0 or self.maximum_connections == 0 or self.maximum_connections > 65_536) return error.InvalidConfiguration;
+    }
 };
 
 pub const TimingOptions = struct {
@@ -37,11 +65,22 @@ pub const TimingOptions = struct {
     idle_timeout_ms: u32 = 10_000,
     minimum_rto_ms: u32 = 50,
     maximum_rto_ms: u32 = 5_000,
+    shutdown_timeout_ms: u32 = 5_000,
+
+    fn validate(self: TimingOptions) !void {
+        if (self.maximum_ack_delay_ms > 10 or self.split_timeout_ms == 0 or self.shutdown_timeout_ms == 0) return error.InvalidConfiguration;
+        if (self.idle_timeout_ms == 0 or self.minimum_rto_ms == 0 or self.minimum_rto_ms > self.maximum_rto_ms) return error.InvalidConfiguration;
+    }
 };
 
 pub const BatchingOptions = struct {
     maximum_ack_records: usize = 256,
     maximum_packets_per_iteration: usize = 256,
+
+    fn validate(self: BatchingOptions) !void {
+        if (self.maximum_ack_records < 2 or self.maximum_ack_records > 65_535) return error.InvalidConfiguration;
+        if (self.maximum_packets_per_iteration == 0 or self.maximum_packets_per_iteration > 4096) return error.InvalidConfiguration;
+    }
 };
 
 pub const Config = struct {
@@ -58,35 +97,13 @@ pub const Config = struct {
     batching: BatchingOptions = .{},
 
     pub fn validate(self: Config) !void {
-        const protocol = self.protocol;
-        const session = self.session;
-        const listener = self.listener;
-        const timing = self.timing;
-        const batching = self.batching;
-
-        if (protocol.minimum_mtu < 400 or protocol.minimum_mtu > protocol.maximum_mtu) return error.InvalidConfiguration;
-        if (protocol.maximum_datagram_size < protocol.maximum_mtu or protocol.maximum_datagram_size > 65_507) return error.InvalidConfiguration;
-        if (protocol.maximum_frame_payload == 0 or protocol.maximum_frame_payload > protocol.maximum_split_bytes) return error.InvalidConfiguration;
-        if (batching.maximum_ack_records < 2 or batching.maximum_ack_records > 65_535) return error.InvalidConfiguration;
-        if (protocol.maximum_acknowledged_datagrams == 0 or protocol.maximum_acknowledged_datagrams > 0x800000) return error.InvalidConfiguration;
-        if (timing.maximum_ack_delay_ms > 10) return error.InvalidConfiguration;
-        if (protocol.receive_window == 0 or protocol.receive_window > 0x7fffff) return error.InvalidConfiguration;
-        if (protocol.reliable_window == 0 or protocol.reliable_window > 0x7fffff) return error.InvalidConfiguration;
-        if (session.maximum_retransmissions == 0 or
-            session.maximum_recovery_bytes == 0 or
-            protocol.maximum_order_channels == 0 or
-            protocol.maximum_order_channels > 256) return error.InvalidConfiguration;
-        if (session.maximum_ordered_packets == 0 or session.maximum_ordered_bytes == 0 or protocol.maximum_split_parts < 2) return error.InvalidConfiguration;
-        if (protocol.maximum_split_bytes == 0 or session.maximum_split_bytes_per_connection < protocol.maximum_split_bytes) return error.InvalidConfiguration;
-        if (session.maximum_concurrent_splits == 0 or timing.split_timeout_ms == 0) return error.InvalidConfiguration;
-        if (listener.maximum_pending_handshakes == 0 or listener.maximum_connections == 0 or listener.maximum_connections > 65_536) return error.InvalidConfiguration;
-        if (session.maximum_queued_outbound_packets == 0 or
-            session.maximum_queued_outbound_packets >= std.math.maxInt(u32) or
-            session.maximum_queued_outbound_bytes == 0) return error.InvalidConfiguration;
-        if (session.reserved_control_queue_packets == 0 or session.reserved_control_queue_packets >= session.maximum_queued_outbound_packets) return error.InvalidConfiguration;
-        if (session.reserved_control_queue_bytes == 0 or session.reserved_control_queue_bytes >= session.maximum_queued_outbound_bytes) return error.InvalidConfiguration;
-        if (batching.maximum_packets_per_iteration == 0 or batching.maximum_packets_per_iteration > 4096) return error.InvalidConfiguration;
-        if (timing.idle_timeout_ms == 0 or timing.minimum_rto_ms == 0 or timing.minimum_rto_ms > timing.maximum_rto_ms) return error.InvalidConfiguration;
+        try self.protocol.validate();
+        try self.session.validate();
+        try self.listener.validate();
+        try self.timing.validate();
+        try self.batching.validate();
+        if (self.session.maximum_split_bytes_per_connection < self.protocol.maximum_split_bytes) return error.InvalidConfiguration;
+        if (self.session.maximum_split_parts_per_connection < self.protocol.maximum_split_parts) return error.InvalidConfiguration;
     }
 };
 
@@ -103,6 +120,9 @@ test "default configuration is internally consistent" {
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
     bad = .{};
     bad.session.maximum_recovery_bytes = 0;
+    try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+    bad = .{};
+    bad.session.maximum_split_bytes_per_connection = bad.protocol.maximum_split_bytes - 1;
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
     bad = .{};
     bad.session.maximum_queued_outbound_packets = 0;
@@ -122,4 +142,14 @@ test "default configuration is internally consistent" {
     bad = .{};
     bad.session.reserved_control_queue_bytes = 0;
     try std.testing.expectError(error.InvalidConfiguration, bad.validate());
+}
+
+test "datagram gap policy stays within modular sequence bounds" {
+    var config: Config = .{};
+    config.protocol.maximum_datagram_gap = @intCast(config.protocol.receive_window);
+    try config.validate();
+    config.protocol.maximum_datagram_gap -= 1;
+    try std.testing.expectError(error.InvalidConfiguration, config.validate());
+    config.protocol.maximum_datagram_gap = 0x800000;
+    try std.testing.expectError(error.InvalidConfiguration, config.validate());
 }

@@ -18,6 +18,10 @@ const Slot = struct {
     deadline_ms: u64 = 0,
     in_flight_bytes: u16 = 0,
     transmissions: u8 = 1,
+    timeouts: u8 = 0,
+    nacked: bool = false,
+    previous: u32 = none,
+    forward: u32 = none,
     heap_index: u32 = none,
     active_previous: u32 = none,
     active_next: u32 = none,
@@ -42,6 +46,8 @@ pub const Recovery = struct {
     count_value: usize = 0,
     maximum_bytes: usize,
     maximum_transmissions: u8,
+    maximum_delay_ms: u32 = 5_000,
+    minimum_abandon_ms: u32 = 0,
     mtu: u16,
     storage_policy: StoragePolicy,
     total_bytes: usize = 0,
@@ -135,14 +141,14 @@ pub const Recovery = struct {
         if (range_count <= self.count_value) {
             var iterator = ack.SequenceIterator.init(ranges, maximum_work);
             while (try iterator.next()) |sequence| {
-                if (self.find(sequence)) |slot| self.ackSlot(@intCast(slot.sequence % self.slots.len), now_ms, &result);
+                if (self.findAcknowledged(sequence)) |index| self.ackSlot(index, now_ms, &result);
             }
         } else {
             var current = self.active_head;
             while (current != none) {
                 const slot = &self.slots[current];
                 const next = slot.active_next;
-                if (contains(ranges, slot.sequence)) self.ackSlot(current, now_ms, &result);
+                if (contains(ranges, slot.sequence) or (slot.previous != none and contains(ranges, slot.previous))) self.ackSlot(current, now_ms, &result);
                 current = next;
             }
         }
@@ -167,8 +173,15 @@ pub const Recovery = struct {
         return marked;
     }
 
-    /// Borrows due payloads until the next recovery mutation.
     pub fn collectDue(self: *Recovery, now_ms: u64, rto_ms: u32, output: []Due, maximum_work: usize) DueBatch {
+        return self.collectDueInto(now_ms, rto_ms, output, maximum_work, null);
+    }
+
+    pub fn collectDueResequenced(self: *Recovery, now_ms: u64, rto_ms: u32, output: []Due, maximum_work: usize, next_sequence: *u32) DueBatch {
+        return self.collectDueInto(now_ms, rto_ms, output, maximum_work, next_sequence);
+    }
+
+    fn collectDueInto(self: *Recovery, now_ms: u64, rto_ms: u32, output: []Due, maximum_work: usize, next_sequence: ?*u32) DueBatch {
         var due_count: usize = 0;
         var inspected: usize = 0;
         var exhausted: usize = 0;
@@ -176,23 +189,62 @@ pub const Recovery = struct {
             const slot = &self.slots[self.heap[0]];
             if (slot.deadline_ms > now_ms) break;
             inspected += 1;
-            if (slot.transmissions >= self.maximum_transmissions) {
+            if (slot.transmissions >= self.maximum_transmissions and time.elapsed(now_ms, slot.sent_ms) >= self.minimum_abandon_ms) {
                 exhausted = 1;
                 break;
             }
-            const block = &self.blocks[slot.block_index];
+            const timed_out = !slot.nacked;
+            slot.transmissions +|= 1;
+            slot.nacked = false;
+            if (timed_out) slot.timeouts +|= 1;
+            const backoff = @as(u64, rto_ms) << @intCast(@min(slot.timeouts, 6));
+            slot.deadline_ms = time.deadline(now_ms, @max(rto_ms, @min(backoff, self.maximum_delay_ms)));
+            const moved = if (next_sequence) |next| self.resequence(self.heap[0], next) else slot;
+            const block = &self.blocks[moved.block_index];
             output[due_count] = .{
-                .sequence = slot.sequence,
-                .data = block.data[0..slot.data_len],
-                .in_flight_bytes = slot.in_flight_bytes,
-                .timed_out = slot.deadline_ms < now_ms,
+                .sequence = moved.sequence,
+                .data = block.data[0..moved.data_len],
+                .in_flight_bytes = moved.in_flight_bytes,
+                .timed_out = timed_out,
             };
             due_count += 1;
-            slot.transmissions += 1;
-            slot.deadline_ms = time.deadline(now_ms, rto_ms);
             self.siftDown(0);
         }
         return .{ .items = output[0..due_count], .exhausted = exhausted, .inspected = inspected };
+    }
+
+    fn resequence(self: *Recovery, from: u32, next: *u32) *Slot {
+        const sequence = uint24.normalize(next.*);
+        const to: u32 = @intCast(sequence % self.slots.len);
+        if (self.slots[to].occupied) return &self.slots[from];
+        const previous = self.slots[from].sequence;
+        self.slots[to] = self.slots[from];
+        self.slots[from] = .{ .sequence = previous, .forward = to };
+        const slot = &self.slots[to];
+        slot.sequence = sequence;
+        slot.previous = previous;
+        slot.forward = none;
+        self.heap[slot.heap_index] = to;
+        if (slot.active_previous == none) self.active_head = to else self.slots[slot.active_previous].active_next = to;
+        if (slot.active_next != none) self.slots[slot.active_next].active_previous = to;
+        const data = self.blocks[slot.block_index].data;
+        data[1] = @truncate(sequence);
+        data[2] = @truncate(sequence >> 8);
+        data[3] = @truncate(sequence >> 16);
+        next.* = uint24.add(sequence, 1);
+        return slot;
+    }
+
+    pub fn freeSlots(self: *const Recovery, raw_first: u32, limit: usize) usize {
+        const bound = @min(limit, self.slots.len - self.count_value);
+        var run: usize = 0;
+        while (run < bound and !self.slots[uint24.add(raw_first, @intCast(run)) % self.slots.len].occupied) run += 1;
+        return run;
+    }
+
+    pub fn expedite(self: *Recovery, raw_first: u32, free: usize, now_ms: u64) bool {
+        const slot = &self.slots[uint24.add(raw_first, @intCast(free)) % self.slots.len];
+        return slot.occupied and slot.transmissions == 1 and self.nackSlot(slot, now_ms);
     }
 
     pub fn nextDeadline(self: Recovery) ?u64 {
@@ -217,6 +269,16 @@ pub const Recovery = struct {
         return if (slot.occupied and slot.sequence == sequence) slot else null;
     }
 
+    fn findAcknowledged(self: *Recovery, raw_sequence: u32) ?u32 {
+        const sequence = uint24.normalize(raw_sequence);
+        const index: u32 = @intCast(sequence % self.slots.len);
+        const slot = self.slots[index];
+        if (slot.occupied) return if (slot.sequence == sequence) index else null;
+        if (slot.forward == none or slot.sequence != sequence) return null;
+        const target = self.slots[slot.forward];
+        return if (target.occupied and target.previous == sequence) slot.forward else null;
+    }
+
     fn removeSlot(self: *Recovery, slot_index: u32) void {
         const slot = &self.slots[slot_index];
         if (slot.active_previous == none) self.active_head = slot.active_next else self.slots[slot.active_previous].active_next = slot.active_next;
@@ -239,6 +301,7 @@ pub const Recovery = struct {
     fn nackSlot(self: *Recovery, slot: *Slot, now_ms: u64) bool {
         if (slot.deadline_ms <= now_ms) return false;
         slot.deadline_ms = now_ms;
+        slot.nacked = true;
         self.siftUp(slot.heap_index);
         return true;
     }
@@ -409,7 +472,122 @@ test "recovery ring, duplicate ACKs, and deadlines" {
     var due: [2]Due = undefined;
     try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(61, 50, &due, 2).items.len);
     try std.testing.expectEqualStrings("two", due[0].data);
-    try std.testing.expectEqual(@as(?u64, 111), recovery.nextDeadline());
+    try std.testing.expectEqual(@as(?u64, 161), recovery.nextDeadline());
+}
+
+test "timeouts back off while NACK retransmits do not" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
+    defer recovery.deinit();
+    recovery.maximum_delay_ms = 300;
+    try recovery.track(0, "data", 4, 0, 50);
+    var due: [1]Due = undefined;
+    for ([_]u64{ 50, 150, 350, 650, 950 }) |deadline| {
+        try std.testing.expectEqual(deadline, recovery.nextDeadline().?);
+        try std.testing.expect(recovery.collectDue(deadline, 50, &due, 1).items[0].timed_out);
+    }
+    const now = recovery.nextDeadline().? - 1;
+    try std.testing.expectEqual(@as(usize, 1), try recovery.markNack(&.{.{ .first = 0, .last = 0 }}, now, 1));
+    try std.testing.expectEqual(@as(usize, 0), try recovery.markNack(&.{.{ .first = 0, .last = 0 }}, now, 1));
+    const nacked = recovery.collectDue(now, 50, &due, 1);
+    try std.testing.expect(!nacked.items[0].timed_out);
+    try std.testing.expectEqual(now + 300, recovery.nextDeadline().?);
+}
+
+test "free slots stop at a pinned wrap alias" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 3, 576);
+    defer recovery.deinit();
+    try std.testing.expectEqual(@as(usize, 4), recovery.freeSlots(0, 8));
+    try recovery.track(2, "pinned", 6, 0, 10);
+    try std.testing.expectEqual(@as(usize, 2), recovery.freeSlots(0, 8));
+    try std.testing.expectEqual(@as(usize, 0), recovery.freeSlots(6, 8));
+    try std.testing.expectEqual(@as(usize, 1), recovery.freeSlots(3, 1));
+    try std.testing.expectEqual(@as(usize, 3), recovery.freeSlots(0xffffff, 8));
+}
+
+test "resends move to a fresh sequence and keep their state" {
+    var recovery = try Recovery.init(std.testing.allocator, 8, 4608, 8, 576);
+    defer recovery.deinit();
+    try recovery.track(3, "\x84\x03\x00\x00a", 5, 0, 50);
+    try recovery.track(4, "\x84\x04\x00\x00b", 5, 0, 60);
+    var next: u32 = 5;
+    var due: [1]Due = undefined;
+    const batch = recovery.collectDueResequenced(50, 50, &due, 1, &next);
+    try std.testing.expectEqual(@as(u32, 5), batch.items[0].sequence);
+    try std.testing.expectEqualSlices(u8, "\x84\x05\x00\x00a", batch.items[0].data);
+    try std.testing.expectEqual(@as(u32, 6), next);
+    try std.testing.expectEqual(@as(usize, 2), recovery.count());
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 3, .last = 3 }}, 60, 8)).packets);
+    try std.testing.expectEqual(@as(usize, 0), (try recovery.acknowledge(&.{.{ .first = 5, .last = 5 }}, 60, 8)).packets);
+    const acked = try recovery.acknowledge(&.{.{ .first = 4, .last = 5 }}, 70, 8);
+    try std.testing.expectEqual(@as(usize, 1), acked.packets);
+    try std.testing.expectEqual(@as(?u64, 70), acked.rtt_sample_ms);
+    try std.testing.expectEqual(@as(usize, 0), recovery.count());
+
+    next = 10;
+    try recovery.track(1, "\x84\x01\x00\x00d", 5, 100, 50);
+    _ = recovery.collectDueResequenced(150, 50, &due, 1, &next);
+    try recovery.track(17, "\x84\x11\x00\x00e", 5, 150, 50);
+    try std.testing.expectEqual(@as(usize, 0), (try recovery.acknowledge(&.{.{ .first = 1, .last = 1 }}, 160, 8)).packets);
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 17, .last = 17 }}, 160, 8)).packets);
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 10, .last = 10 }}, 160, 8)).packets);
+    try std.testing.expectEqual(@as(usize, 0), recovery.count());
+    try std.testing.expectEqual(@as(?u64, null), recovery.nextDeadline());
+
+    next = 0xffffff;
+    try recovery.track(2, "\x84\x02\x00\x00c", 5, 0, 50);
+    const wrapped = recovery.collectDueResequenced(50, 50, &due, 1, &next);
+    try std.testing.expectEqual(@as(u32, 0xffffff), wrapped.items[0].sequence);
+    try std.testing.expectEqual(@as(u32, 0), next);
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 0xffffff, .last = 0xffffff }}, 60, 8)).packets);
+}
+
+test "repeated resends survive ring collisions wrap and long abandon timeouts" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
+    defer recovery.deinit();
+    recovery.minimum_abandon_ms = std.math.maxInt(u32);
+    try recovery.track(0xfffffe, "\x84\xfe\xff\xffa", 5, 0, 1);
+    try recovery.track(3, "\x84\x03\x00\x00b", 5, 0, 1);
+    var next: u32 = 0xffffff;
+    var due: [2]Due = undefined;
+    const collision = recovery.collectDueResequenced(1, 1, &due, 2, &next);
+    try std.testing.expectEqual(@as(usize, 2), collision.items.len);
+    try std.testing.expectEqual(@as(u32, 0xffffff), next);
+    // Simulate an unreliable send using the blocked sequence.
+    next = 0;
+    for (0..300) |iteration| {
+        const batch = recovery.collectDueResequenced((iteration + 1) * 5000, 1, &due, 2, &next);
+        try std.testing.expectEqual(@as(usize, 2), batch.items.len);
+        try std.testing.expectEqual(@as(usize, 0), batch.exhausted);
+        try std.testing.expectEqual(@as(usize, 2), recovery.count());
+        try std.testing.expectEqual(@as(usize, 10), recovery.payloadBytes());
+        for (batch.items) |item| {
+            const wire_sequence = @as(u32, item.data[1]) | (@as(u32, item.data[2]) << 8) | (@as(u32, item.data[3]) << 16);
+            try std.testing.expectEqual(item.sequence, wire_sequence);
+        }
+    }
+    const current = due[0].sequence;
+    const previous = recovery.find(current).?.previous;
+    try std.testing.expect(previous != none);
+    try std.testing.expectEqual(@as(usize, 0), try recovery.markNack(&.{.{ .first = previous, .last = previous }}, 1_500_001, 4));
+    const result = try recovery.acknowledge(&.{.{ .first = current, .last = current }}, 1_500_001, 4);
+    try std.testing.expectEqual(@as(usize, 1), result.packets);
+    try std.testing.expectEqual(@as(usize, 5), result.bytes);
+    try std.testing.expectEqual(@as(?u64, null), result.rtt_sample_ms);
+    const other = due[1].sequence;
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = other, .last = other }}, 1_500_001, 4)).packets);
+    try std.testing.expectEqual(@as(usize, 0), recovery.count());
+}
+
+test "a pinned slot is expedited once" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
+    defer recovery.deinit();
+    try recovery.track(2, "pinned", 6, 0, 50);
+    try std.testing.expect(recovery.expedite(0, 2, 1));
+    var due: [1]Due = undefined;
+    try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(1, 50, &due, 1).items.len);
+    try std.testing.expect(!recovery.expedite(0, 2, 1));
+    try std.testing.expect(!recovery.expedite(0, 0, 1));
+    try std.testing.expectEqual(@as(?u64, 51), recovery.nextDeadline());
 }
 
 test "ring rejects delayed wrap aliases" {
@@ -457,6 +635,24 @@ test "deadline heap inspects only due records" {
     try std.testing.expectEqual(@as(usize, 1), first.inspected);
     try std.testing.expectEqual(@as(u32, 0), first.items[0].sequence);
     try std.testing.expectEqual(@as(?u64, 11), recovery.nextDeadline());
+}
+
+test "exhaustion waits for the minimum abandon age" {
+    var recovery = try Recovery.init(std.testing.allocator, 1, 576, 2, 576);
+    defer recovery.deinit();
+    recovery.minimum_abandon_ms = 1000;
+    try recovery.track(1, "x", 1, 0, 50);
+    var due: [1]Due = undefined;
+    var now: u64 = 0;
+    for (0..6) |_| {
+        now = recovery.nextDeadline().?;
+        const batch = recovery.collectDue(now, 50, &due, 1);
+        if (now >= 1000) break;
+        try std.testing.expectEqual(@as(usize, 0), batch.exhausted);
+        try std.testing.expectEqual(@as(usize, 1), batch.items.len);
+    }
+    try std.testing.expect(now >= 1000);
+    try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(now, 50, &due, 1).exhausted);
 }
 
 test "retransmission exhaustion and clock saturation" {

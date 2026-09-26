@@ -47,7 +47,8 @@ pub const Sequenced = struct {
 pub const Store = struct {
     allocator: std.mem.Allocator,
     channels: []Channel,
-    packets: []Packet,
+    packets: []Packet = &.{},
+    maximum_entries: usize,
     maximum_bytes: usize,
     maximum_window: usize,
     total_bytes: usize = 0,
@@ -66,17 +67,12 @@ pub const Store = struct {
             maximum_window >= uint24.half_range) return error.InvalidConfiguration;
         const channels = try allocator.alloc(Channel, channel_count);
         @memset(channels, .{});
-        errdefer allocator.free(channels);
-        const packets = try allocator.alloc(Packet, maximum_entries);
-        errdefer allocator.free(packets);
-        for (packets, 0..) |*packet, index| packet.* = .{ .next = if (index + 1 < packets.len) @intCast(index + 1) else empty_ref };
         return .{
             .allocator = allocator,
             .channels = channels,
-            .packets = packets,
+            .maximum_entries = maximum_entries,
             .maximum_bytes = maximum_bytes,
             .maximum_window = maximum_window,
-            .free_head = 0,
         };
     }
 
@@ -136,7 +132,7 @@ pub const Store = struct {
         if (forward >= uint24.half_range) return false;
         if (forward >= self.maximum_window) return error.OrderWindowExceeded;
         if (self.peek(channel, index) != null) return false;
-        if (self.packet_count == self.packets.len) return error.OrderQueueFull;
+        if (self.packet_count == self.maximum_entries) return error.OrderQueueFull;
         if (payload.len > self.maximum_bytes -| self.total_bytes) return error.OrderBytesExceeded;
 
         if (self.channels[channel].ring.len == 0) {
@@ -192,7 +188,7 @@ pub const Store = struct {
                 self.class_heads[class_index] = self.packets[packet_ref].next;
                 return packet_ref;
             }
-            packet_ref = self.takeUnused() orelse return error.OrderQueueFull;
+            packet_ref = try self.takeUnused() orelse return error.OrderQueueFull;
             const storage = self.allocator.alloc(u8, class_sizes[class_index]) catch |err| {
                 self.returnUnused(packet_ref);
                 return err;
@@ -202,7 +198,7 @@ pub const Store = struct {
             self.retained_bytes += storage.len;
             return packet_ref;
         }
-        packet_ref = self.takeUnused() orelse return error.OrderQueueFull;
+        packet_ref = try self.takeUnused() orelse return error.OrderQueueFull;
         const storage = self.allocator.alloc(u8, len) catch |err| {
             self.returnUnused(packet_ref);
             return err;
@@ -230,11 +226,21 @@ pub const Store = struct {
         self.returnUnused(packet_ref);
     }
 
-    fn takeUnused(self: *Store) ?u32 {
+    fn takeUnused(self: *Store) !?u32 {
+        if (self.free_head == empty_ref) try self.grow();
         if (self.free_head == empty_ref) return null;
         const packet_ref = self.free_head;
         self.free_head = self.packets[packet_ref].next;
         return packet_ref;
+    }
+
+    fn grow(self: *Store) !void {
+        const old_len = self.packets.len;
+        if (old_len == self.maximum_entries) return;
+        const new_len = @min(self.maximum_entries, @max(16, old_len * 2));
+        self.packets = if (old_len == 0) try self.allocator.alloc(Packet, new_len) else try self.allocator.realloc(self.packets, new_len);
+        for (self.packets[old_len..], old_len..) |*packet, index| packet.* = .{ .next = if (index + 1 < new_len) @intCast(index + 1) else self.free_head };
+        self.free_head = @intCast(old_len);
     }
 
     fn returnUnused(self: *Store, packet_ref: u32) void {
@@ -254,6 +260,20 @@ test "sequenced packets use modular ordering" {
     try std.testing.expect(sequence.accept(0));
     try std.testing.expect(!sequence.accept(0xffffff));
     try std.testing.expect(!sequence.accept(0));
+}
+
+test "packet metadata grows on demand up to the limit" {
+    var store = try Store.init(std.testing.allocator, 1, 40, 4096, 64);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(usize, 0), store.packets.len);
+    for (1..41) |index| try std.testing.expect(try store.push(0, @intCast(index), "x"));
+    try std.testing.expectEqual(@as(usize, 40), store.packets.len);
+    try std.testing.expectError(error.OrderQueueFull, store.push(0, 41, "x"));
+    try store.advanceBorrowed(0, 0);
+    var delivered: usize = 0;
+    while (try store.pop(0)) |owned| : (delivered += 1) owned.deinit();
+    try std.testing.expectEqual(@as(usize, 40), delivered);
+    try std.testing.expect(try store.push(0, 42, "y"));
 }
 
 test "global quotas span channels and in-order fast path advances" {

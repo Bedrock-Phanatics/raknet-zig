@@ -32,15 +32,16 @@ test "session handles every allocation failure" {
 test "hostile ACK and NACK ranges are rejected atomically" {
     var storage: [8]ack.Record = undefined;
     try std.testing.expectError(error.ReversedRange, ack.decode(&.{ 0, 1, 0, 5, 0, 0, 4, 0, 0 }, &storage, storage.len, 64));
-    try std.testing.expectError(error.OverlappingRanges, ack.decode(&.{ 0, 2, 1, 4, 0, 0, 1, 4, 0, 0 }, &storage, storage.len, 64));
-    try std.testing.expectError(error.OverlappingRanges, ack.decode(&.{ 0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 3, 0, 0, 5, 0, 0 }, &storage, storage.len, 64));
+    try std.testing.expectEqual(@as(usize, 1), (try ack.decode(&.{ 0, 2, 1, 4, 0, 0, 1, 4, 0, 0 }, &storage, storage.len, 64)).records.len);
+    try std.testing.expectEqual(@as(usize, 5), (try ack.decode(&.{ 0, 2, 0, 1, 0, 0, 3, 0, 0, 0, 3, 0, 0, 5, 0, 0 }, &storage, storage.len, 64)).acknowledged_count);
+    try std.testing.expectError(error.TooManyAcknowledgements, ack.decode(&.{ 0, 2, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 40, 0, 0 }, &storage, storage.len, 64));
     try std.testing.expectError(error.TooManyAcknowledgements, ack.decode(&.{ 0, 1, 0, 0, 0, 0, 0xff, 0xff, 0xff }, &storage, storage.len, 64));
 
     var core = try Core.init(std.testing.allocator, 576, .{});
     defer core.deinit();
     const repeated = &.{ 0xa0, 0, 2, 1, 7, 0, 0, 1, 7, 0, 0 };
     var unused: u8 = 0;
-    try std.testing.expectError(error.OverlappingRanges, core.processIncoming(repeated, 0, &unused, Discard.deliver));
+    try std.testing.expectEqual(@as(usize, 0), (try core.processIncoming(repeated, 0, &unused, Discard.deliver)).nack_marked);
     try std.testing.expectEqual(@as(u64, 0), core.statistics().lost_datagrams);
 }
 

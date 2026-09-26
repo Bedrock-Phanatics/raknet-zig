@@ -12,6 +12,13 @@ pub const Accepted = struct {
 };
 pub const Action = union(enum) { drop, response: []const u8, accepted: Accepted };
 
+pub const Counters = struct {
+    unconnected_pings: u64 = 0,
+    open_connection_requests_1: u64 = 0,
+    open_connection_requests_2: u64 = 0,
+    rejected: u64 = 0,
+};
+
 pub const Handler = struct {
     server_guid: u64,
     protocol_version: u8,
@@ -20,6 +27,7 @@ pub const Handler = struct {
     advertisement: []const u8,
     cookies: cookie.Jar,
     limiter: *rate.Limiter,
+    counters: Counters = .{},
 
     pub fn init(server_guid: u64, protocol_version: u8, minimum_mtu: u16, maximum_mtu: u16, advertisement: []const u8, cookies: cookie.Jar, limiter: *rate.Limiter) !Handler {
         if (minimum_mtu < 400 or minimum_mtu > maximum_mtu or advertisement.len > 65_535) return error.InvalidConfiguration;
@@ -34,7 +42,6 @@ pub const Handler = struct {
         };
     }
 
-    /// `endpoint` must be a canonical address+port byte representation; `source_key` should be keyed.
     pub fn handle(self: *Handler, datagram: []const u8, endpoint: []const u8, source_key: u64, epoch: u64, now_ms: u64, output: []u8) Action {
         if (datagram.len == 0 or datagram.len > 65_507) return .drop;
         return switch (datagram[0]) {
@@ -46,6 +53,7 @@ pub const Handler = struct {
     }
 
     fn ping(self: *Handler, datagram: []const u8, source_key: u64, now_ms: u64, output: []u8) Action {
+        self.counters.unconnected_pings += 1;
         const request = offline.decodeUnconnectedPing(datagram) catch return .drop;
         const response_size = 35 + self.advertisement.len;
         const cost: u32 = @intCast(@min(@as(usize, std.math.maxInt(u32)), (response_size + datagram.len - 1) / datagram.len));
@@ -55,8 +63,9 @@ pub const Handler = struct {
     }
 
     fn request1(self: *Handler, datagram: []const u8, endpoint: []const u8, source_key: u64, epoch: u64, now_ms: u64, output: []u8) Action {
-        if (!self.limiter.allow(source_key, 1, now_ms)) return .drop;
-        const request = offline.decodeOpenConnectionRequest1(datagram, self.minimum_mtu, self.maximum_mtu) catch return .drop;
+        self.counters.open_connection_requests_1 += 1;
+        if (!self.limiter.allow(source_key, 1, now_ms)) return self.reject();
+        const request = offline.decodeOpenConnectionRequest1(datagram, self.minimum_mtu, self.maximum_mtu) catch return self.reject();
         if (request.protocol_version != self.protocol_version) {
             const response = offline.encodeIncompatibleProtocol(self.protocol_version, self.server_guid, output) catch return .drop;
             return .{ .response = response };
@@ -68,11 +77,17 @@ pub const Handler = struct {
     }
 
     fn request2(self: *Handler, datagram: []const u8, endpoint: []const u8, source_key: u64, epoch: u64, now_ms: u64, output: []u8) Action {
-        if (!self.limiter.allow(source_key, 1, now_ms)) return .drop;
-        const request = offline.decodeOpenConnectionRequest2(datagram, true, self.minimum_mtu, self.maximum_mtu) catch return .drop;
-        if (!self.cookies.verify(request.cookie.?, endpoint, epoch)) return .drop;
+        self.counters.open_connection_requests_2 += 1;
+        if (!self.limiter.allow(source_key, 1, now_ms)) return self.reject();
+        const request = offline.decodeOpenConnectionRequest2(datagram, true, self.minimum_mtu, self.maximum_mtu) catch return self.reject();
+        if (!self.cookies.verify(request.cookie.?, endpoint, epoch)) return self.reject();
         const response = offline.encodeOpenConnectionReply2(self.server_guid, request.server_address, request.mtu, output) catch return .drop;
         return .{ .accepted = .{ .response = response, .client_guid = request.client_guid, .mtu = request.mtu, .server_address = request.server_address } };
+    }
+
+    fn reject(self: *Handler) Action {
+        self.counters.rejected += 1;
+        return .drop;
     }
 };
 

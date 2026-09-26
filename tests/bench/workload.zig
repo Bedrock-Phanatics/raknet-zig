@@ -227,6 +227,7 @@ fn reassembly(io: std.Io, scatter: bool) !usize {
         .maximum_bytes = 512,
         .maximum_concurrent = 1,
         .maximum_total_bytes = 512,
+        .maximum_total_parts = 2,
         .timeout_ms = 1000,
     });
     defer state.deinit();
