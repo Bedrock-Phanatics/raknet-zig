@@ -65,6 +65,7 @@ pub const Socket = struct {
     buffer_sizes: BufferSizes,
     traffic: Traffic = .{},
     batch: ?*SendBatch = null,
+    poll_event: if (builtin.os.tag == .windows) ?std.os.windows.HANDLE else void = if (builtin.os.tag == .windows) null else {},
 
     pub fn bind(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize) !Socket {
         return bindWithBuffers(io, address, maximum_datagram_size, .{});
@@ -81,6 +82,9 @@ pub const Socket = struct {
         return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(value.handle, buffers) };
     }
     pub fn close(self: *Socket) void {
+        if (builtin.os.tag == .windows) if (self.poll_event) |event| {
+            _ = std.os.windows.ntdll.NtClose(event);
+        };
         self.value.close(self.io);
         self.* = undefined;
     }
@@ -158,6 +162,45 @@ pub const Socket = struct {
         return self.buffer_sizes;
     }
 
+    pub fn receive(self: *Socket, buffer: []u8, timeout: std.Io.Timeout) !std.Io.net.IncomingMessage {
+        return self.value.receiveTimeout(self.io, buffer, timeout) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                if (timeout != .none and !try self.waitReadable(timeout)) return error.Timeout;
+                return self.value.receive(self.io, buffer);
+            },
+            else => return err,
+        };
+    }
+
+    fn waitReadable(self: *Socket, timeout: std.Io.Timeout) !bool {
+        if (builtin.os.tag != .windows) return error.ConcurrencyUnavailable;
+        const windows = std.os.windows;
+        const PollHandle = extern struct { handle: windows.HANDLE, events: windows.ULONG, status: windows.NTSTATUS };
+        const PollInfo = extern struct { timeout: windows.LARGE_INTEGER, count: windows.ULONG, exclusive: windows.ULONG, handles: [1]PollHandle };
+        const readable: windows.ULONG = 0x0001 | 0x0008 | 0x0010;
+        if (self.poll_event == null) {
+            var event: windows.HANDLE = undefined;
+            if (windows.ntdll.NtCreateEvent(&event, @bitCast(@as(u32, 0x1f0003)), null, .Synchronization, .FALSE) != .SUCCESS) return error.SystemResources;
+            self.poll_event = event;
+        }
+        const handle: windows.HANDLE = self.value.handle;
+        var info: PollInfo = .{
+            .timeout = -@as(i64, @intCast(@min(remainingMilliseconds(self.io, timeout), std.math.maxInt(i64) / 10_000))) * 10_000,
+            .count = 1,
+            .exclusive = 0,
+            .handles = .{.{ .handle = handle, .events = readable, .status = .SUCCESS }},
+        };
+        var status_block: windows.IO_STATUS_BLOCK = undefined;
+        var status = windows.ntdll.NtDeviceIoControlFile(handle, self.poll_event.?, null, null, &status_block, windows.IOCTL.AFD.POLL, &info, @sizeOf(PollInfo), &info, @sizeOf(PollInfo));
+        if (status == .PENDING) {
+            _ = windows.ntdll.NtWaitForSingleObject(self.poll_event.?, .FALSE, null);
+            status = status_block.u.Status;
+        }
+        if (status == .TIMEOUT) return false;
+        if (status != .SUCCESS) return error.Unexpected;
+        return info.count != 0 and info.handles[0].events & readable != 0;
+    }
+
     pub fn receiveMany(self: *Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8, timeout: std.Io.Timeout) !ReceiveBatch {
         if (messages.len == 0) return error.InvalidConfiguration;
         const required = try std.math.mul(usize, messages.len, self.maximum_datagram_size);
@@ -168,7 +211,7 @@ pub const Socket = struct {
         var actual_failure = failure;
         if (actual_received == 0) if (actual_failure) |err| switch (err) {
             error.ConcurrencyUnavailable => {
-                if (timeout != .none) return err;
+                if (timeout != .none and !try self.waitReadable(timeout)) return error.Timeout;
                 messages[0] = try self.value.receive(self.io, data_storage[0..self.maximum_datagram_size]);
                 actual_received = 1;
                 actual_failure = null;
@@ -190,6 +233,16 @@ pub const Socket = struct {
         return .{ .messages = messages[0..valid], .dropped_oversize = dropped, .trailing_error = actual_failure };
     }
 };
+
+fn remainingMilliseconds(io: std.Io, timeout: std.Io.Timeout) u64 {
+    const nanoseconds: i96 = switch (timeout) {
+        .none => return std.math.maxInt(u64),
+        .duration => |duration| duration.raw.nanoseconds,
+        .deadline => |deadline| deadline.raw.nanoseconds - deadline.clock.now(io).nanoseconds,
+    };
+    if (nanoseconds <= 0) return 0;
+    return @intCast(@min(@divTrunc(nanoseconds + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(u64)));
+}
 
 fn bindReusePort(address: std.Io.net.IpAddress) !std.Io.net.Socket {
     const linux = std.os.linux;
@@ -289,6 +342,28 @@ test "batched sends are flushed together and keep their destinations" {
     try std.testing.expectEqualStrings("one!", (try first.value.receive(io, &storage)).data);
     try std.testing.expectEqualStrings("3rd!", (try first.value.receive(io, &storage)).data);
     try std.testing.expectEqualStrings("two!", (try second.value.receive(io, &storage)).data);
+}
+
+test "timed receive waits for data or times out on every platform" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var receiver = try Socket.bind(io, address, 64);
+    defer receiver.close();
+    var sender = try Socket.bind(io, address, 64);
+    defer sender.close();
+    var storage: [64]u8 = undefined;
+    const before = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, receiver.receive(&storage, .{ .duration = .{ .raw = .fromMilliseconds(30), .clock = .awake } }));
+    try std.testing.expect(before.durationTo(std.Io.Clock.awake.now(io)).nanoseconds >= 20 * std.time.ns_per_ms);
+    try sender.send(receiver.value.address, "ping");
+    try std.testing.expectEqualStrings("ping", (try receiver.receive(&storage, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } })).data);
+    var messages: [2]std.Io.net.IncomingMessage = undefined;
+    var batch_storage: [128]u8 = undefined;
+    try std.testing.expectError(error.Timeout, receiver.receiveMany(&messages, &batch_storage, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }));
+    try sender.send(receiver.value.address, "pong");
+    try std.testing.expectEqualStrings("pong", (try receiver.receiveMany(&messages, &batch_storage, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } })).messages[0].data);
 }
 
 test "listeners can share a port with reuse_port" {

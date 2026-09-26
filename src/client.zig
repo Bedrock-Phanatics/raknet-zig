@@ -394,7 +394,7 @@ pub const Client = struct {
         var work: usize = 0;
         while (work < maximum_work) : (work += 1) {
             const attempt = time.earliest(self.io, deadline, time.after(self.io, retry_ms));
-            const message = receiveTimed(&self.socket.value, self.io, self.receive_buffer, attempt) catch |err| switch (err) {
+            const message = self.socket.receive(self.receive_buffer, attempt) catch |err| switch (err) {
                 error.Timeout => {
                     if (std.Io.Clock.awake.now(self.io).nanoseconds >= deadline.deadline.raw.nanoseconds) return error.Timeout;
                     _ = try self.flushRetransmissions(time.nowMilliseconds(self.io), self.core.config.batching.maximum_packets_per_iteration);
@@ -547,7 +547,7 @@ const HandshakeTransport = struct {
         try self.socket.send(self.server, data);
     }
     pub fn receive(self: *HandshakeTransport, deadline_ms: u64) !?[]const u8 {
-        const message = receiveTimed(&self.socket.value, self.socket.io, self.buffer, time.atMilliseconds(deadline_ms)) catch |err| switch (err) {
+        const message = self.socket.receive(self.buffer, time.atMilliseconds(deadline_ms)) catch |err| switch (err) {
             error.Timeout => return null,
             else => return err,
         };
@@ -560,12 +560,6 @@ fn isLateOfflineReply(data: []const u8) bool {
     return data.len != 0 and (data[0] == @intFromEnum(offline.Id.open_connection_reply_1) or data[0] == @intFromEnum(offline.Id.open_connection_reply_2));
 }
 
-fn receiveTimed(socket: *const std.Io.net.Socket, io: std.Io, buffer: []u8, timeout: std.Io.Timeout) !std.Io.net.IncomingMessage {
-    return socket.receiveTimeout(io, buffer, timeout) catch |err| switch (err) {
-        error.ConcurrencyUnavailable => if (timeout == .none) try socket.receive(io, buffer) else return err,
-        else => return err,
-    };
-}
 test "client validates a descending MTU ladder" {
     try validateOptions(.{});
     try validateOptions(.{ .mtu = 1200 });
@@ -573,7 +567,6 @@ test "client validates a descending MTU ladder" {
     try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .mtu_fallbacks = &.{ 576, 1200 } }));
 }
 test "client and server complete a real loopback handshake" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const server_mod = @import("server.zig");
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
@@ -628,16 +621,18 @@ test "client and server complete a real loopback handshake" {
     const CapacityHarness = struct {
         listener: *server_mod.Listener,
         harness: *Harness,
-        fn run(self: *@This()) !void {
-            while (true) {
-                _ = try self.listener.poll(.none, .{ .context = self.harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+        stop: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This(), io_value: std.Io) !void {
+            while (!self.stop.load(.acquire)) {
+                _ = try self.listener.poll(time.after(io_value, 10), .{ .context = self.harness, .connected = Harness.onConnect, .message = Harness.onMessage });
             }
         }
     };
     var capacity_harness: CapacityHarness = .{ .listener = listener, .harness = &harness };
-    var capacity_task = try io.concurrent(CapacityHarness.run, .{&capacity_harness});
+    var capacity_task = try io.concurrent(CapacityHarness.run, .{ &capacity_harness, io });
     try std.testing.expectError(error.NoFreeIncomingConnections, Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 }));
-    capacity_task.cancel(io) catch {};
+    capacity_harness.stop.store(true, .release);
+    try capacity_task.await(io);
 
     try client.send("\xfehello", .reliable_ordered, 0);
     for (0..4) |_| {
@@ -683,7 +678,9 @@ test "client and server complete a real loopback handshake" {
     }
     try std.testing.expectEqualStrings("\xfeworld", collector.data[0..collector.len]);
 
-    try listener.socket.send(client.socket.value.address, &.{ 0x84, 0 });
+    var client_address = client.socket.value.address;
+    client_address.ip4.bytes = .{ 127, 0, 0, 1 };
+    try listener.socket.send(client_address, &.{ 0x84, 0 });
     _ = try client.poll(.none, &collector, ClientCollector.collect);
     try std.testing.expectEqual(@as(u64, 1), client.rejected_datagrams);
     try std.testing.expect(!client.isClosed());
@@ -722,7 +719,6 @@ test "client and server complete a real loopback handshake" {
 }
 
 test "repeated reconnects survive shutdown with queued traffic" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const server_mod = @import("server.zig");
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
@@ -766,7 +762,6 @@ test "repeated reconnects survive shutdown with queued traffic" {
 }
 
 test "handshake deadline and cancellation release every resource" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
     const io = io_instance.io();
@@ -783,12 +778,11 @@ test "handshake deadline and cancellation release every resource" {
     };
     var task = try io.concurrent(Connect.run, .{ io, silent.value.address });
     var probe: [2048]u8 = undefined;
-    _ = try silent.value.receiveTimeout(io, &probe, time.after(io, 1_000));
+    _ = try silent.receive(&probe, time.after(io, 1_000));
     try std.testing.expectError(error.Canceled, task.cancel(io));
 }
 
 test "graceful client close delivers queued data before the disconnect" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const server_mod = @import("server.zig");
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();

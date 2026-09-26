@@ -883,7 +883,6 @@ fn endpointKey(address: std.Io.net.IpAddress) EndpointKey {
     return key;
 }
 test "listener answers an offline ping over loopback" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
     const io = io_instance.io();
