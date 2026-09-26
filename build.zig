@@ -34,4 +34,9 @@ pub fn build(b: *std.Build) void {
     const install_bench = b.addInstallArtifact(bench, .{});
     b.step("bench-build", "Build benchmark executable").dependOn(&install_bench.step);
     b.step("bench", "Run protocol and network benchmarks").dependOn(&b.addRunArtifact(bench).step);
+
+    const interop_root = module(b, "tests/interop/main.zig", target, .ReleaseFast);
+    interop_root.addImport("raknet", module(b, "src/root.zig", target, .ReleaseFast));
+    const interop = b.addExecutable(.{ .name = "raknet-interop", .root_module = interop_root });
+    b.step("interop", "Build the interop and comparison tool").dependOn(&b.addInstallArtifact(interop, .{}).step);
 }

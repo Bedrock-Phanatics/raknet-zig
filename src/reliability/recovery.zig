@@ -201,6 +201,18 @@ pub const Recovery = struct {
         return .{ .items = output[0..due_count], .exhausted = exhausted, .inspected = inspected };
     }
 
+    pub fn freeSlots(self: *const Recovery, raw_first: u32, limit: usize) usize {
+        const bound = @min(limit, self.slots.len - self.count_value);
+        var run: usize = 0;
+        while (run < bound and !self.slots[uint24.add(raw_first, @intCast(run)) % self.slots.len].occupied) run += 1;
+        return run;
+    }
+
+    pub fn expedite(self: *Recovery, raw_first: u32, free: usize, now_ms: u64) bool {
+        const slot = &self.slots[uint24.add(raw_first, @intCast(free)) % self.slots.len];
+        return slot.occupied and slot.transmissions == 1 and self.nackSlot(slot, now_ms);
+    }
+
     pub fn nextDeadline(self: Recovery) ?u64 {
         return if (self.heap_len == 0) null else self.slots[self.heap[0]].deadline_ms;
     }
@@ -435,6 +447,29 @@ test "timeouts back off while NACK retransmits do not" {
     const nacked = recovery.collectDue(now, 50, &due, 1);
     try std.testing.expect(!nacked.items[0].timed_out);
     try std.testing.expectEqual(now + 300, recovery.nextDeadline().?);
+}
+
+test "free slots stop at a pinned wrap alias" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 3, 576);
+    defer recovery.deinit();
+    try std.testing.expectEqual(@as(usize, 4), recovery.freeSlots(0, 8));
+    try recovery.track(2, "pinned", 6, 0, 10);
+    try std.testing.expectEqual(@as(usize, 2), recovery.freeSlots(0, 8));
+    try std.testing.expectEqual(@as(usize, 0), recovery.freeSlots(6, 8));
+    try std.testing.expectEqual(@as(usize, 1), recovery.freeSlots(3, 1));
+    try std.testing.expectEqual(@as(usize, 3), recovery.freeSlots(0xffffff, 8));
+}
+
+test "a pinned slot is expedited once" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
+    defer recovery.deinit();
+    try recovery.track(2, "pinned", 6, 0, 50);
+    try std.testing.expect(recovery.expedite(0, 2, 1));
+    var due: [1]Due = undefined;
+    try std.testing.expectEqual(@as(usize, 1), recovery.collectDue(1, 50, &due, 1).items.len);
+    try std.testing.expect(!recovery.expedite(0, 2, 1));
+    try std.testing.expect(!recovery.expedite(0, 0, 1));
+    try std.testing.expectEqual(@as(?u64, 51), recovery.nextDeadline());
 }
 
 test "ring rejects delayed wrap aliases" {

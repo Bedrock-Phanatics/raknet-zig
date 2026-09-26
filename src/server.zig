@@ -244,7 +244,7 @@ pub const Session = struct {
         }
     }
     pub fn send(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
-        if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
+        if (!try self.trySend(payload, reliability, channel)) _ = try self.queueSend(payload, reliability, channel);
     }
     pub fn trySend(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
         if (self.state != .connected) return error.NotConnected;
@@ -296,6 +296,7 @@ pub const Session = struct {
             try self.core.sendControl(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit)
         else
             try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit);
+        if (control and self.core.outboundCount(.control) != 0) self.outbound_deadline_ms = now_ms;
         try self.schedule();
         return emitter.count;
     }
@@ -344,7 +345,7 @@ pub const Session = struct {
     }
     fn processDueTimers(self: *Session, now_ms: u64, maximum_work: usize) !usize {
         var remaining = maximum_work;
-        var active: usize = @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms) +
+        var active: usize = @as(usize, @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms)) +
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
             @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
@@ -1213,6 +1214,26 @@ test "ACK delay schedules while NACK remains urgent" {
     try std.testing.expectEqual(@as(?u64, 105), session.ack_deadline_ms);
     try session.queueReceipt(.{ .missing = .{ .first = 2, .last = 2, .count = 1 } }, 102);
     try std.testing.expectEqual(@as(?u64, 102), session.ack_deadline_ms);
+}
+
+test "every due session timer runs when several are due together" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var socket = try backend.Socket.bind(io, address, 576);
+    defer socket.close();
+    var deadlines = try deadline_queue.Queue.init(std.testing.allocator, 1);
+    defer deadlines.deinit();
+    const key = endpointKey(socket.value.address);
+    const session = try Session.create(std.testing.allocator, &socket, &deadlines, socket.value.address, key, 1, 576, 0, 1000, 8, .{});
+    defer session.destroy();
+    try session.core.trackSent(0, "\x84\x00\x00\x00\x00\x00\x08\x01", 8, 0);
+    try session.queueReceipt(.{ .acknowledge = 1 }, 0);
+    session.outbound_deadline_ms = 0;
+    const now = session.core.nextRetransmissionDeadline().?;
+    _ = try session.processDueTimers(now, 16);
+    try std.testing.expectEqual(@as(?u64, null), session.ack_deadline_ms);
+    try std.testing.expectEqual(@as(?u64, null), session.outbound_deadline_ms);
+    try std.testing.expect(session.core.nextRetransmissionDeadline().? > now);
 }
 
 test "global turn budget carries unread batch entries fairly" {

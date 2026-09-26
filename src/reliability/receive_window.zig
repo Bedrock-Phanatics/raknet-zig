@@ -63,6 +63,20 @@ pub const Window = struct {
         return result;
     }
 
+    pub fn skipTo(self: *Window, raw_index: u32) void {
+        const index = uint24.normalize(raw_index);
+        if (uint24.distance(self.expected, index) < self.present.len) return;
+        const target = uint24.sub(index, @intCast(self.present.len - 1));
+        const steps = uint24.distance(self.expected, target);
+        if (steps >= self.present.len) {
+            @memset(self.present, false);
+            self.expected = target;
+        } else {
+            for (0..steps) |_| self.advanceOne();
+        }
+        while (self.present[self.expected % self.present.len]) self.advanceOne();
+    }
+
     fn advanceOne(self: *Window) void {
         self.present[self.expected % self.present.len] = false;
         self.expected = uint24.add(self.expected, 1);
@@ -106,6 +120,25 @@ test "gaps are reported once as they appear" {
     window = try Window.init(&slots, 0xfffffe);
     try std.testing.expectEqual(Gap{ .first = 0xfffffe, .last = 0xffffff, .count = 2 }, window.add(0, 64).accepted.?);
     try std.testing.expectEqual(@as(?Gap, null), window.add(1, 64).accepted);
+}
+
+test "skipping abandons holes behind a far datagram" {
+    var slots: [8]bool = undefined;
+    var window = try Window.init(&slots, 0);
+    try std.testing.expect(window.add(1, 8) == .accepted);
+    try std.testing.expect(window.add(9, 8) == .too_far_ahead);
+    window.skipTo(9);
+    try std.testing.expectEqual(@as(u32, 2), window.expected);
+    try std.testing.expect(window.add(9, 8) == .accepted);
+    window.skipTo(0x1000);
+    try std.testing.expectEqual(@as(u32, 0x1000 - 7), window.expected);
+    try std.testing.expect(window.add(0x1000, 8) == .accepted);
+    try std.testing.expect(window.add(9, 8) == .stale);
+
+    window = try Window.init(&slots, 0xfffffc);
+    window.skipTo(5);
+    try std.testing.expectEqual(@as(u32, 0xfffffe), window.expected);
+    try std.testing.expect(window.add(5, 8) == .accepted);
 }
 
 test "inspection is non-mutating" {

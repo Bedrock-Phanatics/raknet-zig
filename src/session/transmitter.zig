@@ -215,6 +215,10 @@ pub const Transmitter = struct {
         return try std.math.add(usize, payload_len, try std.math.mul(usize, packet_layout.fragment_count, overhead));
     }
 
+    pub fn fragmentCount(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !usize {
+        return (try self.layout(payload_len, reliability, channel)).fragment_count;
+    }
+
     fn layout(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !Layout {
         if (!reliability.supportedForSend()) return error.UnsupportedReliability;
         if (payload_len == 0) return error.EmptyPayload;

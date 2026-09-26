@@ -23,6 +23,7 @@ pub const Traffic = struct {
     datagrams_sent: u64 = 0,
     bytes_received: u64 = 0,
     bytes_sent: u64 = 0,
+    send_drops: u64 = 0,
 };
 
 pub const ReceiveBatch = struct {
@@ -54,7 +55,13 @@ pub const Socket = struct {
     }
     pub fn send(self: *Socket, destination: std.Io.net.IpAddress, data: []const u8) !void {
         if (data.len > self.maximum_datagram_size) return error.DatagramTooLarge;
-        try self.value.send(self.io, &destination, data);
+        self.value.send(self.io, &destination, data) catch |err| switch (err) {
+            error.SystemResources => {
+                self.traffic.send_drops += 1;
+                return;
+            },
+            else => return err,
+        };
         self.traffic.datagrams_sent += 1;
         self.traffic.bytes_sent += data.len;
     }
@@ -64,7 +71,13 @@ pub const Socket = struct {
             if (message.data_len > self.maximum_datagram_size) return error.DatagramTooLarge;
             bytes += message.data_len;
         }
-        try self.value.sendMany(self.io, messages, .{});
+        self.value.sendMany(self.io, messages, .{}) catch |err| switch (err) {
+            error.SystemResources => {
+                self.traffic.send_drops += messages.len;
+                return;
+            },
+            else => return err,
+        };
         self.traffic.datagrams_sent += messages.len;
         self.traffic.bytes_sent += bytes;
     }

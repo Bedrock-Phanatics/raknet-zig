@@ -236,7 +236,7 @@ pub const Client = struct {
         self.allocator.destroy(self);
     }
     pub fn send(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !void {
-        if (!try self.trySend(payload, reliability, channel)) return error.CongestionWindowFull;
+        if (!try self.trySend(payload, reliability, channel)) _ = try self.queueSend(payload, reliability, channel);
     }
 
     pub fn trySend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !bool {
@@ -430,6 +430,7 @@ pub const Client = struct {
             try self.core.sendControl(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit)
         else
             try self.core.send(payload, reliability, channel, self.scratch, now_ms, &emitter, socket_emitter.Emitter.emit);
+        if (control and self.core.outboundCount(.control) != 0) self.outbound_deadline_ms = now_ms;
         return emitter.count;
     }
     fn flushQueuedAt(self: *Client, now_ms: u64) !core_mod.FlushResult {
@@ -463,7 +464,7 @@ pub const Client = struct {
     fn processDueTimers(self: *Client, now_ms: u64, maximum_work: usize) !void {
         if (maximum_work == 0) return;
         var remaining = maximum_work;
-        var active: usize = @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms) +
+        var active: usize = @as(usize, @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms)) +
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
             @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
