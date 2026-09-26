@@ -1,6 +1,6 @@
 .{
     .name = .zig_raknet,
-    .version = "0.1.0",
+    .version = "0.2.4",
     .fingerprint = 0xfea634fc53e873d4,
     .minimum_zig_version = "0.16.0",
     .paths = .{ "build.zig", "build.zig.zon", "src", "tests", "docs/CONFIGURATION.md", "README.md", "LICENSE" },
