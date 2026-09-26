@@ -2,7 +2,7 @@
 
 A RakNet client and server library for Minecraft: Bedrock Edition, written in Zig.
 
-> Version 0.2.4. Public APIs may change before 1.0.
+> Version 0.2.5. Public APIs may change before 1.0.
 
 ## Install
 
