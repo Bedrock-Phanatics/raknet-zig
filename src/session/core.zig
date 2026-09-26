@@ -9,6 +9,7 @@ const congestion = @import("../reliability/congestion.zig");
 const reassembly = @import("../reliability/reassembly.zig");
 const recovery = @import("../reliability/recovery.zig");
 const rtt = @import("../reliability/rtt.zig");
+const uint24 = @import("../util/uint24.zig");
 const outbound_queue = @import("outbound_queue.zig");
 const receiver = @import("receiver.zig");
 const transmitter = @import("transmitter.zig");
@@ -613,7 +614,8 @@ pub const Core = struct {
     }
 
     pub fn collectRetransmissions(self: *Core, now_ms: u64, output: []recovery.Due, maximum_work: usize) recovery.DueBatch {
-        const batch = self.recovery_state.collectDue(now_ms, self.rtt_state.rto(), output, maximum_work);
+        const batch = self.recovery_state.collectDueResequenced(now_ms, self.rtt_state.rto(), output, maximum_work, &self.transmitter_state.datagram_sequence);
+        if (batch.items.len != 0) self.newest_sent = uint24.sub(self.transmitter_state.datagram_sequence, 1);
         self.retransmitted_datagrams +|= batch.items.len;
         var timed_out: usize = 0;
         for (batch.items) |item| if (item.timed_out) {

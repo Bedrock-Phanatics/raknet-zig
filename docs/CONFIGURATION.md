@@ -29,7 +29,7 @@ Default origins are:
 
 | Field | Default | Scope | Origin | Memory and exceed behavior |
 | --- | ---: | --- | --- | --- |
-| `maximum_retransmissions` | 4,096 packets | Session | Policy | Preallocates recovery metadata; excess reliable sends fail. |
+| `maximum_retransmissions` | 1,024 packets | Session | Reference | Preallocates recovery metadata and bounds unacknowledged reliable datagrams; further sends wait for ACKs. |
 | `maximum_recovery_bytes` | 16 MiB | Session | Policy | Independently caps retained wire data; excess sends fail. |
 | `maximum_ordered_packets` | 4,096 packets | Session | Policy | Preallocates ordered metadata; excess packets close the session. |
 | `maximum_ordered_bytes` | 16 MiB | Session | Policy | Caps buffered out-of-order payload; excess closes the session. |

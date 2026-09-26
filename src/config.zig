@@ -25,7 +25,7 @@ pub const ProtocolLimits = struct {
 };
 
 pub const SessionLimits = struct {
-    maximum_retransmissions: usize = 4096,
+    maximum_retransmissions: usize = 1024,
     maximum_recovery_bytes: usize = 16 * 1024 * 1024,
     maximum_ordered_packets: usize = 4096,
     maximum_ordered_bytes: usize = 16 * 1024 * 1024,

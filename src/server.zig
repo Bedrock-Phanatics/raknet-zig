@@ -1083,7 +1083,7 @@ test "graceful session close drains data and retransmits the disconnect until AC
     _ = try listener.processTimers(session.core.nextRetransmissionDeadline().?, harness.callbacks());
     const resent = try CloseHarness.receive(&peer);
     try std.testing.expect(resent.disconnect);
-    try std.testing.expectEqual(disconnect.sequence, resent.sequence);
+    try std.testing.expect(resent.sequence != disconnect.sequence);
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
 
     try harness.ack(listener, &peer, resent.sequence);
