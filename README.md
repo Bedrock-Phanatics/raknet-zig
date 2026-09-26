@@ -2,7 +2,7 @@
 
 A RakNet client and server library for Minecraft: Bedrock Edition, written in Zig.
 
-> Version 0.2.5. Public APIs may change before 1.0.
+> Version 0.2.6. Public APIs may change before 1.0.
 
 ## Install
 
@@ -91,6 +91,10 @@ Payloads are valid only during their callback. Use `payload.toOwned(allocator)` 
 `send` sends immediately or queues a copy, returning an error if the queue is full. `trySend` returns `false` under backpressure without queuing. The caller can reuse its buffer after either call.
 
 `Client.close()` starts graceful shutdown. Keep calling `poll()` or `processTimers()` until `isClosed()` is true. `Session.close()` requires continued listener polling. Closing rejects new sends and drains pending data until the shutdown timeout. Use `destroy()` for immediate teardown.
+
+## Minecraft batches
+
+Minecraft batch handling is provided by [Bedwire](https://github.com/Bedrock-Phanatics/bedwire-zig)
 
 ## Configuration and scope
 
