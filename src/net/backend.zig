@@ -43,9 +43,13 @@ pub const Socket = struct {
         return bindWithBuffers(io, address, maximum_datagram_size, .{});
     }
     pub fn bindWithBuffers(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize, buffers: BufferOptions) !Socket {
+        return bindWithOptions(io, address, maximum_datagram_size, buffers, false);
+    }
+    pub fn bindWithOptions(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize, buffers: BufferOptions, reuse_port: bool) !Socket {
         if (maximum_datagram_size == 0 or maximum_datagram_size > 65_507) return error.InvalidConfiguration;
         try buffers.validate();
-        var value = try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        if (reuse_port and builtin.os.tag != .linux) return error.ReusePortUnsupported;
+        var value = if (builtin.os.tag == .linux and reuse_port) try bindReusePort(address) else try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
         errdefer value.close(io);
         return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(value.handle, buffers) };
     }
@@ -118,6 +122,38 @@ pub const Socket = struct {
     }
 };
 
+fn bindReusePort(address: std.Io.net.IpAddress) !std.Io.net.Socket {
+    const linux = std.os.linux;
+    const family: u32 = switch (address) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const created = linux.socket(family, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, linux.IPPROTO.UDP);
+    if (linux.errno(created) != .SUCCESS) return error.SocketCreateFailed;
+    const fd: std.Io.net.Socket.Handle = @intCast(created);
+    errdefer _ = linux.close(fd);
+    var enabled: c_int = 1;
+    try std.posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, std.mem.asBytes(&enabled));
+    var bound = address;
+    switch (address) {
+        .ip4 => |value| {
+            var raw: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, value.port), .addr = @bitCast(value.bytes) };
+            if (linux.errno(linux.bind(fd, @ptrCast(&raw), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.AddressUnavailable;
+            var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+            if (linux.errno(linux.getsockname(fd, @ptrCast(&raw), &len)) != .SUCCESS) return error.AddressUnavailable;
+            bound.ip4.port = std.mem.bigToNative(u16, raw.port);
+        },
+        .ip6 => |value| {
+            var raw: linux.sockaddr.in6 = .{ .port = std.mem.nativeToBig(u16, value.port), .flowinfo = value.flow, .addr = value.bytes, .scope_id = value.interface.index };
+            if (linux.errno(linux.bind(fd, @ptrCast(&raw), @sizeOf(linux.sockaddr.in6))) != .SUCCESS) return error.AddressUnavailable;
+            var len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+            if (linux.errno(linux.getsockname(fd, @ptrCast(&raw), &len)) != .SUCCESS) return error.AddressUnavailable;
+            bound.ip6.port = std.mem.bigToNative(u16, raw.port);
+        },
+    }
+    return .{ .handle = fd, .address = bound };
+}
+
 fn configureBuffers(handle: std.Io.net.Socket.Handle, options: BufferOptions) !BufferSizes {
     if (builtin.os.tag != .linux) return .{ .receive_bytes = null, .send_bytes = null };
     if (options.receive_bytes) |value| try setLinuxBuffer(handle, std.os.linux.SO.RCVBUF, value);
@@ -158,6 +194,21 @@ test "batched backend receives available loopback datagrams without filling batc
     const result = try server.receiveMany(&messages, &data, .none);
     try std.testing.expect(result.messages.len >= 1);
     try std.testing.expectEqualStrings("hello", result.messages[0].data);
+}
+
+test "listeners can share a port with reuse_port" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    if (builtin.os.tag != .linux) {
+        try std.testing.expectError(error.ReusePortUnsupported, Socket.bindWithOptions(io, address, 64, .{}, true));
+        return;
+    }
+    var first = try Socket.bindWithOptions(io, address, 64, .{}, true);
+    defer first.close();
+    var second = try Socket.bindWithOptions(io, first.value.address, 64, .{}, true);
+    defer second.close();
+    try std.testing.expectEqual(first.value.address.ip4.port, second.value.address.ip4.port);
+    try std.testing.expectError(error.AddressInUse, Socket.bind(io, first.value.address, 64));
 }
 
 test "socket buffer options are bounded" {

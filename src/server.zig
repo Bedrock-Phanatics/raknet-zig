@@ -29,6 +29,7 @@ pub const Options = struct {
     advertisement: []const u8,
     receive_batch_size: usize = 32,
     socket_buffers: backend.BufferOptions = .{},
+    reuse_port: bool = false,
     offline_rate_per_second: u32 = 20,
     offline_burst: u32 = 40,
     global_offline_rate_per_second: u32 = 20_000,
@@ -432,7 +433,7 @@ pub const Listener = struct {
         try validateOptions(options);
         const self = try allocator.create(Listener);
         errdefer allocator.destroy(self);
-        var socket = try backend.Socket.bindWithBuffers(io, address, options.config.protocol.maximum_datagram_size, options.socket_buffers);
+        var socket = try backend.Socket.bindWithOptions(io, address, options.config.protocol.maximum_datagram_size, options.socket_buffers, options.reuse_port);
         errdefer socket.close();
         const advertisement = try allocator.alloc(u8, options.config.protocol.maximum_datagram_size - 35);
         errdefer allocator.free(advertisement);

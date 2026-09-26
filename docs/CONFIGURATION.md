@@ -73,6 +73,6 @@ All timing values use monotonic milliseconds.
 | `maximum_ack_records` | 256 records | Session | Policy | Allocates ACK scratch once; extra ranges are split across datagrams. |
 | `maximum_packets_per_iteration` | 256 work units | Event-loop turn | Policy | Defers remaining packets and timers to the next turn. |
 
-Endpoint options such as `receive_batch_size`, handshake limits, socket buffers,
+Endpoint options such as `receive_batch_size`, handshake limits, socket buffers, `reuse_port`,
 rate limits, and the listener memory quota remain in `ServerOptions` or
 `ClientOptions` because they do not alter RakNet session semantics.

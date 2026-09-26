@@ -4,7 +4,7 @@ const raknet = @import("raknet");
 
 const usage =
     \\usage:
-    \\  raknet-interop server <ip:port> <seconds>
+    \\  raknet-interop server <ip:port> <seconds> [listeners]
     \\  raknet-interop client <ip:port> <connections> <payload> <seconds> <warmup_ms>
     \\
 ;
@@ -14,8 +14,9 @@ pub fn main(init: std.process.Init) !void {
     var threaded: std.Io.Threaded = .init(std.heap.smp_allocator, .{ .async_limit = .unlimited });
     defer threaded.deinit();
     const io = threaded.io();
-    if (args.len == 4 and std.mem.eql(u8, args[1], "server")) {
-        return server(io, try std.Io.net.IpAddress.parseLiteral(args[2]), try std.fmt.parseInt(u32, args[3], 10));
+    if ((args.len == 4 or args.len == 5) and std.mem.eql(u8, args[1], "server")) {
+        const listeners = if (args.len == 5) try std.fmt.parseInt(usize, args[4], 10) else 1;
+        return server(io, try std.Io.net.IpAddress.parseLiteral(args[2]), try std.fmt.parseInt(u32, args[3], 10), listeners);
     }
     if (args.len == 7 and std.mem.eql(u8, args[1], "client")) {
         return client(io, .{
@@ -86,34 +87,73 @@ const Server = struct {
     }
 };
 
-fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32) !void {
-    const baseline = Process.sample();
-    var listener = try raknet.Server.listen(std.heap.smp_allocator, io, address, .{ .advertisement = "MCPE;raknet-zig interop;11;1.21;0;1000;0;interop;Survival;1;19132;19133;" });
-    defer listener.destroy();
-    var state: Server = .{};
-    const deadline = nowNs(io) + @as(u64, seconds) * std.time.ns_per_s;
-    var peak_sessions: usize = 0;
-    var next_progress = nowNs(io) + progress_interval_ns;
-    while (nowNs(io) < deadline) {
-        _ = listener.poll(wait(50), .{ .context = &state, .connected = Server.onConnect, .message = Server.onMessage }) catch |err| std.debug.print("poll error: {s}\n", .{@errorName(err)});
-        peak_sessions = @max(peak_sessions, listener.sessions.count());
-        if (seconds >= 60 and nowNs(io) >= next_progress) {
-            next_progress += progress_interval_ns;
-            const progress = Process.sample();
-            const live = listener.statistics();
-            std.debug.print("progress impl=zig role=server sessions={d} echoed={d} recovery_bytes={d} session_memory_bytes={d} cpu_ms={d} rss_kb={d}\n", .{ live.active_sessions, state.echoed, live.recovery_bytes, live.session_memory_bytes, progress.cpu_ms - baseline.cpu_ms, progress.rss_kb });
+const Shard = struct {
+    listener: *raknet.Server,
+    state: Server = .{},
+    peak_sessions: usize = 0,
+
+    fn run(self: *Shard, io: std.Io, deadline: u64, report: bool, baseline: Process) void {
+        var next_progress = nowNs(io) + progress_interval_ns;
+        while (nowNs(io) < deadline) {
+            _ = self.listener.poll(wait(50), .{ .context = &self.state, .connected = Server.onConnect, .message = Server.onMessage }) catch |err| std.debug.print("poll error: {s}\n", .{@errorName(err)});
+            self.peak_sessions = @max(self.peak_sessions, self.listener.sessions.count());
+            if (report and nowNs(io) >= next_progress) {
+                next_progress += progress_interval_ns;
+                const progress = Process.sample();
+                const live = self.listener.statistics();
+                std.debug.print("progress impl=zig role=server sessions={d} echoed={d} recovery_bytes={d} session_memory_bytes={d} cpu_ms={d} rss_kb={d}\n", .{ live.active_sessions, self.state.echoed, live.recovery_bytes, live.session_memory_bytes, progress.cpu_ms - baseline.cpu_ms, progress.rss_kb });
+            }
         }
     }
-    const stats = listener.statistics();
+};
+
+fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32, listeners: usize) !void {
+    const allocator = std.heap.smp_allocator;
+    const baseline = Process.sample();
+    const shards = try allocator.alloc(Shard, @max(listeners, 1));
+    defer allocator.free(shards);
+    var opened: usize = 0;
+    defer for (shards[0..opened]) |shard| shard.listener.destroy();
+    for (shards) |*shard| {
+        shard.* = .{ .listener = try raknet.Server.listen(allocator, io, address, .{
+            .advertisement = "MCPE;raknet-zig interop;11;1.21;0;1000;0;interop;Survival;1;19132;19133;",
+            .server_guid = 0x7a69_6e74_6572_6f70,
+            .reuse_port = shards.len > 1,
+        }) };
+        opened += 1;
+    }
+    const deadline = nowNs(io) + @as(u64, seconds) * std.time.ns_per_s;
+    const futures = try allocator.alloc(std.Io.Future(void), shards.len - 1);
+    defer allocator.free(futures);
+    for (futures, shards[1..]) |*future, *shard| future.* = try io.concurrent(Shard.run, .{ shard, io, deadline, false, baseline });
+    shards[0].run(io, deadline, seconds >= 60, baseline);
+    for (futures) |*future| future.await(io);
+
+    var total: Server = .{};
+    var peak_sessions: usize = 0;
+    var retransmits: u64 = 0;
+    var malformed: u64 = 0;
+    var rejected: u64 = 0;
+    for (shards) |*shard| {
+        const stats = shard.listener.statistics();
+        total.connected += shard.state.connected;
+        total.echoed += shard.state.echoed;
+        total.dropped += shard.state.dropped;
+        peak_sessions += shard.peak_sessions;
+        retransmits += stats.retransmitted_datagrams;
+        malformed += stats.malformed_datagrams;
+        rejected += stats.handshakes_rejected;
+    }
     const process = Process.sample();
-    std.debug.print("server impl=zig sessions={d} connected={d} echoed={d} dropped={d} retransmits={d} malformed={d} rejected={d} cpu_ms={d} rss_kb={d} peak_rss_kb={d} baseline_rss_kb={d}\n", .{
+    std.debug.print("server impl=zig listeners={d} sessions={d} connected={d} echoed={d} dropped={d} retransmits={d} malformed={d} rejected={d} cpu_ms={d} rss_kb={d} peak_rss_kb={d} baseline_rss_kb={d}\n", .{
+        shards.len,
         peak_sessions,
-        state.connected,
-        state.echoed,
-        state.dropped,
-        stats.retransmitted_datagrams,
-        stats.malformed_datagrams,
-        stats.handshakes_rejected,
+        total.connected,
+        total.echoed,
+        total.dropped,
+        retransmits,
+        malformed,
+        rejected,
         process.cpu_ms - baseline.cpu_ms,
         process.rss_kb,
         process.peak_rss_kb,
