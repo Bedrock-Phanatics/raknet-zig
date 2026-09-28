@@ -202,36 +202,41 @@ pub const Socket = struct {
         };
     }
 
-    /// Peeks without consuming, safe to run beside the owner until close()
     pub fn waitReadable(self: *const Socket, timeout: std.Io.Timeout) !void {
-        if (builtin.os.tag == .windows) {
-            // std.Io can't wait on Windows datagrams and Batch.cancel hangs in 0.16, so poll AFD directly
-            const windows = std.os.windows;
-            const PollHandle = extern struct { handle: windows.HANDLE, events: windows.ULONG, status: windows.NTSTATUS };
-            const PollInfo = extern struct { timeout: windows.LARGE_INTEGER, count: windows.ULONG, exclusive: windows.ULONG, handles: [1]PollHandle };
-            // RECEIVE | DISCONNECT | ABORT | LOCAL_CLOSE
-            const events: windows.ULONG = 0x0001 | 0x0008 | 0x0010 | 0x0020;
-            var info: PollInfo = .{
-                .timeout = afdTimeout(self.io, timeout),
-                .count = 1,
-                .exclusive = 0,
-                .handles = .{.{ .handle = self.value.handle, .events = events, .status = .SUCCESS }},
-            };
-            const result = try self.io.operate(.{ .device_io_control = .{
-                .file = .{ .handle = self.value.handle, .flags = .{ .nonblocking = true } },
-                .code = windows.IOCTL.AFD.POLL,
-                .in = std.mem.asBytes(&info),
-                .out = std.mem.asBytes(&info),
-            } });
-            const status = result.device_io_control.u.Status;
-            if (status == .TIMEOUT or (status == .SUCCESS and info.count == 0)) return error.Timeout;
-            if (status != .SUCCESS) return windows.unexpectedStatus(status);
-            return;
-        }
         var message: [1]std.Io.net.IncomingMessage = .{.init};
         var byte: [1]u8 = undefined;
         const failure, _ = self.value.receiveManyTimeout(self.io, &message, &byte, .{ .peek = true }, timeout);
-        if (failure) |err| return err;
+        const err = failure orelse return;
+        switch (err) {
+            // Windows fails a peek into a short buffer instead of truncating
+            error.MessageOversize => {},
+            error.ConcurrencyUnavailable => if (builtin.os.tag == .windows) return self.pollAfd(timeout) else return err,
+            else => return err,
+        }
+    }
+
+    // Threaded can't wait on Windows datagrams and 0.16's Batch.cancel hangs
+    fn pollAfd(self: *const Socket, timeout: std.Io.Timeout) !void {
+        const windows = std.os.windows;
+        const PollHandle = extern struct { handle: windows.HANDLE, events: windows.ULONG, status: windows.NTSTATUS };
+        const PollInfo = extern struct { timeout: windows.LARGE_INTEGER, count: windows.ULONG, exclusive: windows.ULONG, handles: [1]PollHandle };
+        // RECEIVE | DISCONNECT | ABORT | LOCAL_CLOSE
+        const events: windows.ULONG = 0x0001 | 0x0008 | 0x0010 | 0x0020;
+        var info: PollInfo = .{
+            .timeout = afdTimeout(self.io, timeout),
+            .count = 1,
+            .exclusive = 0,
+            .handles = .{.{ .handle = self.value.handle, .events = events, .status = .SUCCESS }},
+        };
+        const result = try self.io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = self.value.handle, .flags = .{ .nonblocking = true } },
+            .code = windows.IOCTL.AFD.POLL,
+            .in = std.mem.asBytes(&info),
+            .out = std.mem.asBytes(&info),
+        } });
+        const status = result.device_io_control.u.Status;
+        if (status == .TIMEOUT or (status == .SUCCESS and info.count == 0)) return error.Timeout;
+        if (status != .SUCCESS) return windows.unexpectedStatus(status);
     }
 
     // Windows reports ICMP unreachable from an earlier send on a later receive
@@ -241,7 +246,6 @@ pub const Socket = struct {
         return true;
     }
 
-    // So retries don't restart a relative timeout
     fn resetSafeTimeout(self: *const Socket, timeout: std.Io.Timeout) std.Io.Timeout {
         return if (builtin.os.tag == .windows) time.earliest(self.io, timeout, .none) else timeout;
     }
