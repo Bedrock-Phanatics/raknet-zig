@@ -155,6 +155,8 @@ pub const Session = struct {
     ack_deadline_ms: ?u64 = null,
     outbound_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
+    scheduling_deferred: bool = false,
+    scheduling_dirty: bool = false,
     deadlines: *deadline_queue.Queue,
     client_guid: u64,
     mtu: u16,
@@ -335,6 +337,10 @@ pub const Session = struct {
         return sent;
     }
     fn schedule(self: *Session) !void {
+        if (self.scheduling_deferred) {
+            self.scheduling_dirty = true;
+            return;
+        }
         var deadline = time.deadline(self.last_seen_ms, self.idle_timeout_ms);
         if (self.state == .connecting) deadline = @min(deadline, self.handshake_deadline_ms);
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
@@ -430,6 +436,10 @@ pub const Listener = struct {
     closed: bool = false,
     handshake_timeout_ms: u32,
     ack_capacity: usize,
+    timer_visits: u64 = 0,
+    timer_lateness_ms: u64 = 0,
+    maximum_timer_lateness_ms: u64 = 0,
+    deferred_receive_packets: u64 = 0,
 
     pub fn listen(allocator: std.mem.Allocator, io: std.Io, address: std.Io.net.IpAddress, options: Options) !*Listener {
         try validateOptions(options);
@@ -680,6 +690,7 @@ pub const Listener = struct {
             self.pending_message_index = 0;
             self.pending_message_count = 0;
         }
+        self.deferred_receive_packets += self.pending_message_count - self.pending_message_index;
         self.processTimersInto(now_ms, callbacks, &stats, remaining);
         if (remaining == 0) if (self.nextDeadline()) |deadline| {
             self.timer_turn = deadline <= now_ms;
@@ -719,6 +730,18 @@ pub const Listener = struct {
             }
             return;
         }
+        session.scheduling_deferred = true;
+        var removed = false;
+        defer if (!removed) {
+            session.scheduling_deferred = false;
+            const dirty = session.scheduling_dirty;
+            session.scheduling_dirty = false;
+            if (dirty) session.schedule() catch {
+                recordSessionFailure(stats, .internal);
+                session.state = .closed;
+                self.removeSession(key, callbacks);
+            };
+        };
         var bridge: DeliveryBridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
         const processed_incoming = session.core.processIncomingCountedWithScratch(message.data, now_ms, self.frame_scratch, &bridge, DeliveryBridge.deliver) catch |err| {
             remaining.* = 0;
@@ -730,10 +753,12 @@ pub const Listener = struct {
 
             recordSessionFailure(stats, failure.class);
             session.state = .closed;
+            removed = true;
             self.removeSession(key, callbacks);
             return;
         };
         session.last_seen_ms = now_ms;
+        session.scheduling_dirty = true;
         if (bridge.connected) self.handshakes_completed += 1;
         const incoming = processed_incoming.incoming;
         const extra_work = processed_incoming.work_units -| 1;
@@ -743,6 +768,7 @@ pub const Listener = struct {
                 const failure = core_mod.classifyTransitionError(.receipt, err);
                 recordSessionFailure(stats, failure.class);
                 session.state = .closed;
+                removed = true;
                 self.removeSession(key, callbacks);
                 return;
             };
@@ -751,6 +777,7 @@ pub const Listener = struct {
             const flushed = session.flushQueuedAtLimit(now_ms, remaining.*) catch |err| {
                 recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
                 session.state = .closed;
+                removed = true;
                 self.removeSession(key, callbacks);
                 return;
             };
@@ -758,6 +785,7 @@ pub const Listener = struct {
             session.advanceClose(now_ms) catch |err| {
                 recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
                 session.state = .closed;
+                removed = true;
                 self.removeSession(key, callbacks);
                 return;
             };
@@ -766,13 +794,8 @@ pub const Listener = struct {
             session.flushReceipts() catch |err| {
                 recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
             };
+            removed = true;
             self.removeSession(key, callbacks);
-        } else {
-            session.schedule() catch {
-                recordSessionFailure(stats, .internal);
-                session.state = .closed;
-                self.removeSession(key, callbacks);
-            };
         }
     }
 
@@ -781,6 +804,10 @@ pub const Listener = struct {
         var due_count: usize = 0;
         while (due_count < @min(self.timer_entries.len, maximum_work)) : (due_count += 1) {
             const entry = self.deadlines.popDue(now_ms) orelse break;
+            self.timer_visits += 1;
+            const lateness = now_ms - entry.deadline_ms;
+            self.timer_lateness_ms +|= lateness;
+            self.maximum_timer_lateness_ms = @max(self.maximum_timer_lateness_ms, lateness);
             self.timer_entries[due_count] = entry;
         }
         var remaining = maximum_work;
@@ -804,6 +831,7 @@ pub const Listener = struct {
             }
             const sessions_left = due_count - index;
             const quota = @max(@as(usize, 1), remaining / sessions_left);
+            session.scheduling_deferred = true;
             const used = session.processDueTimers(now_ms, quota) catch |err| {
                 recordSessionFailure(stats, core_mod.classifyTransitionError(.retransmission, err).class);
                 session.state = .closed;
@@ -819,6 +847,8 @@ pub const Listener = struct {
                 self.removeSession(entry.key, callbacks);
                 continue;
             }
+            session.scheduling_deferred = false;
+            session.scheduling_dirty = false;
             session.schedule() catch {
                 recordSessionFailure(stats, .internal);
                 session.state = .closed;
@@ -1232,6 +1262,41 @@ test "ACK delay schedules while NACK remains urgent" {
     try std.testing.expectEqual(@as(?u64, 105), session.ack_deadline_ms);
     try session.queueReceipt(.{ .missing = .{ .first = 2, .last = 2, .count = 1 } }, 102);
     try std.testing.expectEqual(@as(?u64, 102), session.ack_deadline_ms);
+}
+
+test "incoming callback sends and receipts update the global deadline once" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "test" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    const session = try CloseHarness.open(listener, &peer);
+    const Echo = struct {
+        fn connected(_: *anyopaque, _: *Session) !void {}
+        fn message(_: *anyopaque, target: *Session, payload: receiver.BorrowedPayload) error{ApplicationFailure}!void {
+            _ = target.queueSend(payload.bytes, .reliable_ordered, 0) catch return error.ApplicationFailure;
+        }
+        fn emit(raw: *anyopaque, _: u32, _: bool, wire: []const u8) transmitter_mod.EmitError!void {
+            const bytes: *std.ArrayList(u8) = @ptrCast(@alignCast(raw));
+            bytes.appendSlice(std.testing.allocator, wire) catch return error.OutOfMemory;
+        }
+    };
+    var transmitter = try transmitter_mod.Transmitter.init(576, .{});
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    var scratch: [576]u8 = undefined;
+    _ = try transmitter.send("\xfetest", .reliable_ordered, 0, &scratch, &wire, Echo.emit);
+    var unused: u8 = 0;
+    var stats: PollStats = .{};
+    var remaining: usize = 256;
+    const before = listener.deadlines.diagnostics.upserts;
+    try listener.processExisting(session, session.key, .{ .from = peer.value.address, .data = wire.items, .control = &.{}, .flags = @bitCast(@as(u8, 0)) }, time.nowMilliseconds(io), .{ .context = &unused, .connected = Echo.connected, .message = Echo.message }, &stats, &remaining);
+    try std.testing.expectEqual(before + 1, listener.deadlines.diagnostics.upserts);
+    try std.testing.expect(!session.scheduling_deferred);
+    try std.testing.expect(!session.scheduling_dirty);
+    try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
+    try std.testing.expectEqual(@as(usize, 1), session.receipts.count());
 }
 
 test "every due session timer runs when several are due together" {

@@ -36,6 +36,7 @@ const Slot = struct {
 pub const Queue = struct {
     allocator: std.mem.Allocator,
     slots: []Slot,
+    maximum_messages: usize,
     maximum_bytes: usize,
     reserved_control_messages: usize,
     reserved_control_bytes: usize,
@@ -58,17 +59,14 @@ pub const Queue = struct {
         if (maximum_messages == 0 or maximum_messages >= none or maximum_bytes == 0) return error.InvalidConfiguration;
         if (reserved_control_messages == 0 or reserved_control_messages >= maximum_messages) return error.InvalidConfiguration;
         if (reserved_control_bytes == 0 or reserved_control_bytes >= maximum_bytes) return error.InvalidConfiguration;
-        const slots = try allocator.alloc(Slot, maximum_messages);
-        for (slots, 0..) |*slot, index| {
-            slot.* = .{ .next = if (index + 1 < slots.len) @intCast(index + 1) else none };
-        }
         return .{
             .allocator = allocator,
-            .slots = slots,
+            .slots = &.{},
+            .maximum_messages = maximum_messages,
             .maximum_bytes = maximum_bytes,
             .reserved_control_messages = reserved_control_messages,
             .reserved_control_bytes = reserved_control_bytes,
-            .free_head = 0,
+            .free_head = none,
         };
     }
 
@@ -82,16 +80,25 @@ pub const Queue = struct {
         if (payload.len == 0) return error.EmptyPayload;
         if (self.next_id == std.math.maxInt(Id)) return error.OutboundQueueIdExhausted;
         if (payload.len > self.maximum_bytes -| self.total_bytes) return error.OutboundQueueBytesExceeded;
-        if (self.free_head == none) return error.OutboundQueueFull;
+        if (self.countAll() == self.maximum_messages) return error.OutboundQueueFull;
         if (lane == .application) {
             const control_index = @intFromEnum(Lane.control);
             const reserved_messages = self.reserved_control_messages -| self.counts[control_index];
-            if (self.slots.len - self.countAll() <= reserved_messages) return error.OutboundQueueFull;
+            if (self.maximum_messages - self.countAll() <= reserved_messages) return error.OutboundQueueFull;
             const reserved_bytes = self.reserved_control_bytes -| self.bytes[control_index];
             const available_bytes = (self.maximum_bytes -| self.total_bytes) -| reserved_bytes;
             if (payload.len > available_bytes) return error.OutboundQueueBytesExceeded;
         }
 
+        if (self.free_head == none) {
+            const old_len = self.slots.len;
+            const capacity = @min(self.maximum_messages, @max(8, old_len *| 2));
+            self.slots = try self.allocator.realloc(self.slots, capacity);
+            for (self.slots[old_len..], old_len..) |*slot, index| {
+                slot.* = .{ .next = if (index + 1 < capacity) @intCast(index + 1) else none };
+            }
+            self.free_head = @intCast(old_len);
+        }
         const owned = try payload_mod.BorrowedPayload.init(payload).toOwned(self.allocator);
         const index = self.free_head;
         const id = self.next_id;
@@ -134,6 +141,7 @@ pub const Queue = struct {
         return message;
     }
 
+    /// Invalidated by any queue mutation.
     pub fn peek(self: *const Queue, lane: Lane) ?*const Message {
         const index = self.heads[@intFromEnum(lane)];
         return if (index == none) null else &self.slots[index].message;
@@ -245,6 +253,27 @@ fn checkAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "queue handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllocationFailures, .{});
+}
+
+fn checkGrowthFailures(allocator: std.mem.Allocator) !void {
+    var queue = try Queue.init(allocator, 33, 128, 1, 1);
+    defer queue.deinit();
+    try std.testing.expectEqual(@as(usize, 0), queue.slots.len);
+    for (0..32) |_| _ = try queue.enqueue(.application, "x", .reliable_ordered, 0);
+    try std.testing.expectError(error.OutboundQueueFull, queue.enqueue(.application, "x", .reliable, 0));
+    _ = try queue.enqueue(.control, "c", .reliable, 0);
+    try std.testing.expectEqual(@as(usize, 33), queue.slots.len);
+    for (0..32) |_| {
+        const message = queue.pop(.application).?;
+        message.payload.deinit();
+    }
+    const message = queue.pop(.control).?;
+    message.payload.deinit();
+    try std.testing.expectEqual(@as(usize, 0), queue.total_bytes);
+}
+
+test "lazy queue grows across capacity boundaries and allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkGrowthFailures, .{});
 }
 
 test "application traffic cannot consume reserved control slots" {

@@ -4,6 +4,9 @@ pub const QuotaAllocator = struct {
     backing: std.mem.Allocator,
     maximum_bytes: usize,
     used_bytes: usize = 0,
+    peak_bytes: usize = 0,
+    allocations: u64 = 0,
+    frees: u64 = 0,
 
     pub fn init(backing: std.mem.Allocator, maximum_bytes: usize) QuotaAllocator {
         return .{ .backing = backing, .maximum_bytes = maximum_bytes };
@@ -27,10 +30,13 @@ pub const QuotaAllocator = struct {
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *QuotaAllocator = @ptrCast(@alignCast(raw));
         if (!self.reserve(len)) return null;
-        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+        const result = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
             self.release(len);
             return null;
         };
+        self.allocations += 1;
+        self.peak_bytes = @max(self.peak_bytes, self.used_bytes);
+        return result;
     }
 
     fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
@@ -42,6 +48,7 @@ pub const QuotaAllocator = struct {
             return false;
         }
         if (new_len < memory.len) self.release(memory.len - new_len);
+        self.peak_bytes = @max(self.peak_bytes, self.used_bytes);
         return true;
     }
 
@@ -54,12 +61,14 @@ pub const QuotaAllocator = struct {
             return null;
         };
         if (new_len < memory.len) self.release(memory.len - new_len);
+        self.peak_bytes = @max(self.peak_bytes, self.used_bytes);
         return result;
     }
 
     fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *QuotaAllocator = @ptrCast(@alignCast(raw));
         self.backing.rawFree(memory, alignment, ret_addr);
+        self.frees += 1;
         self.release(memory.len);
     }
 

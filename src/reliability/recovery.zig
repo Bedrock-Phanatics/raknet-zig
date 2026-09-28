@@ -72,23 +72,16 @@ pub const Recovery = struct {
             mtu > std.math.maxInt(u16)) return error.InvalidConfiguration;
         if (policy != .exact and (std.math.mul(usize, maximum_entries, mtu) catch return error.InvalidConfiguration) > maximum_bytes) return error.InvalidConfiguration;
         const slots = try allocator.alloc(Slot, maximum_entries);
-        errdefer allocator.free(slots);
-        const heap = try allocator.alloc(u32, maximum_entries);
-        errdefer allocator.free(heap);
-        const blocks = try allocator.alloc(Block, maximum_entries);
-        errdefer allocator.free(blocks);
         for (slots) |*slot| slot.* = .{};
-        for (blocks, 0..) |*block, index| block.* = .{ .next = if (index + 1 < blocks.len) @intCast(index + 1) else none };
         return .{
             .allocator = allocator,
             .slots = slots,
-            .heap = heap,
-            .blocks = blocks,
+            .heap = &.{},
+            .blocks = &.{},
             .maximum_bytes = maximum_bytes,
             .maximum_transmissions = maximum_transmissions,
             .mtu = @intCast(mtu),
             .storage_policy = policy,
-            .unused_head = 0,
         };
     }
 
@@ -108,6 +101,9 @@ pub const Recovery = struct {
         if (slot.occupied) return if (slot.sequence == sequence) error.InvalidDatagram else error.RecoveryFull;
         if (self.count_value == self.slots.len) return error.RecoveryFull;
         if (data.len > self.maximum_bytes -| self.total_bytes) return error.RecoveryBytesExceeded;
+        if (self.heap_len == self.heap.len) {
+            self.heap = try self.allocator.realloc(self.heap, @min(self.slots.len, @max(8, self.heap.len *| 2)));
+        }
         const block_index = try self.acquireBlock(data.len);
         errdefer self.releaseBlock(block_index);
         @memcpy(self.blocks[block_index].data[0..data.len], data);
@@ -317,6 +313,15 @@ pub const Recovery = struct {
     fn acquireBlock(self: *Recovery, len: usize) !u32 {
         const desired = self.desiredCapacity(len);
         if (self.takeFree(desired.class, desired.capacity)) |index| return index;
+        if (self.unused_head == none and self.blocks.len < self.slots.len) {
+            const old_len = self.blocks.len;
+            const capacity = @min(self.slots.len, @max(8, old_len *| 2));
+            self.blocks = try self.allocator.realloc(self.blocks, capacity);
+            for (self.blocks[old_len..], old_len..) |*block, index| {
+                block.* = .{ .next = if (index + 1 < capacity) @intCast(index + 1) else none };
+            }
+            self.unused_head = @intCast(old_len);
+        }
         var index = self.popUnused();
         while (self.retained_bytes > self.maximum_bytes -| desired.capacity) {
             const evicted = self.evictFree() orelse return error.RecoveryBytesExceeded;
@@ -614,6 +619,30 @@ test "wire buffers are lazy, bounded, and reused" {
     try recovery.track(2, "again", 5, 0, 10);
     try std.testing.expectEqual(@as(usize, 1), recovery.allocatedBlockCount());
     try std.testing.expectEqual(retained, recovery.retainedCapacity());
+}
+
+fn checkMetadataGrowth(allocator: std.mem.Allocator) !void {
+    var recovery = try Recovery.init(allocator, 65, 65 * 576, 8, 576);
+    defer recovery.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recovery.heap.len);
+    try std.testing.expectEqual(@as(usize, 0), recovery.blocks.len);
+    for (0..17) |sequence| try recovery.track(@intCast(sequence), "\x84\x00\x00\x00x", 5, 0, 50);
+    var next: u32 = 17;
+    var due: [1]Due = undefined;
+    _ = recovery.collectDueResequenced(50, 50, &due, 1, &next);
+    try std.testing.expectEqual(@as(u32, 17), due[0].sequence);
+    for (18..41) |sequence| try recovery.track(@intCast(sequence), "\x84\x00\x00\x00x", 5, 50, 50);
+    try std.testing.expectEqual(@as(usize, 40), recovery.count());
+    try std.testing.expect(recovery.heap.len >= 40 and recovery.heap.len <= 65);
+    try std.testing.expect(recovery.blocks.len >= 40 and recovery.blocks.len <= 65);
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 0, .last = 0 }}, 60, 65)).packets);
+    try std.testing.expectEqual(@as(usize, 39), (try recovery.acknowledge(&.{.{ .first = 1, .last = 40 }}, 60, 65)).packets);
+    try std.testing.expectEqual(@as(usize, 0), recovery.count());
+    try std.testing.expectEqual(@as(?u64, null), recovery.nextDeadline());
+}
+
+test "recovery metadata grows without moving sequence slots or losing old ACK aliases" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkMetadataGrowth, .{});
 }
 
 test "duplicate NACKs are idempotent" {

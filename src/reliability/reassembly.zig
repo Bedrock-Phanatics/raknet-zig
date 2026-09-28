@@ -70,15 +70,22 @@ pub const Reassembler = struct {
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) !Reassembler {
         try limits.validate();
-        const assemblies = try allocator.alloc(Assembly, limits.maximum_concurrent);
+        return .{ .allocator = allocator, .limits = limits, .assemblies = &.{}, .fragment_blocks = &.{}, .heap = &.{} };
+    }
+
+    fn ensureMetadata(self: *Reassembler) !void {
+        if (self.assemblies.len != 0) return;
+        const allocator = self.allocator;
+        const assemblies = try allocator.alloc(Assembly, self.limits.maximum_concurrent);
         @memset(assemblies, .{});
         errdefer allocator.free(assemblies);
-        const fragment_blocks = try allocator.alloc([]Fragment, limits.maximum_concurrent);
+        const fragment_blocks = try allocator.alloc([]Fragment, self.limits.maximum_concurrent);
         @memset(fragment_blocks, &.{});
         errdefer allocator.free(fragment_blocks);
-        const heap = try allocator.alloc(u32, limits.maximum_concurrent);
-        errdefer allocator.free(heap);
-        return .{ .allocator = allocator, .limits = limits, .assemblies = assemblies, .fragment_blocks = fragment_blocks, .heap = heap };
+        const heap = try allocator.alloc(u32, self.limits.maximum_concurrent);
+        self.assemblies = assemblies;
+        self.fragment_blocks = fragment_blocks;
+        self.heap = heap;
     }
 
     pub fn deinit(self: *Reassembler) void {
@@ -129,9 +136,10 @@ pub const Reassembler = struct {
         if (slot != null and self.assemblies[slot.?].count != count_value) return null;
         var created = false;
         if (slot == null) {
-            if (self.assembly_count == self.assemblies.len) return error.TooManyAssemblies;
+            if (self.assembly_count == self.limits.maximum_concurrent) return error.TooManyAssemblies;
             if (count_value > self.limits.maximum_total_parts - self.total_parts) return error.SplitBudgetExceeded;
             if (payload.len > self.limits.maximum_total_bytes - self.total_bytes) return error.SplitBudgetExceeded;
+            try self.ensureMetadata();
             slot = self.freeSlot() orelse return error.InternalInvariant;
             try self.ensureFragmentBlock(slot.?, count_value);
             const deadline_ms = time.deadline(now_ms, self.limits.timeout_ms);
@@ -514,6 +522,9 @@ test "split limits reject before payload allocation" {
     defer value.deinit();
     try std.testing.expectError(error.InvalidSplit, value.push(1, 1, 0, "x", 0));
     try std.testing.expectError(error.InvalidSplit, value.push(1, 5, 0, "x", 0));
+    try std.testing.expectEqual(@as(usize, 0), value.assemblies.len);
+    try std.testing.expectEqual(@as(usize, 0), value.fragment_blocks.len);
+    try std.testing.expectEqual(@as(usize, 0), value.heap.len);
     try std.testing.expect((try value.push(1, 2, 0, "12345678", 0)) == null);
     try std.testing.expectError(error.TooManyAssemblies, value.push(2, 2, 0, "x", 0));
     try std.testing.expectError(error.ReassemblyLimitExceeded, value.push(1, 2, 1, "x", 0));

@@ -24,16 +24,16 @@ The default datagram gap allows recovery across sixteen default receive windows 
 
 | Field | Default | Behavior |
 | --- | ---: | --- |
-| `maximum_retransmissions` | 1,024 packets | Preallocates recovery metadata and bounds unacknowledged reliable datagrams. Further sends wait for ACKs. |
+| `maximum_retransmissions` | 1,024 packets | Preallocates sequence slots; recovery heap and buffer descriptors grow on demand to this bound. Further sends wait for ACKs. |
 | `maximum_recovery_bytes` | 16 MiB | Independently caps retained wire data. Excess sends fail. |
 | `maximum_ordered_packets` | 4,096 packets | Ordered metadata grows lazily up to this limit. Excess packets close the session. |
 | `maximum_ordered_bytes` | 16 MiB | Caps buffered out-of-order payload. Excess closes the session. |
-| `maximum_concurrent_splits` | 64 | Preallocates assembly slots. A new assembly beyond it is left unacknowledged for retry. |
+| `maximum_concurrent_splits` | 64 | Allocates assembly metadata on the first valid split. A new assembly beyond the bound is left unacknowledged for retry. |
 | `maximum_split_bytes_per_connection` | 16 MiB | Caps all incomplete fragment payloads. Excess fragments are left unacknowledged for retry. |
 | `maximum_split_parts_per_connection` | 16,384 | Caps fragment metadata across assemblies. Excess assemblies are left unacknowledged for retry. |
-| `maximum_queued_outbound_packets` | 256 packets | Preallocates queue slots. Excess application sends return backpressure. |
+| `maximum_queued_outbound_packets` | 256 packets | Queue metadata grows on demand to this bound. Excess application sends return backpressure. |
 | `maximum_queued_outbound_bytes` | 16 MiB | Caps queued owned payloads. Excess application sends return backpressure. |
-| `reserved_control_queue_packets` | 16 packets | Reserves existing queue slots for control traffic. |
+| `reserved_control_queue_packets` | 16 packets | Reserves queue capacity for control traffic, including before metadata is allocated. |
 | `reserved_control_queue_bytes` | 64 KiB | Reserves existing queue bytes for control traffic. |
 
 ## Listener limits
@@ -44,6 +44,8 @@ The default datagram gap allows recovery across sixteen default receive windows 
 | `maximum_connections` | 4,096 sessions | Sizes session/deadline tables. New clients receive a capacity response. |
 
 `ServerOptions.maximum_session_memory_bytes` caps session memory across the listener. Allocation failure rejects a new session or closes the affected session.
+
+The default is 512 MiB per listener. Lazy metadata lowers idle connection cost; it does not reserve every session's maximum recovery, split, ordered, and outbound budgets in advance. Active traffic can still exhaust the shared quota. Linux `reuse_port` shards have independent quotas and session tables; their budgets add together.
 
 ## Timing
 
@@ -66,3 +68,5 @@ All timing values use monotonic milliseconds.
 | `maximum_packets_per_iteration` | 256 work units | Defers remaining packets and timers to the next turn. |
 
 Receive batching, handshake options, socket buffers, `reuse_port`, and rate limits are configured through `ServerOptions` or `ClientOptions`.
+
+On Linux with `std.Io.Threaded`, queued UDP datagrams are drained with nonblocking `recvmmsg`; the provider handles waiting and cancellation when no datagram is ready. Other providers and Windows keep the portable receive path. Receive batch capacity is bounded to 256 and the default remains 32. A receive batch can span several bounded listener turns without losing its remaining datagrams.
