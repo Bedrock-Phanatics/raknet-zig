@@ -293,3 +293,80 @@ test "graceful client close delivers queued data before the disconnect" {
     try server_task.await(io);
     try std.testing.expectEqual(@as(usize, 3), harness.received_before_disconnect);
 }
+
+test "client readiness wakes on data and disconnect without polling" {
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var listener = try raknet.Server.listen(std.testing.allocator, io, try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"), .{ .advertisement = "MCPE;ready" });
+    defer listener.destroy();
+
+    const Harness = struct {
+        listener: *raknet.Server,
+        sessions: [2]*raknet.Session = undefined,
+        connected: std.atomic.Value(usize) = .init(0),
+        fn onConnect(raw: *anyopaque, session: *raknet.Session) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.sessions[self.connected.load(.monotonic)] = session;
+            _ = self.connected.fetchAdd(1, .release);
+        }
+        fn onMessage(_: *anyopaque, _: *raknet.Session, _: raknet.BorrowedPayload) !void {}
+        fn run(self: *@This(), target: usize) !void {
+            while (self.connected.load(.acquire) < target) {
+                _ = try self.listener.poll(.none, .{ .context = self, .connected = onConnect, .message = onMessage });
+            }
+        }
+    };
+    const Received = struct {
+        count: usize = 0,
+        fn message(raw: *anyopaque, payload: raknet.BorrowedPayload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.eql(u8, payload.bytes, "\xfewake")) self.count += 1;
+        }
+        fn drain(self: *@This(), client: *Client) !void {
+            while (!client.isClosed()) _ = client.poll(.{ .duration = .{ .raw = .zero, .clock = .awake } }, self, message) catch |err| switch (err) {
+                error.Timeout => return,
+                else => return err,
+            };
+        }
+    };
+    const Wait = struct {
+        fn run(client: *const Client, timeout: std.Io.Timeout) !void {
+            return client.waitReadable(timeout);
+        }
+    };
+
+    var harness: Harness = .{ .listener = listener };
+    var clients: [2]*Client = undefined;
+    for (&clients, 1..) |*client, target| {
+        var task = try io.concurrent(Harness.run, .{ &harness, target });
+        defer task.cancel(io) catch {};
+        client.* = try Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 });
+        try task.await(io);
+    }
+    defer for (clients) |client| client.destroy();
+    var received: [2]Received = .{ .{}, .{} };
+    for (clients, &received) |client, *state| try state.drain(client);
+
+    const long: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } };
+    try std.testing.expect(clients[0].pollTimeout(long).deadline.raw.nanoseconds <= std.Io.Clock.awake.now(io).nanoseconds + 10_000 * std.time.ns_per_ms);
+    for (0..20) |round| {
+        const target = round % 2;
+        var waiters: [2]std.Io.Future(@typeInfo(@TypeOf(Wait.run)).@"fn".return_type.?) = undefined;
+        for (clients, &waiters) |client, *waiter| waiter.* = try io.concurrent(Wait.run, .{ client, long });
+        try harness.sessions[target].send("\xfewake", .reliable_ordered, 0);
+        try waiters[target].await(io);
+        try std.testing.expectError(error.Canceled, waiters[1 - target].cancel(io));
+        try received[target].drain(clients[target]);
+        try std.testing.expectEqual(round / 2 + 1, received[target].count);
+    }
+
+    var waiters: [2]std.Io.Future(@typeInfo(@TypeOf(Wait.run)).@"fn".return_type.?) = undefined;
+    for (clients, &waiters) |client, *waiter| waiter.* = try io.concurrent(Wait.run, .{ client, .none });
+    listener.close();
+    for (clients, &waiters, &received) |client, *waiter, *state| {
+        try waiter.await(io);
+        try state.drain(client);
+        try std.testing.expect(client.isClosed());
+    }
+}

@@ -556,6 +556,7 @@ pub const Listener = struct {
         @memmove(self.advertisement[0..advertisement.len], advertisement);
         self.handshake_handler.advertisement = self.advertisement[0..advertisement.len];
     }
+    /// Cancel or await any pending waitReadable first
     pub fn close(self: *Listener) void {
         if (self.closed) return;
         var iterator = self.sessions.valueIterator();
@@ -587,6 +588,16 @@ pub const Listener = struct {
         return entry.deadline_ms;
     }
 
+    pub fn pollTimeout(self: *const Listener, limit: std.Io.Timeout) std.Io.Timeout {
+        const deadline = self.nextDeadline() orelse return limit;
+        return time.earliest(self.io, limit, time.atMilliseconds(deadline));
+    }
+
+    /// Safe to run beside the owner, pass pollTimeout() since timers aren't checked
+    pub fn waitReadable(self: *const Listener, timeout: std.Io.Timeout) !void {
+        return self.socket.waitReadable(timeout);
+    }
+
     pub fn processTimers(self: *Listener, now_ms: u64, callbacks: Callbacks) !PollStats {
         if (self.closed) return error.ConnectionClosed;
         self.socket.beginBatch(&self.send_batch);
@@ -609,8 +620,7 @@ pub const Listener = struct {
             return stats;
         }
         if (self.pending_message_index == self.pending_message_count) {
-            const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
-            const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
+            const batch = self.socket.receiveMany(self.messages, self.receive_storage, self.pollTimeout(timeout)) catch |err| switch (err) {
                 error.Timeout => {
                     self.processTimersInto(time.nowMilliseconds(self.io), callbacks, &stats, self.config.batching.maximum_packets_per_iteration);
                     return stats;

@@ -219,17 +219,18 @@ pub const Client = struct {
             },
         }
     }
+    // Kept open until destroy() so a pending waitReadable never sees a closed handle
     fn abort(self: *Client) void {
-        if (self.closed) return;
         self.closed = true;
-        self.socket.close();
     }
+    /// Cancel or await any pending waitReadable first
     pub fn destroy(self: *Client) void {
         if (!self.closed and !self.core.disconnect_queued) {
             var payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
             _ = self.sendControlWire(&payload, .reliable_ordered, 0, time.nowMilliseconds(self.io)) catch {};
         }
         self.abort();
+        self.socket.close();
         self.receipts.deinit();
         self.core.deinit();
         self.allocator.free(self.receive_storage);
@@ -296,6 +297,16 @@ pub const Client = struct {
         return deadline;
     }
 
+    pub fn pollTimeout(self: *const Client, limit: std.Io.Timeout) std.Io.Timeout {
+        const deadline = self.nextDeadline() orelse return limit;
+        return time.earliest(self.io, limit, time.atMilliseconds(deadline));
+    }
+
+    /// Safe to run beside the owner, pass pollTimeout() since timers aren't checked
+    pub fn waitReadable(self: *const Client, timeout: std.Io.Timeout) !void {
+        return self.socket.waitReadable(timeout);
+    }
+
     pub fn processTimers(self: *Client, now_ms: u64) !void {
         if (self.closed) return error.ConnectionClosed;
         if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms))) {
@@ -324,8 +335,7 @@ pub const Client = struct {
             return err;
         }
         if (self.pending_message_index == self.pending_message_count) {
-            const wait = if (self.nextDeadline()) |deadline| time.earliest(self.io, timeout, time.atMilliseconds(deadline)) else timeout;
-            const batch = self.socket.receiveMany(self.messages, self.receive_storage, wait) catch |err| switch (err) {
+            const batch = self.socket.receiveMany(self.messages, self.receive_storage, self.pollTimeout(timeout)) catch |err| switch (err) {
                 error.Timeout => {
                     try self.processTimers(time.nowMilliseconds(self.io));
                     return error.Timeout;
