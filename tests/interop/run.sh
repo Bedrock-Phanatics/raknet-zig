@@ -1,25 +1,14 @@
 #!/usr/bin/env bash
-# Linux only. Build first: zig build interop && (cd tests/interop/go && go build -o ../../../zig-out/bin/raknet-interop-go .)
-set -u
-zig_bin=${ZIG_BIN:-./zig-out/bin/raknet-interop}
-go_bin=${GO_BIN:-./zig-out/bin/raknet-interop-go}
-seconds=${SECONDS_PER_CASE:-2}
-port=${BASE_PORT:-19400}
-
-run() {
-  local server=$1 client=$2 connections=$3 payload=$4
-  port=$((port + 1))
-  timeout $((seconds + 10)) "$server" server "127.0.0.1:$port" $((seconds + 3)) &
-  sleep 0.7
-  timeout $((seconds + 10)) "$client" client "127.0.0.1:$port" "$connections" "$payload" "$seconds" 500
-  wait
-}
-
-for pair in "$zig_bin $zig_bin" "$go_bin $go_bin" "$go_bin $zig_bin" "$zig_bin $go_bin"; do
-  set -- $pair
-  for connections in ${CONNECTIONS:-1 10 50 100}; do
-    for payload in ${PAYLOADS:-32 128 512 1200 8192 65536}; do
-      run "$1" "$2" "$connections" "$payload"
-    done
-  done
-done
+set -euo pipefail
+exec python3 tests/interop/scale.py \
+  --zig "${ZIG_BIN:-./zig-out/bin/raknet-interop}" \
+  --go "${GO_BIN:-./zig-out/bin/raknet-interop-go}" \
+  --connections "${CONNECTIONS:-1 10 100 500 1000 2000 4096}" \
+  --payloads "${PAYLOADS:-32 128 512 1200 8192}" \
+  --pairs "${PAIRS:-zig-go go-go go-zig zig-zig}" \
+  --seconds "${SECONDS_PER_CASE:-20}" --samples "${SAMPLES:-3}" \
+  --warmup-ms "${WARMUP_MS:-3000}" --window "${WINDOW:-32}" \
+  --interval-ms "${INTERVAL_MS:-0}" --listeners "${LISTENERS:-1}" \
+  --ack-ms "${ACK_MS:-0}" --receive-batch "${RECEIVE_BATCH:-32}" \
+  --server-cpus "${SERVER_CPUS:-}" --client-cpus "${CLIENT_CPUS:-}" \
+  --port "${BASE_PORT:-19400}" --output "${OUTPUT:-zig-out/interop-$(date +%Y%m%d-%H%M%S)}"
