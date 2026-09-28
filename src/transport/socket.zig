@@ -271,6 +271,11 @@ pub const Socket = struct {
         // Custom providers may use virtual handles.
         if (builtin.os.tag == .linux and messages.len > 1 and self.io.vtable == std.Io.Threaded.global_single_threaded.io().vtable) {
             if (try self.receiveManyLinux(messages, data_storage)) |batch| return batch;
+            // Threaded floors sub-ms waits to zero and spins, this wait is uncancelable but under 1 ms
+            if (remainingNanoseconds(self.io, timeout)) |remaining| if (remaining < std.time.ns_per_ms) {
+                if (remaining == 0 or !try self.pollLinux(remaining)) return error.Timeout;
+                return try self.receiveManyLinux(messages, data_storage) orelse error.Timeout;
+            };
         }
         @memset(messages, .init);
         self.traffic.receive_calls += 1;
@@ -301,6 +306,22 @@ pub const Socket = struct {
         self.traffic.receive_batches += @intFromBool(actual_received != 0);
         self.traffic.maximum_receive_batch = @max(self.traffic.maximum_receive_batch, actual_received);
         return .{ .messages = messages[0..valid], .dropped_oversize = dropped, .trailing_error = actual_failure };
+    }
+
+    fn pollLinux(self: *Socket, nanoseconds: u64) !bool {
+        const linux = std.os.linux;
+        var fds = [1]linux.pollfd{.{ .fd = self.value.handle, .events = linux.POLL.IN, .revents = 0 }};
+        var wait: linux.timespec = .{ .sec = 0, .nsec = @intCast(nanoseconds) };
+        while (true) {
+            try self.io.checkCancel();
+            const ready = linux.ppoll(&fds, 1, &wait, null);
+            switch (linux.errno(ready)) {
+                .SUCCESS => return ready != 0,
+                .INTR => continue,
+                .NOMEM => return error.SystemResources,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
     }
 
     fn receiveManyLinux(self: *Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8) !?ReceiveBatch {
@@ -408,12 +429,17 @@ fn bindReusePort(address: std.Io.net.IpAddress) !std.Io.net.Socket {
 
 // Negative means relative, in 100ns units
 fn afdTimeout(io: std.Io, timeout: std.Io.Timeout) i64 {
+    const remaining = remainingNanoseconds(io, timeout) orelse return std.math.maxInt(i64);
+    return -@as(i64, @intCast(@min(std.math.divCeil(u64, remaining, 100) catch unreachable, std.math.maxInt(i64))));
+}
+
+fn remainingNanoseconds(io: std.Io, timeout: std.Io.Timeout) ?u64 {
     const remaining: i96 = switch (timeout) {
-        .none => return std.math.maxInt(i64),
+        .none => return null,
         .duration => |duration| duration.raw.nanoseconds,
         .deadline => |deadline| deadline.raw.nanoseconds - deadline.clock.now(io).nanoseconds,
     };
-    return -@as(i64, @intCast(std.math.clamp(@divFloor(remaining + 99, 100), 0, std.math.maxInt(i64))));
+    return @intCast(std.math.clamp(remaining, 0, std.math.maxInt(u64)));
 }
 
 // std.Io's AFD handles reject this, skipReset covers them
@@ -576,6 +602,26 @@ test "timed receive waits for data or times out on every platform" {
     try std.testing.expectError(error.Timeout, receiver.receiveMany(&messages, &batch_storage, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }));
     try sender.send(receiver.value.address, "pong");
     try std.testing.expectEqualStrings("pong", (try receiver.receiveMany(&messages, &batch_storage, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } })).messages[0].data);
+}
+
+test "sub-millisecond batch receive waits for its deadline" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var receiver = try Socket.bind(io, address, 64);
+    defer receiver.close();
+    var sender = try Socket.bind(io, address, 64);
+    defer sender.close();
+    var messages: [2]std.Io.net.IncomingMessage = undefined;
+    var storage: [128]u8 = undefined;
+    const short: std.Io.Timeout = .{ .duration = .{ .raw = .fromMicroseconds(600), .clock = .awake } };
+    const before = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, receiver.receiveMany(&messages, &storage, short));
+    if (builtin.os.tag == .linux) try std.testing.expect(before.durationTo(std.Io.Clock.awake.now(io)).nanoseconds >= 500 * std.time.ns_per_us);
+    try sender.send(receiver.value.address, "late");
+    try receiver.waitReadable(.{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+    try std.testing.expectEqualStrings("late", (try receiver.receiveMany(&messages, &storage, short)).messages[0].data);
 }
 
 test "listeners can share a port with reuse_port" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Config = @import("../config.zig").Config;
 const net_address = @import("address.zig");
@@ -28,7 +29,7 @@ pub const Options = struct {
     protocol_version: u8 = 11,
     advertisement: []const u8,
     receive_batch_size: usize = 32,
-    socket_buffers: backend.BufferOptions = .{},
+    socket_buffers: backend.BufferOptions = if (builtin.os.tag == .linux) .{ .receive_bytes = 4 * 1024 * 1024 } else .{},
     reuse_port: bool = false,
     offline_rate_per_second: u32 = 20,
     offline_burst: u32 = 40,
@@ -931,6 +932,18 @@ fn endpointKey(address: std.Io.net.IpAddress) EndpointKey {
     }
     return key;
 }
+
+test "listener asks Linux for more than the default receive buffer" {
+    if (builtin.os.tag != .linux) return;
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;buffers" });
+    defer listener.destroy();
+    var plain = try backend.Socket.bind(io, address, 64);
+    defer plain.close();
+    try std.testing.expect(listener.kernelBufferSizes().receive_bytes.? > plain.kernelBufferSizes().receive_bytes.?);
+}
+
 test "listener answers an offline ping over loopback" {
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
