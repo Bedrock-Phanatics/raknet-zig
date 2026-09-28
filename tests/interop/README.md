@@ -39,6 +39,33 @@ sizes, four implementation pairs, three samples, and 20 measured seconds each.
 
 ## Workloads
 
+### Upstream go-raknet comparison
+
+The main harness uses Lunar's fork. To reproduce the root README's comparison
+with upstream `github.com/sandertv/go-raknet` v1.15.2, run on Linux from the
+repository root with Zig 0.16.0, Go and Python 3 on `PATH`:
+
+```sh
+zig build interop -Dtarget=x86_64-linux -Doptimize=ReleaseFast
+python3 tests/interop/upstream.py --zig zig-out/bin/raknet-interop \
+  --output zig-out/upstream-comparison --server-cpus 0 --client-cpus 2,4,6,8
+```
+
+Choose CPU IDs for your topology. This builds an isolated copy of the Go harness
+with upstream v1.15.2 and no module replacement. Only the unavailable
+`MetricsSnapshot()` diagnostic is replaced; retransmission counts are `-1`
+(unavailable). The echo and client logic are unchanged.
+
+The comparison runs three samples per server at 100 and 1,000 connections,
+alternating server order between rounds. Each sample measures ten seconds after
+two seconds of warm-up, with 128-byte payloads and one outstanding request per
+connection. Both servers use the same upstream Go client. `GOMAXPROCS=4` applies
+to Go processes; CPU affinity limits each server to one logical CPU and the
+client to four separate physical cores on the recorded host. Each run directory
+retains configuration, binary hashes, logs and samples, including failures.
+
+### Available options
+
 | Options | Workload |
 | --- | --- |
 | `--window 0` | Established idle sessions, with protocol keepalives |
