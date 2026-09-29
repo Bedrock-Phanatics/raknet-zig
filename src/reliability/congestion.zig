@@ -25,10 +25,10 @@ pub const Controller = struct {
     pub fn cancel(self: *Controller, bytes: usize) void {
         self.in_flight -|= bytes;
     }
-    pub fn acknowledged(self: *Controller, sequence: u32, bytes: usize) void {
+    pub fn acknowledged(self: *Controller, sequence: u32, bytes: usize, packets: usize) void {
         self.in_flight -|= bytes;
         if (self.recovering and uint24.isNewer(sequence, self.recovery_until)) self.recovering = false;
-        if (self.window < self.threshold) self.window +|= @min(@as(u64, bytes), self.mtu) else {
+        if (self.window < self.threshold) self.window +|= @min(@as(u64, bytes), @as(u64, self.mtu) *| packets) else {
             const increase = @max(@as(u64, 1), (@as(u64, self.mtu) * self.mtu) / @max(self.window, 1));
             self.window +|= increase;
         }
@@ -52,12 +52,18 @@ pub const Controller = struct {
 test "congestion accounting cannot underflow and backs off once" {
     var c = try Controller.init(1200);
     try c.sent(1000);
-    c.acknowledged(0, 1000);
+    c.acknowledged(0, 1000, 1);
     try std.testing.expectEqual(@as(u64, 13_000), c.window);
     c.lost(10);
     const reduced = c.window;
     c.lost(11);
     try std.testing.expectEqual(reduced, c.window);
-    c.acknowledged(11, 999999);
+    c.acknowledged(11, 999999, 1);
     try std.testing.expectEqual(@as(u64, 0), c.in_flight);
+}
+
+test "slow start grows per acknowledged datagram" {
+    var c = try Controller.init(1200);
+    c.acknowledged(0, 4 * 1200, 4);
+    try std.testing.expectEqual(@as(u64, 12_000 + 4 * 1200), c.window);
 }

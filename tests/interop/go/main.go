@@ -90,15 +90,14 @@ func server(address string, seconds int) {
 		go func() {
 			for range time.Tick(time.Second) {
 				p := sample()
-				fmt.Fprintf(os.Stderr, "progress impl=go role=server sessions=%d echoed=%d cpu_ms=%d rss_kb=%d retransmits=%d\n", active.Load(), echoed.Load(), p.cpuMs-baseline.cpuMs, p.rssKb, raknet.MetricsSnapshot().Retransmits)
+				fmt.Fprintf(os.Stderr, "progress impl=go role=server sessions=%d echoed=%d cpu_ms=%d rss_kb=%d\n", active.Load(), echoed.Load(), p.cpuMs-baseline.cpuMs, p.rssKb)
 			}
 		}()
 	}
 	time.Sleep(time.Duration(seconds) * time.Second)
-	metrics := raknet.MetricsSnapshot()
 	p := sample()
-	fmt.Fprintf(os.Stderr, "server impl=go sessions=%d connected=%d echoed=%d dropped=%d retransmits=%d malformed=0 rejected=0 cpu_ms=%d rss_kb=%d peak_rss_kb=%d baseline_rss_kb=%d\n",
-		peak.Load(), connected.Load(), echoed.Load(), dropped.Load(), metrics.Retransmits, p.cpuMs-baseline.cpuMs, p.rssKb, p.peakRssKb, baseline.rssKb)
+	fmt.Fprintf(os.Stderr, "server impl=go sessions=%d connected=%d echoed=%d dropped=%d retransmits=-1 malformed=0 rejected=0 cpu_ms=%d rss_kb=%d peak_rss_kb=%d baseline_rss_kb=%d\n",
+		peak.Load(), connected.Load(), echoed.Load(), dropped.Load(), p.cpuMs-baseline.cpuMs, p.rssKb, p.peakRssKb, baseline.rssKb)
 	_ = listener.Close()
 }
 
@@ -185,16 +184,15 @@ func client(address string, connections, payloadSize, seconds, warmupMs, window,
 	sort.Slice(setup, func(i, j int) bool { return setup[i] < setup[j] })
 	sort.Slice(rtt, func(i, j int) bool { return rtt[i] < rtt[j] })
 	p := sample()
-	metrics := raknet.MetricsSnapshot()
 	fairness := float64(0)
 	if squares != 0 {
 		fairness = float64(messages) * float64(messages) / (float64(connections) * squares)
 	}
 	fmt.Fprintf(os.Stderr, "fairness min_messages=%d max_messages=%d jain=%.6f\n", minimum, maximum, fairness)
-	fmt.Fprintf(os.Stderr, "client impl=go connections=%d payload=%d setup_p50_us=%d setup_p95_us=%d setup_p99_us=%d rtt_p50_us=%d rtt_p95_us=%d rtt_p99_us=%d msgs_per_s=%.0f mib_per_s=%.2f cpu_ms=%d rss_kb=%d peak_rss_kb=%d kb_per_conn=%d retransmits=%d mismatches=%d incomplete=%d failures=%d\n",
+	fmt.Fprintf(os.Stderr, "client impl=go connections=%d payload=%d setup_p50_us=%d setup_p95_us=%d setup_p99_us=%d rtt_p50_us=%d rtt_p95_us=%d rtt_p99_us=%d msgs_per_s=%.0f mib_per_s=%.2f cpu_ms=%d rss_kb=%d peak_rss_kb=%d kb_per_conn=%d retransmits=-1 mismatches=%d incomplete=%d failures=%d\n",
 		connections, payloadSize, pct(setup, .5), pct(setup, .95), pct(setup, .99), pct(rtt, .5), pct(rtt, .95), pct(rtt, .99),
 		float64(messages)/float64(seconds), float64(bytes)/float64(seconds)/(1024*1024), p.cpuMs-baseline.cpuMs, p.rssKb, p.peakRssKb,
-		(connectedRss-min(connectedRss, baseline.rssKb))/uint64(max(connections, 1)), metrics.Retransmits, mismatches, incomplete, failures)
+		(connectedRss-min(connectedRss, baseline.rssKb))/uint64(max(connections, 1)), mismatches, incomplete, failures)
 }
 
 func pct(values []uint64, fraction float64) uint64 {

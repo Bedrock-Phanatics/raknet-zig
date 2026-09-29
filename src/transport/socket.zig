@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const time = @import("../util/time.zig");
 
 pub const BufferOptions = struct {
     receive_bytes: ?u32 = null,
@@ -34,6 +35,7 @@ pub const Traffic = struct {
     nack_datagrams_sent: u64 = 0,
     native_receive_calls: u64 = 0,
     native_received_datagrams: u64 = 0,
+    connection_resets: u64 = 0,
 };
 
 pub const SendBatch = struct {
@@ -75,7 +77,6 @@ pub const Socket = struct {
     buffer_sizes: BufferSizes,
     traffic: Traffic = .{},
     batch: ?*SendBatch = null,
-    poll_event: if (builtin.os.tag == .windows) ?std.os.windows.HANDLE else void = if (builtin.os.tag == .windows) null else {},
 
     pub fn bind(io: std.Io, address: std.Io.net.IpAddress, maximum_datagram_size: usize) !Socket {
         return bindWithBuffers(io, address, maximum_datagram_size, .{});
@@ -89,12 +90,10 @@ pub const Socket = struct {
         if (reuse_port and builtin.os.tag != .linux) return error.ReusePortUnsupported;
         var value = if (builtin.os.tag == .linux and reuse_port) try bindReusePort(address) else try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
         errdefer value.close(io);
+        try ignoreConnectionResets(value.handle);
         return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(value.handle, buffers) };
     }
     pub fn close(self: *Socket) void {
-        if (builtin.os.tag == .windows) if (self.poll_event) |event| {
-            _ = std.os.windows.ntdll.NtClose(event);
-        };
         self.value.close(self.io);
         self.* = undefined;
     }
@@ -183,52 +182,100 @@ pub const Socket = struct {
     }
 
     pub fn receive(self: *Socket, buffer: []u8, timeout: std.Io.Timeout) !std.Io.net.IncomingMessage {
-        self.traffic.receive_calls += 1;
+        const limit = self.resetSafeTimeout(timeout);
+        while (true) {
+            self.traffic.receive_calls += 1;
+            return self.receiveOnce(buffer, limit) catch |err| {
+                if (!self.skipReset(err)) return err;
+                continue;
+            };
+        }
+    }
+
+    fn receiveOnce(self: *Socket, buffer: []u8, timeout: std.Io.Timeout) !std.Io.net.IncomingMessage {
         return self.value.receiveTimeout(self.io, buffer, timeout) catch |err| switch (err) {
             error.ConcurrencyUnavailable => {
-                if (timeout != .none and !try self.waitReadable(timeout)) return error.Timeout;
+                if (timeout != .none) try self.waitReadable(timeout);
                 return self.value.receive(self.io, buffer);
             },
             else => return err,
         };
     }
 
-    fn waitReadable(self: *Socket, timeout: std.Io.Timeout) !bool {
-        if (builtin.os.tag != .windows) return error.ConcurrencyUnavailable;
+    pub fn waitReadable(self: *const Socket, timeout: std.Io.Timeout) !void {
+        var message: [1]std.Io.net.IncomingMessage = .{.init};
+        var byte: [1]u8 = undefined;
+        const failure, _ = self.value.receiveManyTimeout(self.io, &message, &byte, .{ .peek = true }, timeout);
+        const err = failure orelse return;
+        switch (err) {
+            // Windows fails a peek into a short buffer instead of truncating
+            error.MessageOversize => {},
+            error.ConcurrencyUnavailable => if (builtin.os.tag == .windows) return self.pollAfd(timeout) else return err,
+            else => return err,
+        }
+    }
+
+    // Threaded can't wait on Windows datagrams and 0.16's Batch.cancel hangs
+    fn pollAfd(self: *const Socket, timeout: std.Io.Timeout) !void {
         const windows = std.os.windows;
         const PollHandle = extern struct { handle: windows.HANDLE, events: windows.ULONG, status: windows.NTSTATUS };
         const PollInfo = extern struct { timeout: windows.LARGE_INTEGER, count: windows.ULONG, exclusive: windows.ULONG, handles: [1]PollHandle };
-        const readable: windows.ULONG = 0x0001 | 0x0008 | 0x0010;
-        if (self.poll_event == null) {
-            var event: windows.HANDLE = undefined;
-            if (windows.ntdll.NtCreateEvent(&event, @bitCast(@as(u32, 0x1f0003)), null, .Synchronization, .FALSE) != .SUCCESS) return error.SystemResources;
-            self.poll_event = event;
-        }
-        const handle: windows.HANDLE = self.value.handle;
+        // RECEIVE | DISCONNECT | ABORT | LOCAL_CLOSE
+        const events: windows.ULONG = 0x0001 | 0x0008 | 0x0010 | 0x0020;
         var info: PollInfo = .{
-            .timeout = -@as(i64, @intCast(@min(remainingMilliseconds(self.io, timeout), std.math.maxInt(i64) / 10_000))) * 10_000,
+            .timeout = afdTimeout(self.io, timeout),
             .count = 1,
             .exclusive = 0,
-            .handles = .{.{ .handle = handle, .events = readable, .status = .SUCCESS }},
+            .handles = .{.{ .handle = self.value.handle, .events = events, .status = .SUCCESS }},
         };
-        var status_block: windows.IO_STATUS_BLOCK = undefined;
-        var status = windows.ntdll.NtDeviceIoControlFile(handle, self.poll_event.?, null, null, &status_block, windows.IOCTL.AFD.POLL, &info, @sizeOf(PollInfo), &info, @sizeOf(PollInfo));
-        if (status == .PENDING) {
-            _ = windows.ntdll.NtWaitForSingleObject(self.poll_event.?, .FALSE, null);
-            status = status_block.u.Status;
-        }
-        if (status == .TIMEOUT) return false;
-        if (status != .SUCCESS) return error.Unexpected;
-        return info.count != 0 and info.handles[0].events & readable != 0;
+        const result = try self.io.operate(.{ .device_io_control = .{
+            .file = .{ .handle = self.value.handle, .flags = .{ .nonblocking = true } },
+            .code = windows.IOCTL.AFD.POLL,
+            .in = std.mem.asBytes(&info),
+            .out = std.mem.asBytes(&info),
+        } });
+        const status = result.device_io_control.u.Status;
+        if (status == .TIMEOUT or (status == .SUCCESS and info.count == 0)) return error.Timeout;
+        if (status != .SUCCESS) return windows.unexpectedStatus(status);
+    }
+
+    // Windows reports ICMP unreachable from an earlier send on a later receive
+    fn skipReset(self: *Socket, err: anyerror) bool {
+        if (builtin.os.tag != .windows or (err != error.PortUnreachable and err != error.ConnectionResetByPeer)) return false;
+        self.traffic.connection_resets += 1;
+        return true;
+    }
+
+    fn resetSafeTimeout(self: *const Socket, timeout: std.Io.Timeout) std.Io.Timeout {
+        return if (builtin.os.tag == .windows) time.earliest(self.io, timeout, .none) else timeout;
     }
 
     pub fn receiveMany(self: *Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8, timeout: std.Io.Timeout) !ReceiveBatch {
+        const limit = self.resetSafeTimeout(timeout);
+        while (true) {
+            var batch = self.receiveManyOnce(messages, data_storage, limit) catch |err| {
+                if (!self.skipReset(err)) return err;
+                continue;
+            };
+            if (batch.trailing_error) |err| {
+                if (self.skipReset(err)) batch.trailing_error = null;
+            }
+            return batch;
+        }
+    }
+
+    fn receiveManyOnce(self: *Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8, timeout: std.Io.Timeout) !ReceiveBatch {
         if (messages.len == 0) return error.InvalidConfiguration;
         const required = try std.math.mul(usize, messages.len, self.maximum_datagram_size);
         if (data_storage.len < required) return error.NoSpaceLeft;
         // Custom providers may use virtual handles.
         if (builtin.os.tag == .linux and messages.len > 1 and self.io.vtable == std.Io.Threaded.global_single_threaded.io().vtable) {
             if (try self.receiveManyLinux(messages, data_storage)) |batch| return batch;
+            // Threaded floors sub-ms waits to zero and spins, this wait is uncancelable but under 1 ms
+            if (remainingNanoseconds(self.io, timeout)) |remaining| if (remaining < std.time.ns_per_ms) {
+                if (remaining == 0 or !try self.pollLinux(remaining)) return error.Timeout;
+                return try self.receiveManyLinux(messages, data_storage) orelse error.Timeout;
+            };
         }
         @memset(messages, .init);
         self.traffic.receive_calls += 1;
@@ -237,7 +284,7 @@ pub const Socket = struct {
         var actual_failure = failure;
         if (actual_received == 0) if (actual_failure) |err| switch (err) {
             error.ConcurrencyUnavailable => {
-                if (timeout != .none and !try self.waitReadable(timeout)) return error.Timeout;
+                if (timeout != .none) try self.waitReadable(timeout);
                 messages[0] = try self.value.receive(self.io, data_storage[0..self.maximum_datagram_size]);
                 actual_received = 1;
                 actual_failure = null;
@@ -259,6 +306,22 @@ pub const Socket = struct {
         self.traffic.receive_batches += @intFromBool(actual_received != 0);
         self.traffic.maximum_receive_batch = @max(self.traffic.maximum_receive_batch, actual_received);
         return .{ .messages = messages[0..valid], .dropped_oversize = dropped, .trailing_error = actual_failure };
+    }
+
+    fn pollLinux(self: *Socket, nanoseconds: u64) !bool {
+        const linux = std.os.linux;
+        var fds = [1]linux.pollfd{.{ .fd = self.value.handle, .events = linux.POLL.IN, .revents = 0 }};
+        var wait: linux.timespec = .{ .sec = 0, .nsec = @intCast(nanoseconds) };
+        while (true) {
+            try self.io.checkCancel();
+            const ready = linux.ppoll(&fds, 1, &wait, null);
+            switch (linux.errno(ready)) {
+                .SUCCESS => return ready != 0,
+                .INTR => continue,
+                .NOMEM => return error.SystemResources,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
     }
 
     fn receiveManyLinux(self: *Socket, messages: []std.Io.net.IncomingMessage, data_storage: []u8) !?ReceiveBatch {
@@ -332,16 +395,6 @@ pub const Socket = struct {
     }
 };
 
-fn remainingMilliseconds(io: std.Io, timeout: std.Io.Timeout) u64 {
-    const nanoseconds: i96 = switch (timeout) {
-        .none => return std.math.maxInt(u64),
-        .duration => |duration| duration.raw.nanoseconds,
-        .deadline => |deadline| deadline.raw.nanoseconds - deadline.clock.now(io).nanoseconds,
-    };
-    if (nanoseconds <= 0) return 0;
-    return @intCast(@min(@divTrunc(nanoseconds + std.time.ns_per_ms - 1, std.time.ns_per_ms), std.math.maxInt(u64)));
-}
-
 fn bindReusePort(address: std.Io.net.IpAddress) !std.Io.net.Socket {
     const linux = std.os.linux;
     const family: u32 = switch (address) {
@@ -373,6 +426,51 @@ fn bindReusePort(address: std.Io.net.IpAddress) !std.Io.net.Socket {
     }
     return .{ .handle = fd, .address = bound };
 }
+
+// Negative means relative, in 100ns units
+fn afdTimeout(io: std.Io, timeout: std.Io.Timeout) i64 {
+    const remaining = remainingNanoseconds(io, timeout) orelse return std.math.maxInt(i64);
+    return -@as(i64, @intCast(@min(std.math.divCeil(u64, remaining, 100) catch unreachable, std.math.maxInt(i64))));
+}
+
+fn remainingNanoseconds(io: std.Io, timeout: std.Io.Timeout) ?u64 {
+    const remaining: i96 = switch (timeout) {
+        .none => return null,
+        .duration => |duration| duration.raw.nanoseconds,
+        .deadline => |deadline| deadline.raw.nanoseconds - deadline.clock.now(io).nanoseconds,
+    };
+    return @intCast(std.math.clamp(remaining, 0, std.math.maxInt(u64)));
+}
+
+// std.Io's AFD handles reject this, skipReset covers them
+fn ignoreConnectionResets(handle: std.Io.net.Socket.Handle) !void {
+    if (builtin.os.tag != .windows) return;
+    const sio_udp_connreset: u32 = 0x9800000C;
+    const not_socket = 10038;
+    const not_initialised = 10093;
+    var enabled: u32 = 0;
+    var returned: u32 = 0;
+    if (winsock.WSAIoctl(handle, sio_udp_connreset, &enabled, @sizeOf(u32), null, 0, &returned, null, null) == 0) return;
+    switch (winsock.WSAGetLastError()) {
+        not_socket, not_initialised => {},
+        else => return error.SocketOptionFailed,
+    }
+}
+
+const winsock = struct {
+    extern "ws2_32" fn WSAIoctl(
+        socket: std.Io.net.Socket.Handle,
+        code: u32,
+        in_buffer: ?*const anyopaque,
+        in_len: u32,
+        out_buffer: ?*anyopaque,
+        out_len: u32,
+        returned: *u32,
+        overlapped: ?*anyopaque,
+        completion: ?*const anyopaque,
+    ) callconv(.winapi) i32;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
+};
 
 fn configureBuffers(handle: std.Io.net.Socket.Handle, options: BufferOptions) !BufferSizes {
     if (builtin.os.tag != .linux) return .{ .receive_bytes = null, .send_bytes = null };
@@ -506,6 +604,26 @@ test "timed receive waits for data or times out on every platform" {
     try std.testing.expectEqualStrings("pong", (try receiver.receiveMany(&messages, &batch_storage, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } })).messages[0].data);
 }
 
+test "sub-millisecond batch receive waits for its deadline" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var receiver = try Socket.bind(io, address, 64);
+    defer receiver.close();
+    var sender = try Socket.bind(io, address, 64);
+    defer sender.close();
+    var messages: [2]std.Io.net.IncomingMessage = undefined;
+    var storage: [128]u8 = undefined;
+    const short: std.Io.Timeout = .{ .duration = .{ .raw = .fromMicroseconds(600), .clock = .awake } };
+    const before = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, receiver.receiveMany(&messages, &storage, short));
+    if (builtin.os.tag == .linux) try std.testing.expect(before.durationTo(std.Io.Clock.awake.now(io)).nanoseconds >= 500 * std.time.ns_per_us);
+    try sender.send(receiver.value.address, "late");
+    try receiver.waitReadable(.{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+    try std.testing.expectEqualStrings("late", (try receiver.receiveMany(&messages, &storage, short)).messages[0].data);
+}
+
 test "listeners can share a port with reuse_port" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
@@ -540,4 +658,77 @@ test "socket reports kernel buffer sizes where supported" {
         try std.testing.expect(socket.kernelBufferSizes().receive_bytes.? >= 64 * 1024);
         try std.testing.expect(socket.kernelBufferSizes().send_bytes.? >= 64 * 1024);
     }
+}
+
+fn testWait(socket: *const Socket, timeout: std.Io.Timeout) !void {
+    return socket.waitReadable(timeout);
+}
+
+test "waitReadable sleeps until data arrives, wakes without consuming, and cancels" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var receiver = try Socket.bind(io, address, 64);
+    defer receiver.close();
+    var other = try Socket.bind(io, address, 64);
+    defer other.close();
+    var sender = try Socket.bind(io, address, 64);
+    defer sender.close();
+    const short: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(30), .clock = .awake } };
+    const long: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5_000), .clock = .awake } };
+
+    const before = std.Io.Clock.awake.now(io);
+    try std.testing.expectError(error.Timeout, receiver.waitReadable(short));
+    try std.testing.expect(before.durationTo(std.Io.Clock.awake.now(io)).nanoseconds >= 20 * std.time.ns_per_ms);
+
+    var storage: [64]u8 = undefined;
+    for (0..200) |round| {
+        var waiter = try io.concurrent(testWait, .{ &receiver, .none });
+        defer _ = waiter.cancel(io) catch {};
+        var sibling = try io.concurrent(testWait, .{ &other, long });
+        defer _ = sibling.cancel(io) catch {};
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, &payload, @intCast(round), .little);
+        try sender.send(receiver.value.address, &payload);
+        try waiter.await(io);
+        try receiver.waitReadable(.none);
+        const message = try receiver.receive(&storage, short);
+        try std.testing.expectEqual(@as(u32, @intCast(round)), std.mem.readInt(u32, message.data[0..4], .little));
+        try std.testing.expectError(error.Canceled, sibling.cancel(io));
+    }
+    try std.testing.expectError(error.Timeout, receiver.waitReadable(short));
+    try std.testing.expectEqual(@as(u64, 0), other.traffic.receive_calls);
+
+    var blocked = try io.concurrent(testWait, .{ &receiver, .none });
+    try std.testing.expectError(error.Canceled, blocked.cancel(io));
+}
+
+test "receives skip an ICMP reset from a departed peer" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    var socket = try Socket.bind(io, address, 64);
+    defer socket.close();
+    var departed = try Socket.bind(io, address, 64);
+    const departed_address = departed.value.address;
+    departed.close();
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1_000), .clock = .awake } };
+
+    var storage: [64]u8 = undefined;
+    try socket.send(departed_address, "gone");
+    if (builtin.os.tag == .windows) try socket.waitReadable(timeout);
+    try socket.send(socket.value.address, "one");
+    try std.testing.expectEqualStrings("one", (try socket.receive(&storage, timeout)).data);
+
+    var messages: [2]std.Io.net.IncomingMessage = undefined;
+    var batch_storage: [128]u8 = undefined;
+    try socket.send(departed_address, "gone");
+    if (builtin.os.tag == .windows) try socket.waitReadable(timeout);
+    try socket.send(socket.value.address, "two");
+    const batch = try socket.receiveMany(&messages, &batch_storage, timeout);
+    try std.testing.expectEqualStrings("two", batch.messages[0].data);
+    try std.testing.expect(batch.trailing_error == null);
+    if (builtin.os.tag == .windows) try std.testing.expectEqual(@as(u64, 2), socket.traffic.connection_resets);
 }

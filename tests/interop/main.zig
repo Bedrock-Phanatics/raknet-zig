@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
         const receive_batch = if (args.len >= 7) try std.fmt.parseInt(usize, args[6], 10) else 32;
         const send_batch = if (args.len >= 8) try std.fmt.parseInt(usize, args[7], 10) else 64;
         const receive_buffer = if (args.len >= 9) try std.fmt.parseInt(u32, args[8], 10) else null;
-        return server(io, try std.Io.net.IpAddress.parseLiteral(args[2]), try std.fmt.parseInt(u32, args[3], 10), listeners, ack_ms, receive_batch, send_batch, receive_buffer);
+        return server(io, try std.Io.net.IpAddress.parseLiteral(args[2]), try std.fmt.parseInt(u32, args[3], 10), listeners, ack_ms, receive_batch, send_batch, receive_buffer, init.environ_map.get("RAKNET_SPLIT_TIMING") != null);
     }
     if (args.len >= 7 and args.len <= 9 and std.mem.eql(u8, args[1], "client")) {
         return client(io, .{
@@ -125,11 +125,12 @@ const Shard = struct {
     maximum_turn_ns: u64 = 0,
     turns: [2048]u64 = undefined,
 
-    fn run(self: *Shard, io: std.Io, deadline: u64, report: bool, baseline: Process) void {
+    fn run(self: *Shard, io: std.Io, deadline: u64, report: bool, baseline: Process, split: bool) void {
         var next_progress = nowNs(io) + progress_interval_ns;
         while (nowNs(io) < deadline) {
+            if (split) self.listener.waitReadable(self.listener.pollTimeout(wait(50))) catch {};
             const began = nowNs(io);
-            const polled = self.listener.poll(wait(50), .{ .context = &self.state, .connected = Server.onConnect, .message = Server.onMessage }) catch |err| {
+            const polled = self.listener.poll(if (split) wait(0) else wait(50), .{ .context = &self.state, .connected = Server.onConnect, .message = Server.onMessage }) catch |err| {
                 std.debug.print("poll error: {s}\n", .{@errorName(err)});
                 continue;
             };
@@ -153,14 +154,14 @@ const Shard = struct {
                 var turns = self.turns;
                 const samples = turns[0..@min(self.busy_turns, turns.len)];
                 std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-                std.debug.print("network shard={d} native_calls={d} native_datagrams={d} turn_p50_us={d} turn_p95_us={d} turn_p99_us={d} turn_includes_wait=1\n", .{ @intFromPtr(self), t.native_receive_calls, t.native_received_datagrams, percentile(samples, 0.5), percentile(samples, 0.95), percentile(samples, 0.99) });
+                std.debug.print("network shard={d} native_calls={d} native_datagrams={d} turn_p50_us={d} turn_p95_us={d} turn_p99_us={d} turn_max_us={d} turn_includes_wait={d}\n", .{ @intFromPtr(self), t.native_receive_calls, t.native_received_datagrams, percentile(samples, 0.5), percentile(samples, 0.95), percentile(samples, 0.99), if (samples.len == 0) 0 else samples[samples.len - 1], @intFromBool(!split) });
                 std.debug.print("progress impl=zig role=server shard={d} sessions={d} echoed={d} recovery_bytes={d} session_memory_bytes={d} cpu_ms={d} rss_kb={d} upserts={d} unchanged={d} sifts={d} swaps={d} received={d} sent={d} receive_calls={d} receive_batches={d} send_calls={d} receive_max={d} send_max={d} ack_datagrams={d} nack_datagrams={d} ack_records={d} retransmits={d} allocations={d} frees={d} timer_visits={d} timer_lateness_ms={d} timer_lateness_max_ms={d} deferred={d} busy_turns={d} turn_ns={d} turn_max_ns={d} statistics_ns={d}\n", .{ @intFromPtr(self), live.active_sessions, self.state.echoed, live.recovery_bytes, live.session_memory_bytes, progress.cpu_ms - baseline.cpu_ms, progress.rss_kb, d.upserts, d.unchanged, d.sifts, d.swaps, t.datagrams_received, t.datagrams_sent, t.receive_calls, t.receive_batches, t.send_calls, t.maximum_receive_batch, t.maximum_send_batch, t.ack_datagrams_sent, t.nack_datagrams_sent, live.ack_records_sent, live.retransmitted_datagrams, q.allocations, q.frees, self.listener.timer_visits, self.listener.timer_lateness_ms, self.listener.maximum_timer_lateness_ms, self.listener.deferred_receive_packets, self.busy_turns, self.turn_ns, self.maximum_turn_ns, snapshot_ns });
             }
         }
     }
 };
 
-fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32, listeners: usize, ack_ms: u32, receive_batch: usize, send_batch: usize, receive_buffer: ?u32) !void {
+fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32, listeners: usize, ack_ms: u32, receive_batch: usize, send_batch: usize, receive_buffer: ?u32, split: bool) !void {
     if (send_batch == 0 or send_batch > 256) return error.InvalidArguments;
     const allocator = std.heap.smp_allocator;
     const baseline = Process.sample();
@@ -169,14 +170,15 @@ fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32, listeners: us
     var opened: usize = 0;
     defer for (shards[0..opened]) |shard| shard.listener.destroy();
     for (shards) |*shard| {
-        shard.* = .{ .listener = try raknet.Server.listen(allocator, io, address, .{
+        var options: raknet.ServerOptions = .{
             .advertisement = "MCPE;raknet-zig interop;11;1.21;0;1000;0;interop;Survival;1;19132;19133;",
             .server_guid = 0x7a69_6e74_6572_6f70,
             .reuse_port = shards.len > 1,
             .config = .{ .timing = .{ .maximum_ack_delay_ms = ack_ms } },
             .receive_batch_size = receive_batch,
-            .socket_buffers = .{ .receive_bytes = receive_buffer },
-        }) };
+        };
+        if (receive_buffer) |bytes| options.socket_buffers.receive_bytes = bytes;
+        shard.* = .{ .listener = try raknet.Server.listen(allocator, io, address, options) };
         opened += 1;
         const buffers = shard.listener.kernelBufferSizes();
         std.debug.print("buffers receive_bytes={d} send_bytes={d}\n", .{ buffers.receive_bytes orelse 0, buffers.send_bytes orelse 0 });
@@ -192,10 +194,10 @@ fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32, listeners: us
     var launched: usize = 0;
     errdefer for (futures[0..launched]) |*future| future.await(io);
     for (futures, shards[1..]) |*future, *shard| {
-        future.* = try io.concurrent(Shard.run, .{ shard, io, deadline, true, baseline });
+        future.* = try io.concurrent(Shard.run, .{ shard, io, deadline, true, baseline, split });
         launched += 1;
     }
-    shards[0].run(io, deadline, true, baseline);
+    shards[0].run(io, deadline, true, baseline, split);
     for (futures) |*future| future.await(io);
 
     var total: Server = .{};

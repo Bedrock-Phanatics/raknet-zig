@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Estimator = struct {
     smoothed_ms: u64 = 0,
     variation_ms: u64 = 0,
+    peak_ms: u64 = 0,
     initialized: bool = false,
     minimum_rto_ms: u32,
     maximum_rto_ms: u32,
@@ -14,6 +15,8 @@ pub const Estimator = struct {
 
     pub fn observe(self: *Estimator, raw_sample_ms: u64) void {
         const sample = @min(raw_sample_ms, self.maximum_rto_ms);
+        // Peers that batch ACKs produce recurring slow samples the variance soon forgets
+        self.peak_ms = @max(sample, self.peak_ms - self.peak_ms / 128);
         if (!self.initialized) {
             self.smoothed_ms = sample;
             self.variation_ms = @max(@as(u64, 1), sample / 2);
@@ -27,7 +30,7 @@ pub const Estimator = struct {
 
     pub fn rto(self: Estimator) u32 {
         if (!self.initialized) return @min(@max(@as(u32, 500), self.minimum_rto_ms), self.maximum_rto_ms);
-        const calculated = self.smoothed_ms +| (4 *| self.variation_ms);
+        const calculated = @max(self.smoothed_ms +| (4 *| self.variation_ms), self.peak_ms +| self.peak_ms / 4);
         return @intCast(@min(@max(calculated, self.minimum_rto_ms), self.maximum_rto_ms));
     }
 };
@@ -41,4 +44,14 @@ test "RTO is smoothed and clamped" {
     try std.testing.expect(value.rto() >= 100 and value.rto() < 300);
     value.observe(100_000);
     try std.testing.expect(value.rto() <= 5000);
+}
+
+test "RTO stays above recurring delayed ACK samples" {
+    var value = try Estimator.init(50, 5000);
+    for (0..200) |index| value.observe(if (index % 10 == 0) 150 else 55);
+    try std.testing.expect(value.rto() > 150);
+
+    var steady = try Estimator.init(50, 5000);
+    for (0..200) |_| steady.observe(20);
+    try std.testing.expectEqual(@as(u32, 50), steady.rto());
 }
