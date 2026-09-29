@@ -137,14 +137,15 @@ pub const Recovery = struct {
         if (range_count <= self.count_value) {
             var iterator = ack.SequenceIterator.init(ranges, maximum_work);
             while (try iterator.next()) |sequence| {
-                if (self.findAcknowledged(sequence)) |index| self.ackSlot(index, now_ms, &result);
+                if (self.findAcknowledged(sequence)) |index| self.ackSlot(index, now_ms, &result, self.slots[index].sequence != uint24.normalize(sequence));
             }
         } else {
             var current = self.active_head;
             while (current != none) {
                 const slot = &self.slots[current];
                 const next = slot.active_next;
-                if (contains(ranges, slot.sequence) or (slot.previous != none and contains(ranges, slot.previous))) self.ackSlot(current, now_ms, &result);
+                const original = slot.previous != none and contains(ranges, slot.previous);
+                if (original or contains(ranges, slot.sequence)) self.ackSlot(current, now_ms, &result, original);
                 current = next;
             }
         }
@@ -286,11 +287,12 @@ pub const Recovery = struct {
         slot.* = .{};
     }
 
-    fn ackSlot(self: *Recovery, slot_index: u32, now_ms: u64, result: *Acknowledged) void {
+    // An ACK naming the first send gives an unambiguous RTT sample
+    fn ackSlot(self: *Recovery, slot_index: u32, now_ms: u64, result: *Acknowledged, original: bool) void {
         const slot = &self.slots[slot_index];
         result.packets += 1;
         result.bytes +|= slot.in_flight_bytes;
-        if (slot.transmissions == 1) result.rtt_sample_ms = time.elapsed(now_ms, slot.sent_ms);
+        if (slot.transmissions == 1 or (original and slot.transmissions == 2)) result.rtt_sample_ms = time.elapsed(now_ms, slot.sent_ms);
         self.removeSlot(slot_index);
     }
 
@@ -507,6 +509,21 @@ test "free slots stop at a pinned wrap alias" {
     try std.testing.expectEqual(@as(usize, 0), recovery.freeSlots(6, 8));
     try std.testing.expectEqual(@as(usize, 1), recovery.freeSlots(3, 1));
     try std.testing.expectEqual(@as(usize, 3), recovery.freeSlots(0xffffff, 8));
+}
+
+test "an ACK naming the first send still samples RTT after a resend" {
+    var recovery = try Recovery.init(std.testing.allocator, 8, 4608, 8, 576);
+    defer recovery.deinit();
+    try recovery.track(3, "\x84\x03\x00\x00a", 5, 0, 50);
+    try recovery.track(4, "\x84\x04\x00\x00b", 5, 0, 50);
+    var next: u32 = 5;
+    var due: [2]Due = undefined;
+    try std.testing.expectEqual(@as(usize, 2), recovery.collectDueResequenced(50, 50, &due, 2, &next).items.len);
+    const original = try recovery.acknowledge(&.{.{ .first = 3, .last = 3 }}, 90, 8);
+    try std.testing.expectEqual(@as(?u64, 90), original.rtt_sample_ms);
+    const resent = try recovery.acknowledge(&.{.{ .first = 6, .last = 6 }}, 90, 8);
+    try std.testing.expectEqual(@as(usize, 1), resent.packets);
+    try std.testing.expectEqual(@as(?u64, null), resent.rtt_sample_ms);
 }
 
 test "resends move to a fresh sequence and keep their state" {

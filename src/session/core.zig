@@ -588,7 +588,7 @@ pub const Core = struct {
                 const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
                 self.ack_records_received += decoded.records.len;
                 self.acknowledged_datagrams +|= result.packets;
-                if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes);
+                if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes, result.packets);
                 if (result.rtt_sample_ms) |sample| self.rtt_state.observe(sample);
                 break :blk .{ .incoming = .{ .acknowledged = result }, .work_units = 1 + decoded.acknowledged_count };
             },
