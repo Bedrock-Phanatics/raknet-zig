@@ -9,4 +9,4 @@ loss=$2
 shift 2
 ip link set lo up
 tc qdisc add dev lo root netem limit 100000 delay "${delay}ms" loss "${loss}%" reorder "${REORDER_PERCENT:-0}%" duplicate "${DUPLICATE_PERCENT:-0}%"
-exec python3 tests/interop/scale.py "$@"
+exec python3 "$(dirname "$0")/scale.py" "$@"

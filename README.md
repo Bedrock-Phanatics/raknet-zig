@@ -104,42 +104,46 @@ Applications handle Bedrock login, authentication, and encryption.
 
 ## Benchmarks vs go-raknet
 
-Measured on September 28, 2026 against upstream
-[sandertv/go-raknet v1.15.2](https://github.com/sandertv/go-raknet/tree/v1.15.2).
-Both servers used the same upstream Go client, 128-byte reliable ordered echoes,
-and one outstanding request per connection. These are loopback transport tests,
-not Minecraft gameplay benchmarks.
+Compared with [sandertv/go-raknet v1.15.2](https://github.com/sandertv/go-raknet/tree/v1.15.2)
+using its own client against both servers, with reliable ordered echoes over
+loopback. RTT is localhost echo time, not player ping. Medians of three rounds on
+a Ryzen 5 5500 under WSL2, each server pinned to one CPU.
 
-Medians of three runs, each with ten measured seconds after two seconds of
-warm-up; server order alternated between rounds. Host: Ryzen 5 5500, Ubuntu on
-WSL2, about 8 GiB RAM, Zig 0.16.0 ReleaseFast and Go 1.27.1. Each server was pinned
-to one logical CPU; the client used four separate physical cores.
+**Paced load**, one request per connection per interval:
 
-| Connections | Server | Echoes/s | RTT p50 / p95 / p99 (ms) | Server RSS (MiB) | Completed runs |
-| ---: | --- | ---: | --- | ---: | ---: |
-| 100 | raknet-zig | 53,502 | 0.875 / 1.315 / 58.743 | 13.00 | 3/3 |
-| 100 | go-raknet | 53,019 | 0.517 / 1.415 / 4.361 | 78.63 | 3/3 |
-| 1,000 | raknet-zig | 78,881 | 2.051 / 59.871 / 294.048 | 115.25 | 3/3 |
-| 1,000 | go-raknet | 53,210* | 1.821 / 9.575 / 364.520 | 101.38 | 0/3 |
+| Workload | Server | RTT p50 / p99 (ms) | Server CPU | RSS (MiB) |
+| --- | --- | --- | ---: | ---: |
+| 100 conns, 128 B, 10/s | raknet-zig | 0.152 / 0.289 | 3.3% | 9.8 |
+|  | go-raknet | 0.192 / 0.696 | 6.9% | 11.2 |
+| 1,000 conns, 128 B, 10/s | raknet-zig | 0.259 / 1.244 | 16.9% | 83.4 |
+|  | go-raknet | 0.418 / 8.506 | 36.6% | 38.4 |
+| 4,096 conns, 128 B, 2.5/s | raknet-zig | 0.207 / 1.387 | 25.7% | 335.8 |
+|  | go-raknet | 0.379 / 232.503 | 70.1% | 105.1 |
+| 1,000 conns, 8 KiB, 1/s | raknet-zig | 0.172 / 0.350 | 10.6% | 100.4 |
+|  | go-raknet | 0.215 / 2.968 | 28.8% | 42.5 |
 
-At 100 connections, throughput was similar: individual runs ranged from
-50,126–71,432 echoes/s for Zig and 51,785–58,146 for Go. Go had lower p99 latency;
-Zig used less RSS. At 1,000 connections, Zig completed all runs but both servers
-had high tail latency. **The starred Go result includes incomplete drains in
-every run and is not a successful capacity result.** No throughput speedup ratio
-is claimed from those failed runs.
+**Impaired network and overload**, one outstanding request per connection:
 
-Completed means no reported connection failures, payload mismatches or incomplete
-drains, with the requested session population maintained. Throughput excludes
-drained replies; RTT includes them and uses each connection's last 2,048 samples.
-RSS is sampled at measurement boundaries, not peak memory. Defaults and internal
-resource limits differ between libraries. These short, single-core WSL2 results
-do not establish Windows, WAN or multicore performance.
+| Workload | Server | Echoes/s | RTT p50 / p99 (ms) | Completed runs |
+| --- | --- | ---: | --- | ---: |
+| 100 conns, 128 B, 20 ms RTT, 1% loss | raknet-zig | 4,317 | 20.2 / 158.2 | 3/3 |
+|  | go-raknet | 3,822 | 20.2 / 296.0 | 2/3 |
+| 100 conns, 8 KiB, 20 ms RTT, 1% loss | raknet-zig | 1,250 | 79.6 / 279.7 | 3/3 |
+|  | go-raknet | 1,338 | 20.4 / 621.4 | 0/3 |
+| 100 conns, 8 KiB, 50 ms RTT | raknet-zig | 1,570 | 50.5 / 149.3 | 3/3 |
+|  | go-raknet | 1,820 | 50.3 / 57.9 | 3/3 |
+| 100 conns, 128 B, saturated | raknet-zig | 109,325 | 0.874 / 1.598 | 3/3 |
+|  | go-raknet | 65,013 | 0.591 / 5.151 | 3/3 |
+| 1,000 conns, 128 B, saturated | raknet-zig | 90,915 | 3.475 / 276.844 | 3/3 |
+|  | go-raknet | 64,542 | 1.530 / 341.676 | 2/3 |
 
-See [individual samples and build metadata](tests/interop/upstream-results.json)
-and [reproduction instructions](tests/interop/README.md#upstream-go-raknet-comparison).
-The earlier [scalability audit](tests/interop/AUDIT.md) used Lunar's fork and is a
-separate comparison.
+Both servers delivered the full paced load. Incomplete go-raknet runs had
+failed connections or undrained requests. go-raknet's server has no congestion
+window, which helps it on large replies to its own client. raknet-zig uses more
+memory per session. Saturated runs show overload behavior, not healthy latency.
+
+See [the samples](tests/interop/results.json), [how to reproduce them](tests/interop/README.md)
+and [the performance audit](tests/interop/AUDIT.md).
 
 ## Development
 
