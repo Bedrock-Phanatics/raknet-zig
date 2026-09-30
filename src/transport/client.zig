@@ -186,6 +186,9 @@ pub const Client = struct {
     pub fn kernelBufferSizes(self: *const Client) backend.BufferSizes {
         return self.socket.kernelBufferSizes();
     }
+    pub fn localAddress(self: *const Client) std.Io.net.IpAddress {
+        return self.socket.value.address;
+    }
     pub fn statistics(self: *const Client) core_mod.Statistics {
         var stats = self.core.statistics();
         stats.ack_records_sent = self.receipts.ack_records_sent;

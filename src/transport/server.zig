@@ -165,6 +165,8 @@ pub const Session = struct {
     last_seen_ms: u64,
     handshake_deadline_ms: u64,
     idle_timeout_ms: u32,
+    // The application owns this pointer.
+    user_data: ?*anyopaque = null,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -209,6 +211,12 @@ pub const Session = struct {
         self.receipts.deinit();
         self.allocator.free(self.scratch);
         self.allocator.destroy(self);
+    }
+    pub fn setUserData(self: *Session, ptr: ?*anyopaque) void {
+        self.user_data = ptr;
+    }
+    pub fn userData(self: *const Session) ?*anyopaque {
+        return self.user_data;
     }
     pub fn isConnected(self: Session) bool {
         return self.state == .connected;
@@ -517,6 +525,9 @@ pub const Listener = struct {
 
     pub fn kernelBufferSizes(self: *const Listener) backend.BufferSizes {
         return self.socket.kernelBufferSizes();
+    }
+    pub fn localAddress(self: *const Listener) std.Io.net.IpAddress {
+        return self.socket.value.address;
     }
     pub fn statistics(self: *const Listener) ListenerStatistics {
         var totals = self.retired;

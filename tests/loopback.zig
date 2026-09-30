@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const raknet = @import("raknet");
 const Client = raknet.Client;
 const Config = raknet.Config;
@@ -14,6 +15,7 @@ test "client and server complete a real loopback handshake" {
     server_config.listener.maximum_connections = 1;
     var listener = try raknet.Server.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;interop", .config = server_config });
     defer listener.destroy();
+    try std.testing.expect(listener.localAddress().ip4.port != 0);
     const Harness = struct {
         listener: *raknet.Server,
         connected: std.atomic.Value(bool) = .init(false),
@@ -21,18 +23,29 @@ test "client and server complete a real loopback handshake" {
         message_len: usize = 0,
         fail_messages: bool = false,
         disconnected: usize = 0,
-        fn onConnect(raw: *anyopaque, _: *raknet.Session) !void {
+        user_data_on_disconnect: bool = false,
+        fn onConnect(raw: *anyopaque, session: *raknet.Session) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (session.userData() != null) return error.ApplicationFailure;
+            session.setUserData(self);
+            if (session.userData() != raw) return error.ApplicationFailure;
+            session.setUserData(self.listener);
+            if (session.userData() != @as(*anyopaque, @ptrCast(self.listener))) return error.ApplicationFailure;
+            session.setUserData(null);
+            if (session.userData() != null) return error.ApplicationFailure;
+            session.setUserData(self);
             self.connected.store(true, .release);
         }
-        fn onMessage(raw: *anyopaque, _: *raknet.Session, payload: raknet.BorrowedPayload) !void {
+        fn onMessage(raw: *anyopaque, session: *raknet.Session, payload: raknet.BorrowedPayload) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (session.userData() != raw) return error.ApplicationFailure;
             if (self.fail_messages or payload.bytes.len > self.message_data.len) return error.ApplicationFailure;
             @memcpy(self.message_data[0..payload.bytes.len], payload.bytes);
             self.message_len = payload.bytes.len;
         }
-        fn onDisconnect(raw: *anyopaque, _: *raknet.Session) void {
+        fn onDisconnect(raw: *anyopaque, session: *raknet.Session) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.user_data_on_disconnect = session.userData() == raw;
             self.disconnected += 1;
         }
         fn run(self: *@This(), io_value: std.Io) !void {
@@ -45,11 +58,12 @@ test "client and server complete a real loopback handshake" {
     var harness: Harness = .{ .listener = listener };
     var server_task = try io.concurrent(Harness.run, .{ &harness, io });
     defer server_task.cancel(io) catch {};
-    const client = Client.connect(std.testing.allocator, io, listener.socket.value.address, .{ .handshake_retry_ms = 10 }) catch |err| {
+    const client = Client.connect(std.testing.allocator, io, listener.localAddress(), .{ .handshake_retry_ms = 10 }) catch |err| {
         std.debug.print("client connect failed: {any}\n", .{err});
         return err;
     };
     defer client.destroy();
+    try std.testing.expect(client.localAddress().ip4.port != 0);
     try server_task.await(io);
     try std.testing.expect(harness.connected.load(.acquire));
     try std.testing.expectEqual(listener.handshake_handler.server_guid, client.server_guid);
@@ -116,7 +130,7 @@ test "client and server complete a real loopback handshake" {
     }
     try std.testing.expectEqualStrings("\xfeworld", collector.data[0..collector.len]);
 
-    var client_address = client.socket.value.address;
+    var client_address = client.localAddress();
     client_address.ip4.bytes = .{ 127, 0, 0, 1 };
     try listener.socket.send(client_address, &.{ 0x84, 0 });
     _ = try client.poll(.none, &collector, ClientCollector.collect);
@@ -146,6 +160,7 @@ test "client and server complete a real loopback handshake" {
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
     try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+    try std.testing.expect(harness.user_data_on_disconnect);
 
     const retransmission_deadline = client.core.nextRetransmissionDeadline().?;
     try std.testing.expectEqual(retransmission_deadline, client.nextDeadline().?);
@@ -292,6 +307,61 @@ test "graceful client close delivers queued data before the disconnect" {
     try std.testing.expect(client.nextDeadline() == null);
     try server_task.await(io);
     try std.testing.expectEqual(@as(usize, 3), harness.received_before_disconnect);
+}
+
+test "listener local address supports port zero and reuse port" {
+    const io = std.testing.io;
+    const ipv4 = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    if (builtin.os.tag != .linux) {
+        try std.testing.expectError(error.ReusePortUnsupported, raknet.Server.listen(std.testing.allocator, io, ipv4, .{ .advertisement = "MCPE;reuse", .reuse_port = true }));
+        return;
+    }
+    for ([_][]const u8{ "127.0.0.1:0", "[::1]:0" }) |literal| {
+        const address = try std.Io.net.IpAddress.parseLiteral(literal);
+        const first = try raknet.Server.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;reuse", .reuse_port = true });
+        defer first.destroy();
+        const bound = first.localAddress();
+        switch (bound) {
+            .ip4 => |value| try std.testing.expect(value.port != 0),
+            .ip6 => |value| try std.testing.expect(value.port != 0),
+        }
+        const second = try raknet.Server.listen(std.testing.allocator, io, bound, .{ .advertisement = "MCPE;reuse", .reuse_port = true });
+        defer second.destroy();
+        const third = try raknet.Server.listen(std.testing.allocator, io, bound, .{ .advertisement = "MCPE;reuse", .reuse_port = true });
+        defer third.destroy();
+        try std.testing.expectEqual(bound, second.localAddress());
+        try std.testing.expectEqual(bound, third.localAddress());
+    }
+}
+
+test "IPv6 client local address uses the bound port" {
+    if (builtin.os.tag != .linux) return;
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    const address = try std.Io.net.IpAddress.parseLiteral("[::1]:0");
+    const listener = try raknet.Server.listen(std.testing.allocator, io, address, .{ .advertisement = "MCPE;IPv6" });
+    defer listener.destroy();
+    const Harness = struct {
+        listener: *raknet.Server,
+        connected: bool = false,
+        fn onConnect(raw: *anyopaque, _: *raknet.Session) error{ApplicationFailure}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.connected = true;
+        }
+        fn onMessage(_: *anyopaque, _: *raknet.Session, _: raknet.BorrowedPayload) error{ApplicationFailure}!void {}
+        fn run(self: *@This()) !void {
+            while (!self.connected) _ = try self.listener.poll(.none, .{ .context = self, .connected = onConnect, .message = onMessage });
+        }
+    };
+    var harness: Harness = .{ .listener = listener };
+    var task = try io.concurrent(Harness.run, .{&harness});
+    defer task.cancel(io) catch {};
+    const client = try Client.connect(std.testing.allocator, io, listener.localAddress(), .{ .handshake_retry_ms = 10 });
+    defer client.destroy();
+    try task.await(io);
+    try std.testing.expect(client.localAddress().ip6.port != 0);
+    try std.testing.expect(listener.localAddress().ip6.port != 0);
 }
 
 test "client readiness wakes on data and disconnect without polling" {
