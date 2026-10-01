@@ -8,11 +8,13 @@ pub const Config = @import("config.zig").Config;
 pub const FlushResult = @import("session/core.zig").FlushResult;
 pub const ListenerStatistics = @import("transport/server.zig").ListenerStatistics;
 pub const OwnedPayload = @import("payload.zig").OwnedPayload;
+pub const Pong = @import("transport/ping.zig").Pong;
 pub const SendHandle = @import("session/core.zig").SendHandle;
 pub const Server = @import("transport/server.zig").Listener;
 pub const ServerOptions = @import("transport/server.zig").Options;
 pub const Session = @import("transport/server.zig").Session;
 pub const SessionStatistics = @import("session/core.zig").Statistics;
+pub const ping = @import("transport/ping.zig").ping;
 
 pub const advanced = struct {
     pub const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;

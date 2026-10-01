@@ -5,6 +5,32 @@ const Client = raknet.Client;
 const Config = raknet.Config;
 const Options = raknet.ClientOptions;
 
+test "public ping receives an opaque advertisement over loopback" {
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var listener = try raknet.Server.listen(std.testing.allocator, io, try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"), .{ .advertisement = "MCPE;loopback" });
+    defer listener.destroy();
+    const Harness = struct {
+        listener: *raknet.Server,
+        fn connected(_: *anyopaque, _: *raknet.Session) !void {}
+        fn message(_: *anyopaque, _: *raknet.Session, _: raknet.BorrowedPayload) !void {}
+        fn run(self: *@This()) !void {
+            const stats = try self.listener.poll(.none, .{ .context = self, .connected = connected, .message = message });
+            try std.testing.expectEqual(@as(usize, 1), stats.datagrams);
+        }
+    };
+    var harness: Harness = .{ .listener = listener };
+    var task = try io.concurrent(Harness.run, .{&harness});
+    defer task.cancel(io) catch {};
+    var buffer: [1492]u8 = undefined;
+    const pong = try raknet.ping(io, listener.localAddress(), &buffer, 1_000);
+    try task.await(io);
+    try std.testing.expectEqual(listener.handshake_handler.server_guid, pong.server_guid);
+    try std.testing.expectEqualStrings("MCPE;loopback", pong.advertisement);
+    try std.testing.expectError(error.InvalidConfiguration, raknet.ping(io, listener.localAddress(), buffer[0..34], 1_000));
+}
+
 test "client and server complete a real loopback handshake" {
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();

@@ -71,6 +71,15 @@ fn expectMagic(reader: *cursor.Reader) !void {
 }
 
 pub const UnconnectedPing = struct { time: u64, client_guid: u64, open_connections_only: bool };
+pub fn encodeUnconnectedPing(time: u64, client_guid: u64, output: []u8) ![]u8 {
+    var w: cursor.Writer = .{ .data = output };
+    try w.byte(@intFromEnum(Id.unconnected_ping));
+    try w.u64be(time);
+    try w.bytes(&magic);
+    try w.u64be(client_guid);
+    return w.written();
+}
+
 pub fn decodeUnconnectedPing(data: []const u8) !UnconnectedPing {
     var r: cursor.Reader = .{ .data = data };
     const id = try r.byte();
@@ -119,6 +128,19 @@ pub fn encodeUnconnectedPong(time: u64, server_guid: u64, advertisement: []const
     try w.u16be(@intCast(advertisement.len));
     try w.bytes(advertisement);
     return w.written();
+}
+
+pub const UnconnectedPong = struct { time: u64, server_guid: u64, advertisement: []const u8 };
+pub fn decodeUnconnectedPong(data: []const u8) !UnconnectedPong {
+    var r: cursor.Reader = .{ .data = data };
+    if (try r.byte() != @intFromEnum(Id.unconnected_pong)) return error.WrongPacket;
+    const time = try r.u64be();
+    const server_guid = try r.u64be();
+    try expectMagic(&r);
+    const length = try r.u16be();
+    const advertisement = try r.take(length);
+    if (r.remaining() != 0) return error.TrailingData;
+    return .{ .time = time, .server_guid = server_guid, .advertisement = advertisement };
 }
 
 pub fn encodeOpenConnectionRequest1(protocol_version: u8, mtu: u16, output: []u8) ![]u8 {
@@ -223,6 +245,35 @@ test "offline ping validates magic and exact structure" {
     try std.testing.expectEqual(@as(u64, 5), ping.time);
     bytes[9] ^= 1;
     try std.testing.expectError(error.InvalidMagic, decodeUnconnectedPing(w.written()));
+}
+
+test "unconnected ping and pong validate exact wire structure" {
+    var ping_bytes: [33]u8 = undefined;
+    const ping = try encodeUnconnectedPing(0x0102030405060708, 9, &ping_bytes);
+    try std.testing.expectEqual(@as(usize, 33), ping.len);
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), (try decodeUnconnectedPing(ping)).time);
+    try std.testing.expectError(error.NoSpaceLeft, encodeUnconnectedPing(1, 2, ping_bytes[0..32]));
+
+    var pong_bytes: [40]u8 = undefined;
+    const pong = try encodeUnconnectedPong(0x0102030405060708, 10, "MCPE;", &pong_bytes);
+    const decoded = try decodeUnconnectedPong(pong);
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), decoded.time);
+    try std.testing.expectEqual(@as(u64, 10), decoded.server_guid);
+    try std.testing.expectEqualStrings("MCPE;", decoded.advertisement);
+    try std.testing.expectEqual(@intFromPtr(pong.ptr) + 35, @intFromPtr(decoded.advertisement.ptr));
+    for (0..pong.len) |length| try std.testing.expectError(error.Truncated, decodeUnconnectedPong(pong[0..length]));
+    pong[0] = 0;
+    try std.testing.expectError(error.WrongPacket, decodeUnconnectedPong(pong));
+    pong[0] = @intFromEnum(Id.unconnected_pong);
+    pong[17] ^= 1;
+    try std.testing.expectError(error.InvalidMagic, decodeUnconnectedPong(pong));
+    pong[17] ^= 1;
+    pong[33] = 0;
+    pong[34] = 6;
+    try std.testing.expectError(error.Truncated, decodeUnconnectedPong(pong));
+    pong[33] = 0;
+    pong[34] = 4;
+    try std.testing.expectError(error.TrailingData, decodeUnconnectedPong(pong));
 }
 
 test "addresses round trip and truncate safely" {
