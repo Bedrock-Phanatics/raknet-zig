@@ -93,6 +93,11 @@ pub const Recovery = struct {
         self.* = undefined;
     }
 
+    pub fn clear(self: *Recovery) void {
+        while (self.active_head != none) self.removeSlot(self.active_head);
+        for (self.slots) |*slot| slot.* = .{};
+    }
+
     pub fn track(self: *Recovery, raw_sequence: u32, data: []const u8, in_flight_bytes: usize, now_ms: u64, rto_ms: u32) !void {
         const sequence = uint24.normalize(raw_sequence);
         if (data.len == 0 or data.len > self.mtu or in_flight_bytes > std.math.maxInt(u16)) return error.InvalidDatagram;

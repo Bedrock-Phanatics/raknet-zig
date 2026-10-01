@@ -522,7 +522,13 @@ pub const Core = struct {
 
     pub fn advanceClose(self: *Core, now_ms: u64) !CloseStep {
         const deadline = self.close_deadline_ms orelse return .pending;
-        if (now_ms >= deadline) return .done;
+        if (now_ms >= deadline) {
+            self.recovery_state.clear();
+            self.outbound_state.clear();
+            self.outbound_packetization = @splat(null);
+            self.congestion_state.cancel(self.congestion_state.in_flight);
+            return .done;
+        }
         if (self.outbound_state.countAll() != 0 or self.recovery_state.count() != 0) return .pending;
         if (self.disconnect_queued) return .done;
         _ = try self.enqueueOutbound(.control, &.{@intFromEnum(offline.Id.disconnect_notification)}, .reliable_ordered, 0);
@@ -1113,4 +1119,19 @@ test "close is forced at the shutdown deadline when the ACK never arrives" {
     try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 99));
     try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 100));
     try std.testing.expectEqual(@as(usize, 1), peer.count);
+    try expectClosedClean(&core);
+}
+
+test "close deadline discards queued data" {
+    var config: Config = .{};
+    config.timing.shutdown_timeout_ms = 100;
+    var core = try Core.init(std.testing.allocator, 576, config);
+    defer core.deinit();
+    var peer: ClosePeer = .{};
+    _ = try core.enqueueOutbound(.application, "queued", .reliable_ordered, 0);
+    core.beginClose(0);
+    try std.testing.expectEqual(CloseStep.pending, try peer.step(&core, 0));
+    try std.testing.expectEqual(CloseStep.done, try peer.step(&core, 100));
+    try std.testing.expectEqual(@as(usize, 0), peer.count);
+    try expectClosedClean(&core);
 }

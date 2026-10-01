@@ -274,6 +274,29 @@ test "handshake deadline and cancellation release every resource" {
     try std.testing.expectError(error.Canceled, task.cancel(io));
 }
 
+test "connected handshake timeout releases every resource" {
+    var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+    defer io_instance.deinit();
+    const io = io_instance.io();
+    var listener = try raknet.Server.listen(std.testing.allocator, io, try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"), .{ .advertisement = "MCPE;timeout" });
+    defer listener.destroy();
+    const Harness = struct {
+        listener: *raknet.Server,
+        fn connected(_: *anyopaque, _: *raknet.Session) !void {}
+        fn message(_: *anyopaque, _: *raknet.Session, _: raknet.BorrowedPayload) !void {}
+        fn run(self: *@This()) !void {
+            while (self.listener.sessions.count() == 0) {
+                _ = try self.listener.poll(.none, .{ .context = self, .connected = connected, .message = message });
+            }
+        }
+    };
+    var harness: Harness = .{ .listener = listener };
+    var task = try io.concurrent(Harness.run, .{&harness});
+    defer task.cancel(io) catch {};
+    try std.testing.expectError(error.Timeout, Client.connect(std.testing.allocator, io, listener.localAddress(), .{ .handshake_timeout_ms = 200, .handshake_retry_ms = 10 }));
+    try task.await(io);
+}
+
 test "graceful client close delivers queued data before the disconnect" {
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();

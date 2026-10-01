@@ -157,10 +157,11 @@ pub const Client = struct {
         const receive_storage = try allocator.alloc(u8, try std.math.mul(usize, options.receive_batch_size, options.config.protocol.maximum_datagram_size));
         errdefer allocator.free(receive_storage);
 
+        var transferred = false;
         var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
-        errdefer core.deinit();
+        errdefer if (transferred) self.core.deinit() else core.deinit();
         var receipts = try receipt_batch.Batch.init(allocator, options.config.batching.maximum_ack_records, reply2.mtu, options.config.protocol.maximum_acknowledged_datagrams);
-        errdefer receipts.deinit();
+        errdefer if (transferred) self.receipts.deinit() else receipts.deinit();
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -178,6 +179,7 @@ pub const Client = struct {
             .mtu = reply2.mtu,
             .last_seen_ms = time.nowMilliseconds(io),
         };
+        transferred = true;
         try self.finishConnectedHandshake(&negotiator, deadline, options.handshake_retry_ms, options.config.batching.maximum_packets_per_iteration);
         self.last_seen_ms = time.nowMilliseconds(io);
         return self;

@@ -76,6 +76,12 @@ pub const Queue = struct {
         self.* = undefined;
     }
 
+    pub fn clear(self: *Queue) void {
+        for ([_]Lane{ .control, .application }) |lane| {
+            while (self.pop(lane)) |message| message.payload.deinit();
+        }
+    }
+
     pub fn enqueue(self: *Queue, lane: Lane, payload: []const u8, reliability: frame.Reliability, channel: u8) !Id {
         if (payload.len == 0) return error.EmptyPayload;
         if (self.next_id == std.math.maxInt(Id)) return error.OutboundQueueIdExhausted;
