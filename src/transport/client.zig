@@ -422,7 +422,7 @@ pub const Client = struct {
             const attempt = time.earliest(self.io, deadline, time.after(self.io, retry_ms));
             const message = self.socket.receive(self.receive_buffer, attempt) catch |err| switch (err) {
                 error.Timeout => {
-                    if (std.Io.Clock.awake.now(self.io).nanoseconds >= deadline.deadline.raw.nanoseconds) return error.Timeout;
+                    if (attempt.deadline.raw.nanoseconds == deadline.deadline.raw.nanoseconds or std.Io.Clock.awake.now(self.io).nanoseconds >= deadline.deadline.raw.nanoseconds) return error.Timeout;
                     _ = try self.flushRetransmissions(time.nowMilliseconds(self.io), self.core.config.batching.maximum_packets_per_iteration);
                     continue;
                 },

@@ -293,7 +293,7 @@ test "connected handshake timeout releases every resource" {
     var harness: Harness = .{ .listener = listener };
     var task = try io.concurrent(Harness.run, .{&harness});
     defer task.cancel(io) catch {};
-    try std.testing.expectError(error.Timeout, Client.connect(std.testing.allocator, io, listener.localAddress(), .{ .handshake_timeout_ms = 200, .handshake_retry_ms = 10 }));
+    try std.testing.expectError(error.Timeout, Client.connect(std.testing.allocator, io, listener.localAddress(), .{ .handshake_timeout_ms = 200, .handshake_retry_ms = 200 }));
     try task.await(io);
 }
 
