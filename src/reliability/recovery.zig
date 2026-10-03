@@ -216,9 +216,25 @@ pub const Recovery = struct {
     }
 
     fn resequence(self: *Recovery, from: u32, next: *u32) *Slot {
-        const sequence = uint24.normalize(next.*);
-        const to: u32 = @intCast(sequence % self.slots.len);
-        if (self.slots[to].occupied) return &self.slots[from];
+        var sequence = uint24.normalize(next.*);
+        var to: u32 = @intCast(sequence % self.slots.len);
+        var skipped: usize = 0;
+        while (self.slots[to].occupied and skipped < self.slots.len) : (skipped += 1) {
+            sequence = uint24.add(sequence, 1);
+            to = @intCast(sequence % self.slots.len);
+        }
+        if (skipped == self.slots.len) {
+            while (sequence % self.slots.len != from) sequence = uint24.add(sequence, 1);
+            const slot = &self.slots[from];
+            slot.previous = slot.sequence;
+            slot.sequence = sequence;
+            const data = self.blocks[slot.block_index].data;
+            data[1] = @truncate(sequence);
+            data[2] = @truncate(sequence >> 8);
+            data[3] = @truncate(sequence >> 16);
+            next.* = uint24.add(sequence, 1);
+            return slot;
+        }
         const previous = self.slots[from].sequence;
         self.slots[to] = self.slots[from];
         self.slots[from] = .{ .sequence = previous, .forward = to };
@@ -275,7 +291,7 @@ pub const Recovery = struct {
         const sequence = uint24.normalize(raw_sequence);
         const index: u32 = @intCast(sequence % self.slots.len);
         const slot = self.slots[index];
-        if (slot.occupied) return if (slot.sequence == sequence) index else null;
+        if (slot.occupied) return if (slot.sequence == sequence or slot.previous == sequence) index else null;
         if (slot.forward == none or slot.sequence != sequence) return null;
         const target = self.slots[slot.forward];
         return if (target.occupied and target.previous == sequence) slot.forward else null;
@@ -568,6 +584,39 @@ test "resends move to a fresh sequence and keep their state" {
     try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 0xffffff, .last = 0xffffff }}, 60, 8)).packets);
 }
 
+test "retransmission skips an occupied sequence slot" {
+    var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
+    defer recovery.deinit();
+    try recovery.track(1, "\x84\x01\x00\x00a", 5, 0, 1);
+    try recovery.track(2, "\x84\x02\x00\x00b", 5, 0, 100);
+    var next: u32 = 2;
+    var due: [1]Due = undefined;
+    const batch = recovery.collectDueResequenced(1, 1, &due, 1, &next);
+    try std.testing.expectEqual(@as(u32, 3), batch.items[0].sequence);
+    try std.testing.expectEqual(@as(u32, 4), next);
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 3, .last = 3 }}, 2, 4)).packets);
+    try std.testing.expectEqual(@as(usize, 1), recovery.count());
+}
+
+test "full recovery ring retransmits with a fresh sequence" {
+    var recovery = try Recovery.init(std.testing.allocator, 2, 1152, 8, 576);
+    defer recovery.deinit();
+    try recovery.track(0, "\x84\x00\x00\x00a", 5, 0, 1);
+    try recovery.track(1, "\x84\x01\x00\x00b", 5, 0, 100);
+    var next: u32 = 2;
+    var due: [1]Due = undefined;
+    const batch = recovery.collectDueResequenced(1, 1, &due, 1, &next);
+    try std.testing.expectEqual(@as(u32, 4), batch.items[0].sequence);
+    try std.testing.expectEqual(@as(u32, 5), next);
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 4, .last = 4 }}, 2, 2)).packets);
+    try std.testing.expectEqual(@as(usize, 1), recovery.count());
+    try recovery.track(6, "\x84\x06\x00\x00c", 5, 2, 100);
+    next = 7;
+    try std.testing.expectEqual(@as(u32, 9), recovery.collectDueResequenced(100, 1, &due, 1, &next).items[0].sequence);
+    try std.testing.expectEqual(@as(usize, 1), (try recovery.acknowledge(&.{.{ .first = 1, .last = 1 }}, 101, 2)).packets);
+    try std.testing.expectEqual(@as(usize, 1), recovery.count());
+}
+
 test "repeated resends survive ring collisions wrap and long abandon timeouts" {
     var recovery = try Recovery.init(std.testing.allocator, 4, 2304, 8, 576);
     defer recovery.deinit();
@@ -578,7 +627,7 @@ test "repeated resends survive ring collisions wrap and long abandon timeouts" {
     var due: [2]Due = undefined;
     const collision = recovery.collectDueResequenced(1, 1, &due, 2, &next);
     try std.testing.expectEqual(@as(usize, 2), collision.items.len);
-    try std.testing.expectEqual(@as(u32, 0xffffff), next);
+    try std.testing.expectEqual(@as(u32, 2), next);
     // Simulate an unreliable send using the blocked sequence.
     next = 0;
     for (0..300) |iteration| {
