@@ -65,6 +65,7 @@ pub const Client = struct {
 
         fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
             const self: *PollBridge = @ptrCast(@alignCast(raw));
+            if (self.remote_disconnect or self.client.closed) return;
             const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
             switch (packet) {
                 .connected_ping => |sent| {
@@ -294,6 +295,7 @@ pub const Client = struct {
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
         var deadline = time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms);
+        if (self.core.receiver_state.hasPendingDeliveries()) deadline = self.last_seen_ms;
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
@@ -313,12 +315,22 @@ pub const Client = struct {
     }
 
     pub fn processTimers(self: *Client, now_ms: u64) !void {
+        _ = try self.processTimersAt(now_ms, null);
+    }
+
+    /// Advances timers and delivers buffered ordered messages within the turn budget.
+    pub fn processTimersWithMessages(self: *Client, now_ms: u64, context: *anyopaque, on_message: MessageFn) !usize {
+        var bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
+        return self.processTimersAt(now_ms, &bridge);
+    }
+
+    fn processTimersAt(self: *Client, now_ms: u64, bridge: ?*PollBridge) !usize {
         if (self.closed) return error.ConnectionClosed;
         if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms))) {
             self.abort();
             return error.ConnectionTimedOut;
         }
-        self.processDueTimers(now_ms, self.core.config.batching.maximum_packets_per_iteration) catch |err| {
+        const delivered = self.processDueTimers(now_ms, self.core.config.batching.maximum_packets_per_iteration, bridge) catch |err| {
             self.abort();
             return err;
         };
@@ -326,14 +338,14 @@ pub const Client = struct {
             self.abort();
             return err;
         };
+        return delivered;
     }
 
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         if (self.timer_turn) {
             self.timer_turn = false;
-            try self.processTimers(time.nowMilliseconds(self.io));
-            return 0;
+            return self.processTimersWithMessages(time.nowMilliseconds(self.io), context, on_message);
         }
         if (self.pending_receive_error) |err| {
             self.pending_receive_error = null;
@@ -342,7 +354,8 @@ pub const Client = struct {
         if (self.pending_message_index == self.pending_message_count) {
             const batch = self.socket.receiveMany(self.messages, self.receive_storage, self.pollTimeout(timeout)) catch |err| switch (err) {
                 error.Timeout => {
-                    try self.processTimers(time.nowMilliseconds(self.io));
+                    const delivered = try self.processTimersWithMessages(time.nowMilliseconds(self.io), context, on_message);
+                    if (delivered != 0) return delivered;
                     return error.Timeout;
                 },
                 else => return err,
@@ -398,7 +411,8 @@ pub const Client = struct {
             return err;
         };
         remaining -= @min(remaining, flushed.datagrams);
-        self.processDueTimers(latest_ms, remaining) catch |err| {
+        var timer_bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = latest_ms };
+        delivered += self.processDueTimers(latest_ms, remaining, &timer_bridge) catch |err| {
             self.abortOnError(.retransmission, err);
             return err;
         };
@@ -491,22 +505,25 @@ pub const Client = struct {
         if (self.receipts.isEmpty()) self.ack_deadline_ms = null;
         return sent;
     }
-    fn processDueTimers(self: *Client, now_ms: u64, maximum_work: usize) !void {
-        if (maximum_work == 0) return;
+    fn processDueTimers(self: *Client, now_ms: u64, maximum_work: usize, bridge: ?*PollBridge) !usize {
+        if (maximum_work == 0) return 0;
+        var delivered: usize = 0;
         var remaining = maximum_work;
         var active: usize = @as(usize, @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms)) +
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
-            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
+            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false) +
+            @intFromBool(bridge != null and self.core.receiver_state.hasPendingDeliveries());
         const start = self.timer_cursor;
         var visited: usize = 0;
-        while (visited < 4 and remaining != 0 and active != 0) : (visited += 1) {
-            const timer = (start + visited) % 4;
+        while (visited < 5 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 5;
             const due = switch (timer) {
                 0 => self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms,
                 1 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
                 2 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
-                else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+                3 => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+                else => bridge != null and self.core.receiver_state.hasPendingDeliveries(),
             };
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
@@ -514,12 +531,20 @@ pub const Client = struct {
                 0 => try self.flushReceiptsUpTo(quota),
                 1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
                 2 => self.core.expireSplits(now_ms, quota).inspected,
-                else => try self.flushRetransmissions(now_ms, quota),
+                3 => try self.flushRetransmissions(now_ms, quota),
+                else => try self.core.receiver_state.drainPending(quota, bridge.?, PollBridge.deliver),
             };
+            if (timer == 4) delivered += used;
             remaining -= @min(remaining, @max(@as(usize, 1), used));
             active -= 1;
-            self.timer_cursor = @intCast((timer + 1) % 4);
+            self.timer_cursor = @intCast((timer + 1) % 5);
+            if (bridge) |delivery| if (delivery.remote_disconnect) {
+                self.flushReceipts() catch {};
+                self.abort();
+                break;
+            };
         }
+        return delivered;
     }
 
     fn flushRetransmissions(self: *Client, now_ms: u64, maximum_work: usize) !usize {

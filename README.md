@@ -88,6 +88,8 @@ pub fn main(init: std.process.Init) !void {
 
 Payloads are valid only during their callback. Use `payload.toOwned(allocator)` to retain a copy and release it when done. Keep each client or listener on one event loop.
 
+Ordered delivery that exhausts a turn budget resumes on the next deadline. External client event loops should use `processTimersWithMessages(now_ms, context, onMessage)` so buffered messages can be delivered without another datagram. `processTimers` only advances protocol timers; `poll` handles both. Advanced `Receiver` users must call `drainPending` while `hasPendingDeliveries` is true.
+
 `send` sends immediately or queues a copy, returning an error if the queue is full. `trySend` returns `false` under backpressure without queuing. The caller can reuse its buffer after either call.
 
 `Client.close()` starts graceful shutdown. Keep calling `poll()` or `processTimers()` until `isClosed()` is true. `Session.close()` requires continued listener polling. Closing rejects new sends and drains pending data until the shutdown timeout. Use `destroy()` for immediate teardown.

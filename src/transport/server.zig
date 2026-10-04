@@ -351,6 +351,7 @@ pub const Session = struct {
             return;
         }
         var deadline = time.deadline(self.last_seen_ms, self.idle_timeout_ms);
+        if (self.core.receiver_state.hasPendingDeliveries()) deadline = self.last_seen_ms;
         if (self.state == .connecting) deadline = @min(deadline, self.handshake_deadline_ms);
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
@@ -359,21 +360,23 @@ pub const Session = struct {
         if (self.core.close_deadline_ms) |close_deadline| deadline = @min(deadline, close_deadline);
         try self.deadlines.upsert(self.key, deadline);
     }
-    fn processDueTimers(self: *Session, now_ms: u64, maximum_work: usize) !usize {
+    fn processDueTimers(self: *Session, now_ms: u64, maximum_work: usize, bridge: *DeliveryBridge) !usize {
         var remaining = maximum_work;
         var active: usize = @as(usize, @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms)) +
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
-            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
+            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false) +
+            @intFromBool(self.core.receiver_state.hasPendingDeliveries());
         const start = self.timer_cursor;
         var visited: usize = 0;
-        while (visited < 4 and remaining != 0 and active != 0) : (visited += 1) {
-            const timer = (start + visited) % 4;
+        while (visited < 5 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 5;
             const due = switch (timer) {
                 0 => self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms,
                 1 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
                 2 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
-                else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+                3 => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+                else => self.core.receiver_state.hasPendingDeliveries(),
             };
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
@@ -381,11 +384,12 @@ pub const Session = struct {
                 0 => try self.flushReceiptsUpTo(quota),
                 1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
                 2 => self.core.expireSplits(now_ms, quota).inspected,
-                else => try self.flushRetransmissions(now_ms, quota),
+                3 => try self.flushRetransmissions(now_ms, quota),
+                else => try self.core.receiver_state.drainPending(quota, bridge, DeliveryBridge.deliver),
             };
             remaining -= @min(remaining, @max(@as(usize, 1), used));
             active -= 1;
-            self.timer_cursor = @intCast((timer + 1) % 4);
+            self.timer_cursor = @intCast((timer + 1) % 5);
         }
         return maximum_work - remaining;
     }
@@ -854,18 +858,23 @@ pub const Listener = struct {
             const sessions_left = due_count - index;
             const quota = @max(@as(usize, 1), remaining / sessions_left);
             session.scheduling_deferred = true;
-            const used = session.processDueTimers(now_ms, quota) catch |err| {
-                recordSessionFailure(stats, core_mod.classifyTransitionError(.retransmission, err).class);
+            var bridge: DeliveryBridge = .{ .callbacks = callbacks, .session = session, .now_ms = now_ms };
+            const used = session.processDueTimers(now_ms, quota, &bridge) catch |err| {
+                recordSessionFailure(stats, if (err == error.RetransmissionLimitExceeded) .transport else core_mod.classifyIncomingError(err).class);
                 session.state = .closed;
                 self.removeSession(entry.key, callbacks);
                 continue;
             };
+            if (bridge.connected) self.handshakes_completed += 1;
             remaining -= @min(remaining, @max(@as(usize, 1), used));
             session.advanceClose(now_ms) catch |err| {
                 recordSessionFailure(stats, core_mod.classifyTransitionError(.application_send, err).class);
                 session.state = .closed;
             };
             if (session.state == .closed) {
+                session.flushReceipts() catch |err| {
+                    recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
+                };
                 self.removeSession(entry.key, callbacks);
                 continue;
             }
@@ -1181,6 +1190,84 @@ test "graceful session close drains data and retransmits the disconnect until AC
     try std.testing.expectEqual(@as(usize, 1), stats.queued_packets_high_water);
 }
 
+test "timers resume ordered delivery without another datagram and close on callback failure" {
+    const Harness = struct {
+        delivered: usize = 0,
+        disconnected: usize = 0,
+        fail: bool = false,
+        fn connected(_: *anyopaque, _: *Session) !void {}
+        fn message(raw: *anyopaque, _: *Session, payload: receiver.BorrowedPayload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail or payload.bytes.len != 2 or payload.bytes[1] != self.delivered) return error.ApplicationFailure;
+            self.delivered += 1;
+        }
+        fn disconnectedCallback(raw: *anyopaque, _: *Session) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.disconnected += 1;
+        }
+        fn callbacks(self: *@This()) Callbacks {
+            return .{ .context = self, .connected = @This().connected, .message = message, .disconnected = disconnectedCallback };
+        }
+    };
+    const Mode = enum { normal, failure, disconnect };
+    for ([_]Mode{ .normal, .failure, .disconnect }) |mode| {
+        const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+        var config: Config = .{};
+        config.batching.maximum_packets_per_iteration = 2;
+        if (mode == .disconnect) config.timing.maximum_ack_delay_ms = 10;
+        var listener = try Listener.listen(std.testing.allocator, std.testing.io, address, .{ .advertisement = "test", .config = config });
+        defer listener.destroy();
+        var peer = try backend.Socket.bind(std.testing.io, address, 576);
+        defer peer.close();
+        const session = try CloseHarness.open(listener, &peer);
+        var harness: Harness = .{};
+        var storage: [128]u8 = undefined;
+        for ([_]u8{ 1, 2, 3, 4, 5, 0 }, 0..) |order, sequence| {
+            const payload = [_]u8{ 0xfe, order };
+            const frames = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = @intCast(sequence), .order_index = order, .order_channel = 0, .payload = if (mode == .disconnect and order == 3) &.{@backingInt(offline.Id.disconnect_notification)} else &payload }};
+            const wire = try @import("../protocol/datagram.zig").encodeData(@intCast(sequence), &frames, &storage);
+            listener.messages[0] = .{ .from = peer.value.address, .data = wire, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+            listener.pending_message_index = 0;
+            listener.pending_message_count = 1;
+            while (listener.pending_message_count != 0) _ = try listener.poll(.none, harness.callbacks());
+        }
+        try std.testing.expectEqual(@as(usize, 2), harness.delivered);
+        try std.testing.expect(listener.nextDeadline().? <= time.nowMilliseconds(listener.io));
+        harness.fail = mode == .failure;
+        var failures: usize = 0;
+        for (0..8) |_| {
+            const stats = try listener.processTimers(time.nowMilliseconds(listener.io), harness.callbacks());
+            failures += stats.application_failures;
+            if (failures != 0 or harness.delivered == 6 or harness.disconnected != 0) break;
+        }
+        if (mode != .normal) {
+            try std.testing.expectEqual(@as(usize, if (mode == .failure) 1 else 0), failures);
+            try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
+            try std.testing.expectEqual(@as(usize, 0), listener.sessions.count());
+            try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+            if (mode == .disconnect) {
+                try std.testing.expectEqual(@as(usize, 3), harness.delivered);
+                var acknowledged = false;
+                for (0..8) |_| {
+                    const message = try peer.receive(&storage, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+                    var records: [8]@import("../protocol/ack.zig").Record = undefined;
+                    const packet = try @import("../protocol/datagram.zig").decode(message.data, &records, records.len, 8);
+                    if (packet == .ack) for (packet.ack.records) |record| {
+                        if (record.first <= 5 and record.last >= 5) acknowledged = true;
+                    };
+                    if (acknowledged) break;
+                }
+                try std.testing.expect(acknowledged);
+            }
+        } else {
+            try std.testing.expectEqual(@as(usize, 6), harness.delivered);
+            try std.testing.expectEqual(@as(usize, 0), session.core.receiver_state.ordered.count());
+            try std.testing.expect(!session.core.receiver_state.hasPendingDeliveries());
+            try std.testing.expect(listener.nextDeadline().? > time.nowMilliseconds(listener.io));
+        }
+    }
+}
+
 test "advertisement updates are bounded and used by the next pong" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
@@ -1347,7 +1434,9 @@ test "every due session timer runs when several are due together" {
     try session.queueReceipt(.{ .acknowledge = 1 }, 0);
     session.outbound_deadline_ms = 0;
     const now = session.core.nextRetransmissionDeadline().?;
-    _ = try session.processDueTimers(now, 16);
+    var harness: CloseHarness = .{};
+    var bridge: DeliveryBridge = .{ .callbacks = harness.callbacks(), .session = session, .now_ms = now };
+    _ = try session.processDueTimers(now, 16, &bridge);
     try std.testing.expectEqual(@as(?u64, null), session.ack_deadline_ms);
     try std.testing.expectEqual(@as(?u64, null), session.outbound_deadline_ms);
     try std.testing.expect(session.core.nextRetransmissionDeadline().? > now);

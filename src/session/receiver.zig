@@ -39,6 +39,7 @@ pub const Receiver = struct {
     ordered: ordered_store.Store,
     sequenced: []ordered_store.Sequenced,
     stale: bool = false,
+    pending_ordered: std.StaticBitSet(256) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Receiver {
         try config.validate();
@@ -86,6 +87,31 @@ pub const Receiver = struct {
 
     pub fn expireSplits(self: *Receiver, now_ms: u64, maximum_work: usize) reassembly.ExpiryBatch {
         return self.splits.expire(now_ms, maximum_work);
+    }
+
+    pub fn hasPendingDeliveries(self: *const Receiver) bool {
+        return self.pending_ordered.findFirstSet() != null;
+    }
+
+    pub fn drainPending(self: *Receiver, maximum_work: usize, context: *anyopaque, deliver: DeliverFn) !usize {
+        var delivered: usize = 0;
+        while (delivered < maximum_work) {
+            const channel: u8 = @intCast(self.pending_ordered.findFirstSet() orelse break);
+            delivered += try self.drainChannel(channel, maximum_work - delivered, context, deliver);
+        }
+        return delivered;
+    }
+
+    fn drainChannel(self: *Receiver, channel: u8, maximum_work: usize, context: *anyopaque, deliver: DeliverFn) !usize {
+        var delivered: usize = 0;
+        while (delivered < maximum_work) {
+            const owned = try self.ordered.pop(channel) orelse break;
+            defer owned.deinit();
+            try deliverPayload(context, owned.bytes, deliver);
+            delivered += 1;
+        }
+        self.pending_ordered.setValue(channel, self.ordered.peek(channel, try self.ordered.expectedIndex(channel)) != null);
+        return delivered;
     }
 
     pub fn process(self: *Receiver, data: []const u8, now_ms: u64, context: *anyopaque, deliver: DeliverFn) !Receipt {
@@ -214,14 +240,7 @@ pub const Receiver = struct {
                 try self.commitReliable(value.reliable_index);
                 try deliverPayload(context, payload, deliver);
                 try self.ordered.advanceBorrowed(channel, index);
-                var delivered: usize = 1;
-                while (try self.ordered.pop(channel)) |owned| {
-                    defer owned.deinit();
-                    try deliverPayload(context, owned.bytes, deliver);
-                    delivered += 1;
-                    if (delivered >= self.config.batching.maximum_packets_per_iteration) break;
-                }
-                return delivered;
+                return 1 + try self.drainChannel(channel, self.config.batching.maximum_packets_per_iteration - 1, context, deliver);
             }
             _ = try self.ordered.push(channel, index, payload);
             try self.commitReliable(value.reliable_index);
@@ -254,6 +273,51 @@ pub const Receiver = struct {
         }
     }
 };
+
+test "ordered delivery resumes within its budget across channels and sequence wrap" {
+    for ([_]usize{ 1, 2 }) |budget| {
+        var config: Config = .{};
+        config.batching.maximum_packets_per_iteration = budget;
+        config.protocol.maximum_order_channels = 256;
+        var value = try Receiver.init(std.testing.allocator, config);
+        defer value.deinit();
+        var collector: TestCollector = .{};
+        var wire: [128]u8 = undefined;
+        var scratch: [1]frame.Frame = undefined;
+        var sequence: u32 = 0;
+        for ([_]u8{ 0, 255 }) |channel| {
+            value.ordered.channels[channel].expected = 0xfffffe;
+            for (1..4) |offset| {
+                const frames = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = sequence, .order_index = uint24.add(0xfffffe, @intCast(offset)), .order_channel = channel, .payload = "queued" }};
+                _ = try value.processWithScratch(try testDatagram(sequence, &frames, &wire), 0, &scratch, &collector, TestCollector.deliver);
+                sequence += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), collector.count);
+        try std.testing.expect(!value.hasPendingDeliveries());
+        for ([_]u8{ 0, 255 }) |channel| {
+            const frames = [_]frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = sequence, .order_index = 0xfffffe, .order_channel = channel, .payload = "first" }};
+            const encoded = try testDatagram(sequence, &frames, &wire);
+            const receipt = try value.process(encoded, 1, &collector, TestCollector.deliver);
+            try std.testing.expectEqual(budget, receipt.delivered);
+            try std.testing.expectEqual(@as(usize, 0), (try value.process(encoded, 1, &collector, TestCollector.deliver)).delivered);
+            sequence += 1;
+        }
+        try std.testing.expect(value.hasPendingDeliveries());
+        try std.testing.expectEqual(@as(usize, 0), try value.drainPending(0, &collector, TestCollector.deliver));
+        var turns: usize = 0;
+        while (value.hasPendingDeliveries() and turns < 8) : (turns += 1) {
+            const drained = try value.drainPending(budget, &collector, TestCollector.deliver);
+            try std.testing.expect(drained > 0 and drained <= budget);
+        }
+        try std.testing.expect(!value.hasPendingDeliveries());
+        try std.testing.expectEqual(@as(usize, 8), collector.count);
+        try std.testing.expectEqual(@as(usize, 0), value.ordered.count());
+        for ([_]u8{ 0, 255 }) |channel| try std.testing.expectEqual(@as(u32, 2), try value.ordered.expectedIndex(channel));
+        try std.testing.expectEqualStrings("first", collector.get(0));
+        try std.testing.expectEqualStrings("first", collector.get(budget));
+    }
+}
 
 test "receiver delivers in order with a zero-copy fast path" {
     const Collector = struct {

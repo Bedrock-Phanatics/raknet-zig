@@ -31,6 +31,83 @@ test "public ping receives an opaque advertisement over loopback" {
     try std.testing.expectError(error.InvalidConfiguration, raknet.ping(io, listener.localAddress(), buffer[0..34], 1_000));
 }
 
+test "client resumes buffered ordered messages through poll and timer callbacks" {
+    const Harness = struct {
+        listener: *raknet.Server,
+        connected: bool = false,
+        delivered: usize = 0,
+        fail: bool = false,
+        fn onConnect(raw: *anyopaque, _: *raknet.Session) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.connected = true;
+        }
+        fn onServerMessage(_: *anyopaque, _: *raknet.Session, _: raknet.BorrowedPayload) !void {}
+        fn onMessage(raw: *anyopaque, payload: raknet.BorrowedPayload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail or payload.bytes.len != 2 or payload.bytes[1] != self.delivered) return error.ApplicationFailure;
+            self.delivered += 1;
+        }
+        fn run(self: *@This()) !void {
+            while (!self.connected) _ = try self.listener.poll(.none, .{ .context = self, .connected = onConnect, .message = onServerMessage });
+        }
+    };
+    const Mode = enum { normal, failure, disconnect };
+    for ([_]Mode{ .normal, .failure, .disconnect }) |mode| {
+        var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
+        defer threaded.deinit();
+        const io = threaded.io();
+        const listener = try raknet.Server.listen(std.testing.allocator, io, try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0"), .{ .advertisement = "test" });
+        defer listener.destroy();
+        var harness: Harness = .{ .listener = listener };
+        var task = try io.concurrent(Harness.run, .{&harness});
+        defer task.cancel(io) catch {};
+        var config: Config = .{};
+        config.batching.maximum_packets_per_iteration = 2;
+        const client = try Client.connect(std.testing.allocator, io, listener.localAddress(), .{ .config = config });
+        defer client.destroy();
+        try task.await(io);
+        const initial_order = try client.core.receiver_state.ordered.expectedIndex(0);
+        var sequence = client.core.receiver_state.datagrams.expected;
+        var reliable = client.core.receiver_state.reliable.expected;
+        var storage: [128]u8 = undefined;
+        for ([_]u8{ 1, 2, 3, 4, 5, 0 }) |offset| {
+            const payload = [_]u8{ 0xfe, offset };
+            const frames = [_]raknet.advanced.protocol.frame.Frame{.{ .reliability = .reliable_ordered, .reliable_index = reliable, .order_index = raknet.advanced.uint24.add(initial_order, offset), .order_channel = 0, .payload = if (mode == .disconnect and offset == 3) &.{@backingInt(raknet.advanced.protocol.offline.Id.disconnect_notification)} else &payload }};
+            const wire = try raknet.advanced.protocol.datagram.encodeData(sequence, &frames, &storage);
+            client.messages[0] = .{ .from = listener.localAddress(), .data = wire, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+            client.pending_message_index = 0;
+            client.pending_message_count = 1;
+            while (client.pending_message_count != 0) _ = try client.poll(.none, &harness, Harness.onMessage);
+            sequence = raknet.advanced.uint24.add(sequence, 1);
+            reliable = raknet.advanced.uint24.add(reliable, 1);
+        }
+        try std.testing.expectEqual(@as(usize, 2), harness.delivered);
+        harness.fail = mode == .failure;
+        const now: u64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
+        try std.testing.expect(client.nextDeadline().? <= now);
+        if (mode == .failure) {
+            try std.testing.expectError(error.ApplicationFailure, client.processTimersWithMessages(now, &harness, Harness.onMessage));
+            try std.testing.expect(client.isClosed());
+            try std.testing.expect(client.nextDeadline() == null);
+        } else {
+            _ = try client.processTimersWithMessages(now, &harness, Harness.onMessage);
+            for (0..8) |_| {
+                if (harness.delivered == 6 or client.isClosed()) break;
+                _ = try client.poll(.none, &harness, Harness.onMessage);
+            }
+            try std.testing.expectEqual(@as(usize, if (mode == .disconnect) 3 else 6), harness.delivered);
+            try std.testing.expectEqual(mode == .disconnect, client.isClosed());
+            if (mode == .normal) {
+                try std.testing.expectEqual(@as(usize, 0), client.core.receiver_state.ordered.count());
+                try std.testing.expect(!client.core.receiver_state.hasPendingDeliveries());
+            } else {
+                try std.testing.expectError(error.ConnectionClosed, client.poll(.none, &harness, Harness.onMessage));
+                try std.testing.expectEqual(@as(usize, 3), harness.delivered);
+            }
+        }
+    }
+}
+
 test "client and server complete a real loopback handshake" {
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
