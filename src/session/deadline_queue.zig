@@ -8,18 +8,15 @@ pub const Entry = struct {
     order: u64,
 };
 
-// removeByPtr can't take array keys in Zig 0.16
-const Slot = struct { key: Key };
-
 // Map pointers stay valid since the preallocated map never rehashes
 const HeapEntry = struct {
     deadline_ms: u64,
     order: u64,
-    slot: *Slot,
+    key_ptr: *Key,
     index_ptr: *usize,
 
     fn entry(self: HeapEntry) Entry {
-        return .{ .key = self.slot.key, .deadline_ms = self.deadline_ms, .order = self.order };
+        return .{ .key = self.key_ptr.*, .deadline_ms = self.deadline_ms, .order = self.order };
     }
 };
 
@@ -28,7 +25,7 @@ pub const Queue = struct {
     items: []HeapEntry,
     len: usize = 0,
     next_order: u64 = 0,
-    indices: std.AutoHashMapUnmanaged(Slot, usize) = .empty,
+    indices: std.AutoHashMapUnmanaged(Key, usize) = .empty,
     diagnostics: struct {
         upserts: u64 = 0,
         unchanged: u64 = 0,
@@ -40,7 +37,7 @@ pub const Queue = struct {
         if (capacity == 0) return error.InvalidCapacity;
         const items = try allocator.alloc(HeapEntry, capacity);
         errdefer allocator.free(items);
-        var indices: std.AutoHashMapUnmanaged(Slot, usize) = .empty;
+        var indices: std.AutoHashMapUnmanaged(Key, usize) = .empty;
         errdefer indices.deinit(allocator);
         try indices.ensureTotalCapacity(allocator, @intCast(capacity));
         return .{ .allocator = allocator, .items = items, .indices = indices };
@@ -58,7 +55,7 @@ pub const Queue = struct {
 
     pub fn upsert(self: *Queue, key: Key, deadline_ms: u64) !void {
         self.diagnostics.upserts += 1;
-        if (self.indices.get(.{ .key = key })) |index| {
+        if (self.indices.get(key)) |index| {
             const previous = self.items[index].deadline_ms;
             self.diagnostics.unchanged += @intFromBool(previous == deadline_ms);
             self.items[index].deadline_ms = deadline_ms;
@@ -72,15 +69,15 @@ pub const Queue = struct {
         if (self.len == self.items.len) return error.DeadlineQueueFull;
         const index = self.len;
         self.len += 1;
-        const inserted = self.indices.getOrPutAssumeCapacity(.{ .key = key });
+        const inserted = self.indices.getOrPutAssumeCapacity(key);
         std.debug.assert(!inserted.found_existing);
         inserted.value_ptr.* = index;
-        self.items[index] = .{ .deadline_ms = deadline_ms, .order = self.takeOrder(), .slot = inserted.key_ptr, .index_ptr = inserted.value_ptr };
+        self.items[index] = .{ .deadline_ms = deadline_ms, .order = self.takeOrder(), .key_ptr = inserted.key_ptr, .index_ptr = inserted.value_ptr };
         self.siftUp(index);
     }
 
     pub fn remove(self: *Queue, key: Key) bool {
-        const index = self.indices.get(.{ .key = key }) orelse return false;
+        const index = self.indices.get(key) orelse return false;
         self.removeIndex(index);
         return true;
     }
@@ -97,7 +94,7 @@ pub const Queue = struct {
     }
 
     fn removeIndex(self: *Queue, index: usize) void {
-        self.indices.removeByPtr(self.items[index].slot);
+        self.indices.removeByPtr(self.items[index].key_ptr);
         self.len -= 1;
         if (index == self.len) return;
 
@@ -261,7 +258,7 @@ test "heap index pointers survive full capacity churn and table slot reuse" {
         try std.testing.expect(!queue.remove(popped.key));
         if (iteration % 256 == 0) for (queue.items[0..queue.len], 0..) |item, index| {
             try std.testing.expectEqual(index, item.index_ptr.*);
-            try std.testing.expectEqual(index, queue.indices.get(item.slot.*).?);
+            try std.testing.expectEqual(index, queue.indices.get(item.key_ptr.*).?);
         };
     }
     var previous: u64 = 0;

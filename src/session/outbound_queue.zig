@@ -88,7 +88,7 @@ pub const Queue = struct {
         if (payload.len > self.maximum_bytes -| self.total_bytes) return error.OutboundQueueBytesExceeded;
         if (self.countAll() == self.maximum_messages) return error.OutboundQueueFull;
         if (lane == .application) {
-            const control_index = @intFromEnum(Lane.control);
+            const control_index = @backingInt(Lane.control);
             const reserved_messages = self.reserved_control_messages -| self.counts[control_index];
             if (self.maximum_messages - self.countAll() <= reserved_messages) return error.OutboundQueueFull;
             const reserved_bytes = self.reserved_control_bytes -| self.bytes[control_index];
@@ -115,7 +115,7 @@ pub const Queue = struct {
             .occupied = true,
         };
 
-        const lane_index = @intFromEnum(lane);
+        const lane_index = @backingInt(lane);
         if (self.tails[lane_index] == none) {
             self.heads[lane_index] = index;
         } else {
@@ -131,7 +131,7 @@ pub const Queue = struct {
     }
 
     pub fn pop(self: *Queue, lane: Lane) ?Message {
-        const lane_index = @intFromEnum(lane);
+        const lane_index = @backingInt(lane);
         const index = self.heads[lane_index];
         if (index == none) return null;
         const slot = &self.slots[index];
@@ -149,16 +149,16 @@ pub const Queue = struct {
 
     /// Invalidated by any queue mutation.
     pub fn peek(self: *const Queue, lane: Lane) ?*const Message {
-        const index = self.heads[@intFromEnum(lane)];
+        const index = self.heads[@backingInt(lane)];
         return if (index == none) null else &self.slots[index].message;
     }
 
     pub fn iterator(self: *const Queue, lane: Lane) Iterator {
-        return .{ .queue = self, .next_index = self.heads[@intFromEnum(lane)] };
+        return .{ .queue = self, .next_index = self.heads[@backingInt(lane)] };
     }
 
     pub fn cancel(self: *Queue, lane: Lane, id: Id) ?Message {
-        const lane_index = @intFromEnum(lane);
+        const lane_index = @backingInt(lane);
         var previous: u32 = none;
         var index = self.heads[lane_index];
         while (index != none) {
@@ -183,7 +183,7 @@ pub const Queue = struct {
     }
 
     pub fn count(self: Queue, lane: Lane) usize {
-        return self.counts[@intFromEnum(lane)];
+        return self.counts[@backingInt(lane)];
     }
 
     pub fn countAll(self: Queue) usize {
@@ -191,7 +191,7 @@ pub const Queue = struct {
     }
 
     pub fn byteCount(self: Queue, lane: Lane) usize {
-        return self.bytes[@intFromEnum(lane)];
+        return self.bytes[@backingInt(lane)];
     }
 
     pub fn byteCountAll(self: Queue) usize {
@@ -303,8 +303,8 @@ test "application traffic cannot consume reserved control bytes" {
     _ = try queue.enqueue(.application, "abcd", .reliable, 0);
     try std.testing.expectError(error.OutboundQueueBytesExceeded, queue.enqueue(.application, "x", .reliable, 0));
     _ = try queue.enqueue(.control, "yz", .reliable, 0);
-    try std.testing.expectEqual(@as(usize, 4), queue.bytes[@intFromEnum(Lane.application)]);
-    try std.testing.expectEqual(@as(usize, 2), queue.bytes[@intFromEnum(Lane.control)]);
+    try std.testing.expectEqual(@as(usize, 4), queue.bytes[@backingInt(Lane.application)]);
+    try std.testing.expectEqual(@as(usize, 2), queue.bytes[@backingInt(Lane.control)]);
 }
 
 test "cancellation preserves FIFO order and accounting" {

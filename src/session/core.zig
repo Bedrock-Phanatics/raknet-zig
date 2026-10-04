@@ -420,7 +420,7 @@ pub const Core = struct {
     pub fn cancelOutbound(self: *Core, handle: SendHandle) CancelResult {
         if (handle.owner != self.send_owner) return .not_found;
         inline for (.{ outbound_queue.Lane.control, outbound_queue.Lane.application }) |lane| {
-            const lane_index = @intFromEnum(lane);
+            const lane_index = @backingInt(lane);
             if (self.outbound_state.peek(lane)) |head| {
                 if (head.id == handle.id and self.outbound_packetization[lane_index] != null) return .in_progress;
             }
@@ -464,7 +464,7 @@ pub const Core = struct {
     pub fn flushOutbound(self: *Core, lane: outbound_queue.Lane, scratch: []u8, maximum_datagrams: usize, now_ms: u64, context: *anyopaque, emit: SendFn) !transmitter.Sent {
         if (self.terminal_send_failure) return error.ConnectionClosed;
         var total: transmitter.Sent = .{ .datagrams = 0, .wire_bytes = 0 };
-        const lane_index = @intFromEnum(lane);
+        const lane_index = @backingInt(lane);
         while (total.datagrams < maximum_datagrams) {
             const message = self.outbound_state.peek(lane) orelse break;
             if (self.outbound_packetization[lane_index] == null) {
@@ -531,7 +531,7 @@ pub const Core = struct {
         }
         if (self.outbound_state.countAll() != 0 or self.recovery_state.count() != 0) return .pending;
         if (self.disconnect_queued) return .done;
-        _ = try self.enqueueOutbound(.control, &.{@intFromEnum(offline.Id.disconnect_notification)}, .reliable_ordered, 0);
+        _ = try self.enqueueOutbound(.control, &.{@backingInt(offline.Id.disconnect_notification)}, .reliable_ordered, 0);
         self.disconnect_queued = true;
         return .flush;
     }
@@ -931,7 +931,7 @@ test "partial send failure rolls back only the failed datagram" {
     try std.testing.expectEqual(@as(usize, 1), core.recovery_state.count());
     try std.testing.expectEqual(@as(u64, 576), core.congestion_state.in_flight);
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
-    const progress = core.outbound_packetization[@intFromEnum(outbound_queue.Lane.application)].?;
+    const progress = core.outbound_packetization[@backingInt(outbound_queue.Lane.application)].?;
     try std.testing.expectEqual(progress.capacity, progress.offset);
     try std.testing.expect(core.terminal_send_failure);
 
@@ -1010,7 +1010,7 @@ const ClosePeer = struct {
         var disconnect = false;
         while (decoded.frames.remaining() != 0) {
             const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
-            disconnect = disconnect or value.payload[0] == @intFromEnum(offline.Id.disconnect_notification);
+            disconnect = disconnect or value.payload[0] == @backingInt(offline.Id.disconnect_notification);
         }
         self.sequences[self.count] = decoded.sequence;
         self.disconnects[self.count] = disconnect;

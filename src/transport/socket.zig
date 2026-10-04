@@ -121,7 +121,7 @@ pub const Socket = struct {
         while (offset < batch.len) {
             const pending = batch.messages[offset..batch.len];
             self.traffic.send_calls += 1;
-            const failure, const sent = self.io.vtable.netSend(self.io.userdata, self.value.handle, pending, .{});
+            const failure, const sent = self.value.sendManyTimeout(self.io, pending, .{}, .none);
             for (pending[0..sent]) |message| self.recordSent(message.data_ptr[0..message.data_len]);
             self.traffic.maximum_send_batch = @max(self.traffic.maximum_send_batch, sent);
             self.traffic.datagrams_sent += sent;
@@ -215,7 +215,7 @@ pub const Socket = struct {
         }
     }
 
-    // Threaded can't wait on Windows datagrams and 0.16's Batch.cancel hangs
+    // Threaded cannot wait on Windows datagram sockets.
     fn pollAfd(self: *const Socket, timeout: std.Io.Timeout) !void {
         const windows = std.os.windows;
         const PollHandle = extern struct { handle: windows.HANDLE, events: windows.ULONG, status: windows.NTSTATUS };

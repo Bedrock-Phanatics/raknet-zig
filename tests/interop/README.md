@@ -1,7 +1,7 @@
 # Interop benchmarks
 
 These tools compare raknet-zig with [sandertv/go-raknet](https://github.com/sandertv/go-raknet)
-over real UDP sockets. They need Linux, Zig 0.16.0, Go and Python 3.
+over real UDP sockets. They need Linux, Zig 0.17.0, Go and Python 3.
 
 ## Build
 

@@ -28,18 +28,18 @@ pub fn decode(data: []const u8) !Message {
     var reader: cursor.Reader = .{ .data = data };
     const id = try reader.byte();
     return switch (id) {
-        @intFromEnum(offline.Id.connected_ping) => .{ .connected_ping = try exactU64(&reader) },
-        @intFromEnum(offline.Id.connected_pong) => blk: {
+        @backingInt(offline.Id.connected_ping) => .{ .connected_ping = try exactU64(&reader) },
+        @backingInt(offline.Id.connected_pong) => blk: {
             const ping = try reader.u64be();
             const pong = try reader.u64be();
             try exactEnd(&reader);
             break :blk .{ .connected_pong = .{ .ping_time = ping, .pong_time = pong } };
         },
-        @intFromEnum(offline.Id.detect_lost_connections) => blk: {
+        @backingInt(offline.Id.detect_lost_connections) => blk: {
             try exactEnd(&reader);
             break :blk .detect_lost_connections;
         },
-        @intFromEnum(offline.Id.connection_request) => blk: {
+        @backingInt(offline.Id.connection_request) => blk: {
             const guid = try reader.u64be();
             const time = try reader.u64be();
             const secure_byte = try reader.byte();
@@ -47,9 +47,9 @@ pub fn decode(data: []const u8) !Message {
             try exactEnd(&reader);
             break :blk .{ .connection_request = .{ .client_guid = guid, .request_time = time, .secure = secure_byte != 0 } };
         },
-        @intFromEnum(offline.Id.connection_request_accepted) => .{ .connection_request_accepted = try decodeAddressList(&reader, true) },
-        @intFromEnum(offline.Id.new_incoming_connection) => .{ .new_incoming_connection = try decodeAddressList(&reader, false) },
-        @intFromEnum(offline.Id.disconnect_notification) => blk: {
+        @backingInt(offline.Id.connection_request_accepted) => .{ .connection_request_accepted = try decodeAddressList(&reader, true) },
+        @backingInt(offline.Id.new_incoming_connection) => .{ .new_incoming_connection = try decodeAddressList(&reader, false) },
+        @backingInt(offline.Id.disconnect_notification) => blk: {
             try exactEnd(&reader);
             break :blk .disconnect;
         },
@@ -87,20 +87,20 @@ fn decodeAddressList(reader: *cursor.Reader, has_system_index: bool) !AddressLis
 
 pub fn encodePing(time: u64, output: []u8) ![]u8 {
     var writer: cursor.Writer = .{ .data = output };
-    try writer.byte(@intFromEnum(offline.Id.connected_ping));
+    try writer.byte(@backingInt(offline.Id.connected_ping));
     try writer.u64be(time);
     return writer.written();
 }
 pub fn encodePong(ping_time: u64, pong_time: u64, output: []u8) ![]u8 {
     var writer: cursor.Writer = .{ .data = output };
-    try writer.byte(@intFromEnum(offline.Id.connected_pong));
+    try writer.byte(@backingInt(offline.Id.connected_pong));
     try writer.u64be(ping_time);
     try writer.u64be(pong_time);
     return writer.written();
 }
 pub fn encodeConnectionRequest(client_guid: u64, request_time: u64, output: []u8) ![]u8 {
     var writer: cursor.Writer = .{ .data = output };
-    try writer.byte(@intFromEnum(offline.Id.connection_request));
+    try writer.byte(@backingInt(offline.Id.connection_request));
     try writer.u64be(client_guid);
     try writer.u64be(request_time);
     try writer.byte(0);
@@ -117,7 +117,7 @@ pub fn encodeAddressList(
 ) ![]u8 {
     if (addresses.len > 20) return error.TooManySystemAddresses;
     var writer: cursor.Writer = .{ .data = output };
-    try writer.byte(if (id == .accepted) @intFromEnum(offline.Id.connection_request_accepted) else @intFromEnum(offline.Id.new_incoming_connection));
+    try writer.byte(if (id == .accepted) @backingInt(offline.Id.connection_request_accepted) else @backingInt(offline.Id.new_incoming_connection));
     try offline.encodeAddress(primary, &writer);
     if (id == .accepted) try writer.u16be(system_index);
     for (addresses) |address| try offline.encodeAddress(address, &writer);
@@ -144,7 +144,7 @@ test "variable system-address lists preserve timestamps" {
 
 test "system address lists accept variable counts in either family" {
     const v4: offline.Address = .{ .ipv4 = .{ .octets = .{ 192, 0, 2, 1 }, .port = 19132 } };
-    const v6: offline.Address = .{ .ipv6 = .{ .octets = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ .{1}, .port = 19132 } };
+    const v6: offline.Address = .{ .ipv6 = .{ .octets = .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ .{1}, .port = 19132 } };
     var bytes: [1024]u8 = undefined;
     for ([_]offline.Address{ v4, v6 }) |primary| {
         for ([_]usize{ 0, 1, 10, 20 }) |count| {

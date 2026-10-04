@@ -46,7 +46,7 @@ pub const Frame = struct {
 
 pub fn decodeOne(reader: *cursor.Reader, maximum_payload: usize, maximum_split_parts: usize) !Frame {
     const flags = try reader.byte();
-    const reliability: Reliability = @enumFromInt(@as(u3, @truncate(flags >> 5)));
+    const reliability: Reliability = @fromBackingInt(@intCast(@as(u3, @truncate(flags >> 5))));
     const split_flag = flags & 0x10 != 0;
     if (flags & 0x0f != 0) return error.InvalidFrameFlags;
     const bit_length = try reader.u16be();
@@ -84,7 +84,7 @@ pub fn encode(value: Frame, writer: *cursor.Writer) !void {
     if (value.reliability.hasReliableIndex() != (value.reliable_index != null)) return error.MissingIndex;
     if (value.reliability.hasSequenceIndex() != (value.sequence_index != null)) return error.MissingIndex;
     if (value.reliability.hasOrderIndex() != (value.order_index != null and value.order_channel != null)) return error.MissingIndex;
-    var flags: u8 = @as(u8, @intFromEnum(value.reliability)) << 5;
+    var flags: u8 = @as(u8, @backingInt(value.reliability)) << 5;
     if (value.split != null) flags |= 0x10;
     try writer.byte(flags);
     const bits = try std.math.mul(usize, value.payload.len, 8);

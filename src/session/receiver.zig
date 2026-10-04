@@ -318,7 +318,7 @@ test "malformed suffix cannot consume sequence state or invoke callbacks" {
     }};
     const prefix = try @import("../protocol/datagram.zig").encodeData(0, &valid, &wire_storage);
     const malformed_len = prefix.len + 2;
-    wire_storage[prefix.len] = @as(u8, @intFromEnum(frame.Reliability.reliable_ordered)) << 5;
+    wire_storage[prefix.len] = @as(u8, @backingInt(frame.Reliability.reliable_ordered)) << 5;
     wire_storage[prefix.len + 1] = 0;
 
     var datagrams_before: [8]bool = undefined;

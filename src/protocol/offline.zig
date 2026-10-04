@@ -73,7 +73,7 @@ fn expectMagic(reader: *cursor.Reader) !void {
 pub const UnconnectedPing = struct { time: u64, client_guid: u64, open_connections_only: bool };
 pub fn encodeUnconnectedPing(time: u64, client_guid: u64, output: []u8) ![]u8 {
     var w: cursor.Writer = .{ .data = output };
-    try w.byte(@intFromEnum(Id.unconnected_ping));
+    try w.byte(@backingInt(Id.unconnected_ping));
     try w.u64be(time);
     try w.bytes(&magic);
     try w.u64be(client_guid);
@@ -83,19 +83,19 @@ pub fn encodeUnconnectedPing(time: u64, client_guid: u64, output: []u8) ![]u8 {
 pub fn decodeUnconnectedPing(data: []const u8) !UnconnectedPing {
     var r: cursor.Reader = .{ .data = data };
     const id = try r.byte();
-    if (id != @intFromEnum(Id.unconnected_ping) and id != @intFromEnum(Id.unconnected_ping_open_connections)) return error.WrongPacket;
+    if (id != @backingInt(Id.unconnected_ping) and id != @backingInt(Id.unconnected_ping_open_connections)) return error.WrongPacket;
     const time = try r.u64be();
     try expectMagic(&r);
     const guid = try r.u64be();
     if (r.remaining() != 0) return error.TrailingData;
-    return .{ .time = time, .client_guid = guid, .open_connections_only = id == @intFromEnum(Id.unconnected_ping_open_connections) };
+    return .{ .time = time, .client_guid = guid, .open_connections_only = id == @backingInt(Id.unconnected_ping_open_connections) };
 }
 
 pub const OpenConnectionRequest1 = struct { protocol_version: u8, mtu: u16 };
 pub fn decodeOpenConnectionRequest1(data: []const u8, minimum_mtu: u16, maximum_mtu: u16) !OpenConnectionRequest1 {
     if (data.len > 65_507 or data.len > maximum_mtu -| 28) return error.MtuTooLarge;
     var r: cursor.Reader = .{ .data = data };
-    if (try r.byte() != @intFromEnum(Id.open_connection_request_1)) return error.WrongPacket;
+    if (try r.byte() != @backingInt(Id.open_connection_request_1)) return error.WrongPacket;
     try expectMagic(&r);
     const version = try r.byte();
     const mtu_usize = try std.math.add(usize, data.len, 28);
@@ -106,7 +106,7 @@ pub fn decodeOpenConnectionRequest1(data: []const u8, minimum_mtu: u16, maximum_
 pub const OpenConnectionRequest2 = struct { cookie: ?u32, server_address: Address, mtu: u16, client_guid: u64 };
 pub fn decodeOpenConnectionRequest2(data: []const u8, cookie_required: bool, minimum_mtu: u16, maximum_mtu: u16) !OpenConnectionRequest2 {
     var r: cursor.Reader = .{ .data = data };
-    if (try r.byte() != @intFromEnum(Id.open_connection_request_2)) return error.WrongPacket;
+    if (try r.byte() != @backingInt(Id.open_connection_request_2)) return error.WrongPacket;
     try expectMagic(&r);
     const cookie = if (cookie_required) try r.u32be() else null;
     if (cookie_required and try r.byte() != 0) return error.UnsupportedSecurity;
@@ -121,7 +121,7 @@ pub fn decodeOpenConnectionRequest2(data: []const u8, cookie_required: bool, min
 pub fn encodeUnconnectedPong(time: u64, server_guid: u64, advertisement: []const u8, output: []u8) ![]u8 {
     if (advertisement.len > 65_535) return error.AdvertisementTooLarge;
     var w: cursor.Writer = .{ .data = output };
-    try w.byte(@intFromEnum(Id.unconnected_pong));
+    try w.byte(@backingInt(Id.unconnected_pong));
     try w.u64be(time);
     try w.u64be(server_guid);
     try w.bytes(&magic);
@@ -133,7 +133,7 @@ pub fn encodeUnconnectedPong(time: u64, server_guid: u64, advertisement: []const
 pub const UnconnectedPong = struct { time: u64, server_guid: u64, advertisement: []const u8 };
 pub fn decodeUnconnectedPong(data: []const u8) !UnconnectedPong {
     var r: cursor.Reader = .{ .data = data };
-    if (try r.byte() != @intFromEnum(Id.unconnected_pong)) return error.WrongPacket;
+    if (try r.byte() != @backingInt(Id.unconnected_pong)) return error.WrongPacket;
     const time = try r.u64be();
     const server_guid = try r.u64be();
     try expectMagic(&r);
@@ -147,7 +147,7 @@ pub fn encodeOpenConnectionRequest1(protocol_version: u8, mtu: u16, output: []u8
     const target_size = @as(usize, mtu) -| 28;
     if (target_size < 18 or output.len < target_size) return error.InvalidMtu;
     var writer: cursor.Writer = .{ .data = output[0..target_size] };
-    try writer.byte(@intFromEnum(Id.open_connection_request_1));
+    try writer.byte(@backingInt(Id.open_connection_request_1));
     try writer.bytes(&magic);
     try writer.byte(protocol_version);
     @memset(output[writer.offset..target_size], 0);
@@ -157,7 +157,7 @@ pub fn encodeOpenConnectionRequest1(protocol_version: u8, mtu: u16, output: []u8
 pub const OpenConnectionReply1 = struct { server_guid: u64, cookie: ?u32, mtu: u16 };
 pub fn decodeOpenConnectionReply1(data: []const u8) !OpenConnectionReply1 {
     var reader: cursor.Reader = .{ .data = data };
-    if (try reader.byte() != @intFromEnum(Id.open_connection_reply_1)) return error.WrongPacket;
+    if (try reader.byte() != @backingInt(Id.open_connection_reply_1)) return error.WrongPacket;
     try expectMagic(&reader);
     const guid = try reader.u64be();
     const security = try reader.byte();
@@ -168,7 +168,7 @@ pub fn decodeOpenConnectionReply1(data: []const u8) !OpenConnectionReply1 {
 
 pub fn encodeOpenConnectionRequest2(server_address: Address, cookie: ?u32, mtu: u16, client_guid: u64, output: []u8) ![]u8 {
     var writer: cursor.Writer = .{ .data = output };
-    try writer.byte(@intFromEnum(Id.open_connection_request_2));
+    try writer.byte(@backingInt(Id.open_connection_request_2));
     try writer.bytes(&magic);
     if (cookie) |value| {
         try writer.u32be(value);
@@ -183,7 +183,7 @@ pub fn encodeOpenConnectionRequest2(server_address: Address, cookie: ?u32, mtu: 
 pub const OpenConnectionReply2 = struct { server_guid: u64, client_address: Address, mtu: u16 };
 pub fn decodeOpenConnectionReply2(data: []const u8, minimum_mtu: u16, maximum_mtu: u16) !OpenConnectionReply2 {
     var reader: cursor.Reader = .{ .data = data };
-    if (try reader.byte() != @intFromEnum(Id.open_connection_reply_2)) return error.WrongPacket;
+    if (try reader.byte() != @backingInt(Id.open_connection_reply_2)) return error.WrongPacket;
     try expectMagic(&reader);
     const guid = try reader.u64be();
     const address = try decodeAddress(&reader);
@@ -198,7 +198,7 @@ pub fn encodeOpenConnectionReply1(server_guid: u64, cookie: ?u32, mtu: u16, pad_
     const target_size = if (pad_to_mtu) @max(base_size, @as(usize, mtu) -| 28) else base_size;
     if (output.len < target_size) return error.NoSpaceLeft;
     var w: cursor.Writer = .{ .data = output[0..target_size] };
-    try w.byte(@intFromEnum(Id.open_connection_reply_1));
+    try w.byte(@backingInt(Id.open_connection_reply_1));
     try w.bytes(&magic);
     try w.u64be(server_guid);
     try w.byte(@intFromBool(cookie != null));
@@ -210,7 +210,7 @@ pub fn encodeOpenConnectionReply1(server_guid: u64, cookie: ?u32, mtu: u16, pad_
 
 pub fn encodeOpenConnectionReply2(server_guid: u64, client_address: Address, mtu: u16, output: []u8) ![]u8 {
     var w: cursor.Writer = .{ .data = output };
-    try w.byte(@intFromEnum(Id.open_connection_reply_2));
+    try w.byte(@backingInt(Id.open_connection_reply_2));
     try w.bytes(&magic);
     try w.u64be(server_guid);
     try encodeAddress(client_address, &w);
@@ -221,7 +221,7 @@ pub fn encodeOpenConnectionReply2(server_guid: u64, client_address: Address, mtu
 
 pub fn encodeIncompatibleProtocol(version: u8, server_guid: u64, output: []u8) ![]u8 {
     var w: cursor.Writer = .{ .data = output };
-    try w.byte(@intFromEnum(Id.incompatible_protocol_version));
+    try w.byte(@backingInt(Id.incompatible_protocol_version));
     try w.byte(version);
     try w.bytes(&magic);
     try w.u64be(server_guid);
@@ -229,7 +229,7 @@ pub fn encodeIncompatibleProtocol(version: u8, server_guid: u64, output: []u8) !
 }
 pub fn encodeNoFreeIncomingConnections(server_guid: u64, output: []u8) ![]u8 {
     var w: cursor.Writer = .{ .data = output };
-    try w.byte(@intFromEnum(Id.no_free_incoming_connections));
+    try w.byte(@backingInt(Id.no_free_incoming_connections));
     try w.bytes(&magic);
     try w.u64be(server_guid);
     return w.written();
@@ -264,7 +264,7 @@ test "unconnected ping and pong validate exact wire structure" {
     for (0..pong.len) |length| try std.testing.expectError(error.Truncated, decodeUnconnectedPong(pong[0..length]));
     pong[0] = 0;
     try std.testing.expectError(error.WrongPacket, decodeUnconnectedPong(pong));
-    pong[0] = @intFromEnum(Id.unconnected_pong);
+    pong[0] = @backingInt(Id.unconnected_pong);
     pong[17] ^= 1;
     try std.testing.expectError(error.InvalidMagic, decodeUnconnectedPong(pong));
     pong[17] ^= 1;
@@ -305,7 +305,7 @@ test "no-free response has the canonical offline shape" {
     var bytes: [32]u8 = undefined;
     const wire = try encodeNoFreeIncomingConnections(0x0102030405060708, &bytes);
     try std.testing.expectEqual(@as(usize, 25), wire.len);
-    try std.testing.expectEqual(@intFromEnum(Id.no_free_incoming_connections), wire[0]);
+    try std.testing.expectEqual(@backingInt(Id.no_free_incoming_connections), wire[0]);
     try std.testing.expectEqualSlices(u8, &magic, wire[1..17]);
     try std.testing.expectEqual(@as(u64, 0x0102030405060708), std.mem.readInt(u64, wire[17..25], .big));
 }

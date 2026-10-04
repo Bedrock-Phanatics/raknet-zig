@@ -231,7 +231,7 @@ pub const Client = struct {
     /// Cancel or await any pending waitReadable first
     pub fn destroy(self: *Client) void {
         if (!self.closed and !self.core.disconnect_queued) {
-            var payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
+            var payload = [_]u8{@backingInt(offline.Id.disconnect_notification)};
             _ = self.sendControlWire(&payload, .reliable_ordered, 0, time.nowMilliseconds(self.io)) catch {};
         }
         self.abort();
@@ -583,7 +583,7 @@ const HandshakeTransport = struct {
 };
 
 fn isLateOfflineReply(data: []const u8) bool {
-    return data.len != 0 and (data[0] == @intFromEnum(offline.Id.open_connection_reply_1) or data[0] == @intFromEnum(offline.Id.open_connection_reply_2));
+    return data.len != 0 and (data[0] == @backingInt(offline.Id.open_connection_reply_1) or data[0] == @backingInt(offline.Id.open_connection_reply_2));
 }
 
 test "client validates a descending MTU ladder" {

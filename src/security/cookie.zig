@@ -31,7 +31,7 @@ pub const Jar = struct {
 };
 
 test "cookies bind endpoint and tolerate one rotation interval" {
-    const jar: Jar = .{ .current_key = [_]u8{1} ** 32, .previous_key = [_]u8{2} ** 32 };
+    const jar: Jar = .{ .current_key = @splat(1), .previous_key = @splat(2) };
     const cookie = jar.create("192.0.2.1:19132", 10);
     try std.testing.expect(jar.verify(cookie, "192.0.2.1:19132", 10));
     try std.testing.expect(jar.verify(cookie, "192.0.2.1:19132", 11));

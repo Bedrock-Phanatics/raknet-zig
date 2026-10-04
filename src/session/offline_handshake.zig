@@ -45,9 +45,9 @@ pub const Handler = struct {
     pub fn handle(self: *Handler, datagram: []const u8, endpoint: []const u8, source_key: u64, epoch: u64, now_ms: u64, output: []u8) Action {
         if (datagram.len == 0 or datagram.len > 65_507) return .drop;
         return switch (datagram[0]) {
-            @intFromEnum(offline.Id.unconnected_ping), @intFromEnum(offline.Id.unconnected_ping_open_connections) => self.ping(datagram, source_key, now_ms, output),
-            @intFromEnum(offline.Id.open_connection_request_1) => self.request1(datagram, endpoint, source_key, epoch, now_ms, output),
-            @intFromEnum(offline.Id.open_connection_request_2) => self.request2(datagram, endpoint, source_key, epoch, now_ms, output),
+            @backingInt(offline.Id.unconnected_ping), @backingInt(offline.Id.unconnected_ping_open_connections) => self.ping(datagram, source_key, now_ms, output),
+            @backingInt(offline.Id.open_connection_request_1) => self.request1(datagram, endpoint, source_key, epoch, now_ms, output),
+            @backingInt(offline.Id.open_connection_request_2) => self.request2(datagram, endpoint, source_key, epoch, now_ms, output),
             else => .drop,
         };
     }
@@ -94,10 +94,10 @@ pub const Handler = struct {
 test "request one is stateless, cookie bound, and non-amplifying" {
     var entries: [8]rate.Entry = undefined;
     var limiter = try rate.Limiter.init(&entries, .{ .tokens_per_second = 100, .burst = 100, .global_tokens_per_second = 100, .global_burst = 100 }, 0);
-    const jar: cookie.Jar = .{ .current_key = [_]u8{3} ** 32, .previous_key = [_]u8{4} ** 32 };
+    const jar: cookie.Jar = .{ .current_key = @splat(3), .previous_key = @splat(4) };
     var handler = try Handler.init(7, 11, 576, 1492, "MCPE;server", jar, &limiter);
     var request: [548]u8 = @splat(0);
-    request[0] = @intFromEnum(offline.Id.open_connection_request_1);
+    request[0] = @backingInt(offline.Id.open_connection_request_1);
     @memcpy(request[1..17], &offline.magic);
     request[17] = 11;
     var output: [1492]u8 = undefined;
@@ -114,10 +114,10 @@ test "handshake floods stay inside rate limits" {
         .global_tokens_per_second = 1,
         .global_burst = 4,
     }, 0);
-    const jar: cookie.Jar = .{ .current_key = [_]u8{3} ** 32, .previous_key = [_]u8{4} ** 32 };
+    const jar: cookie.Jar = .{ .current_key = @splat(3), .previous_key = @splat(4) };
     var handler = try Handler.init(7, 11, 576, 1492, "MCPE;server", jar, &limiter);
     var request: [548]u8 = @splat(0);
-    request[0] = @intFromEnum(offline.Id.open_connection_request_1);
+    request[0] = @backingInt(offline.Id.open_connection_request_1);
     @memcpy(request[1..17], &offline.magic);
     request[17] = 11;
     var output: [1492]u8 = undefined;

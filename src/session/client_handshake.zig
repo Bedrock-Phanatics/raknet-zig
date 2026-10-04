@@ -68,10 +68,10 @@ pub const Negotiator = struct {
     pub fn receive(self: *Negotiator, datagram: []const u8) !?Result {
         if (self.result != null or datagram.len == 0) return null;
         switch (datagram[0]) {
-            @intFromEnum(offline.Id.incompatible_protocol_version) => return error.IncompatibleProtocol,
-            @intFromEnum(offline.Id.no_free_incoming_connections) => return error.NoFreeIncomingConnections,
-            @intFromEnum(offline.Id.open_connection_reply_1) => self.reply1(datagram),
-            @intFromEnum(offline.Id.open_connection_reply_2) => return self.reply2(datagram),
+            @backingInt(offline.Id.incompatible_protocol_version) => return error.IncompatibleProtocol,
+            @backingInt(offline.Id.no_free_incoming_connections) => return error.NoFreeIncomingConnections,
+            @backingInt(offline.Id.open_connection_reply_1) => self.reply1(datagram),
+            @backingInt(offline.Id.open_connection_reply_2) => return self.reply2(datagram),
             else => {},
         }
         return null;
@@ -189,7 +189,7 @@ const FakeServer = struct {
             return err;
         }
         switch (data[0]) {
-            @intFromEnum(offline.Id.open_connection_request_1) => {
+            @backingInt(offline.Id.open_connection_request_1) => {
                 self.request1 += 1;
                 const size: u16 = @intCast(data.len + 28);
                 if (size > self.path_mtu) return;
@@ -202,7 +202,7 @@ const FakeServer = struct {
                 var out: [64]u8 = undefined;
                 self.push(try offline.encodeOpenConnectionReply1(1, self.cookie, @min(size, self.server_mtu), false, &out));
             },
-            @intFromEnum(offline.Id.open_connection_request_2) => {
+            @backingInt(offline.Id.open_connection_request_2) => {
                 const request = try offline.decodeOpenConnectionRequest2(data, true, 0, std.math.maxInt(u16));
                 self.request2_mtus[self.request2] = request.mtu;
                 self.request2_cookies[self.request2] = request.cookie;
@@ -306,7 +306,7 @@ test "repeated identical Reply 1 does not restart Request 2 early" {
     var reply: [64]u8 = undefined;
     const wire = try offline.encodeOpenConnectionReply1(1, 5, 1492, false, &reply);
     _ = try negotiator.receive(wire);
-    try testing.expectEqual(offline.Id.open_connection_request_2, @as(offline.Id, @enumFromInt((try negotiator.poll(0, &output)).?[0])));
+    try testing.expectEqual(offline.Id.open_connection_request_2, @as(offline.Id, @fromBackingInt(@intCast((try negotiator.poll(0, &output)).?[0]))));
     try testing.expectEqual(@as(?[]const u8, null), try negotiator.poll(10, &output));
     _ = try negotiator.receive(wire);
     try testing.expectEqual(@as(?[]const u8, null), try negotiator.poll(10, &output));
@@ -346,11 +346,11 @@ test "unexpected datagrams are ignored and terminal replies fail" {
     var negotiator: Negotiator = .init(testOptions());
     try testing.expectEqual(@as(?Result, null), try negotiator.receive(&.{}));
     try testing.expectEqual(@as(?Result, null), try negotiator.receive(&.{ 0x84, 0, 0, 0 }));
-    try testing.expectEqual(@as(?Result, null), try negotiator.receive(&.{@intFromEnum(offline.Id.open_connection_reply_1)}));
+    try testing.expectEqual(@as(?Result, null), try negotiator.receive(&.{@backingInt(offline.Id.open_connection_reply_1)}));
     var reply: [64]u8 = undefined;
     try testing.expectEqual(@as(?Result, null), try negotiator.receive(try offline.encodeOpenConnectionReply2(1, server_address, 1492, &reply)));
-    try testing.expectError(error.IncompatibleProtocol, negotiator.receive(&.{@intFromEnum(offline.Id.incompatible_protocol_version)}));
-    try testing.expectError(error.NoFreeIncomingConnections, negotiator.receive(&.{@intFromEnum(offline.Id.no_free_incoming_connections)}));
+    try testing.expectError(error.IncompatibleProtocol, negotiator.receive(&.{@backingInt(offline.Id.incompatible_protocol_version)}));
+    try testing.expectError(error.NoFreeIncomingConnections, negotiator.receive(&.{@backingInt(offline.Id.no_free_incoming_connections)}));
 }
 
 test "silent server times out at the deadline with bounded sends" {

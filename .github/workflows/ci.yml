@@ -29,7 +29,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Check formatting
         run: zig fmt --check build.zig build.zig.zon src tests
@@ -55,7 +55,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
           cache-key: tests
 
       - name: Verify Zig version
@@ -77,7 +77,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
           cache-key: release-safe
 
       - name: Run ReleaseSafe tests

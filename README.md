@@ -6,7 +6,7 @@ A RakNet client and server library for Minecraft: Bedrock Edition, written in Zi
 
 ## Install
 
-Requires Zig 0.16.x and a `std.Io` provider.
+Requires Zig 0.17.x and a `std.Io` provider.
 
 ```sh
 zig fetch --save git+https://github.com/Bedrock-Phanatics/raknet-zig.git

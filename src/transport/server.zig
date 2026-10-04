@@ -242,7 +242,7 @@ pub const Session = struct {
     fn closeNow(self: *Session) void {
         const now_ms = time.nowMilliseconds(self.socket.io);
         if ((self.state == .connected or self.state == .closing) and !self.core.disconnect_queued) {
-            const payload = [_]u8{@intFromEnum(offline.Id.disconnect_notification)};
+            const payload = [_]u8{@backingInt(offline.Id.disconnect_notification)};
             self.sendControl(&payload, .reliable_ordered, now_ms) catch {};
         }
         self.closeAt(now_ms);
@@ -907,10 +907,10 @@ fn validateOptions(options: Options) !void {
 fn isOfflineHandshake(data: []const u8) bool {
     if (data.len == 0) return false;
     return switch (data[0]) {
-        @intFromEnum(offline.Id.unconnected_ping),
-        @intFromEnum(offline.Id.unconnected_ping_open_connections),
-        @intFromEnum(offline.Id.open_connection_request_1),
-        @intFromEnum(offline.Id.open_connection_request_2),
+        @backingInt(offline.Id.unconnected_ping),
+        @backingInt(offline.Id.unconnected_ping_open_connections),
+        @backingInt(offline.Id.open_connection_request_1),
+        @backingInt(offline.Id.open_connection_request_2),
         => true,
         else => false,
     };
@@ -966,7 +966,7 @@ test "listener answers an offline ping over loopback" {
     defer client.close();
     var ping: [33]u8 = undefined;
     var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
-    try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
+    try writer.byte(@backingInt(offline.Id.unconnected_ping));
     try writer.u64be(123);
     try writer.bytes(&offline.magic);
     try writer.u64be(456);
@@ -984,22 +984,22 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expectEqual(@as(usize, 1), stats.datagrams);
     var response: [2048]u8 = undefined;
     const message = try client.value.receive(io, &response);
-    try std.testing.expectEqual(@intFromEnum(offline.Id.unconnected_pong), message.data[0]);
+    try std.testing.expectEqual(@backingInt(offline.Id.unconnected_pong), message.data[0]);
 
     var request1: [548]u8 = @splat(0);
-    request1[0] = @intFromEnum(offline.Id.open_connection_request_1);
+    request1[0] = @backingInt(offline.Id.open_connection_request_1);
     @memcpy(request1[1..17], &offline.magic);
     request1[17] = 11;
     try client.send(listener.socket.value.address, &request1);
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
     const reply1 = try client.value.receive(io, &response);
-    try std.testing.expectEqual(@intFromEnum(offline.Id.open_connection_reply_1), reply1.data[0]);
+    try std.testing.expectEqual(@backingInt(offline.Id.open_connection_reply_1), reply1.data[0]);
     const cookie_value = std.mem.readInt(u32, reply1.data[26..30], .big);
     const mtu = std.mem.readInt(u16, reply1.data[30..32], .big);
 
     var request2_buffer: [64]u8 = undefined;
     var request2: @import("../protocol/cursor.zig").Writer = .{ .data = &request2_buffer };
-    try request2.byte(@intFromEnum(offline.Id.open_connection_request_2));
+    try request2.byte(@backingInt(offline.Id.open_connection_request_2));
     try request2.bytes(&offline.magic);
     try request2.u32be(cookie_value);
     try request2.byte(0);
@@ -1009,7 +1009,7 @@ test "listener answers an offline ping over loopback" {
     try client.send(listener.socket.value.address, request2.written());
     _ = try listener.poll(.none, .{ .context = &context, .connected = Noop.connected, .message = Noop.message });
     const reply2 = try client.value.receive(io, &response);
-    try std.testing.expectEqual(@intFromEnum(offline.Id.open_connection_reply_2), reply2.data[0]);
+    try std.testing.expectEqual(@backingInt(offline.Id.open_connection_reply_2), reply2.data[0]);
     try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
     try std.testing.expectEqual(@as(usize, 1), listener.deadlines.count());
     const scheduled = listener.sessions.get(endpointKey(client.value.address)).?;
@@ -1126,7 +1126,7 @@ const CloseHarness = struct {
             if (message.data[0] & 0x40 != 0) continue;
             var decoded = try frame.decodeDatagram(message.data);
             const value = try frame.decodeOne(&decoded.frames, 8192, 2048);
-            return .{ .sequence = decoded.sequence, .disconnect = value.payload[0] == @intFromEnum(offline.Id.disconnect_notification) };
+            return .{ .sequence = decoded.sequence, .disconnect = value.payload[0] == @backingInt(offline.Id.disconnect_notification) };
         }
     }
 
@@ -1193,7 +1193,7 @@ test "advertisement updates are bounded and used by the next pong" {
     try listener.setAdvertisement("MCPE;Quark;11;1.21;7;100;");
     var ping: [33]u8 = undefined;
     var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
-    try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
+    try writer.byte(@backingInt(offline.Id.unconnected_ping));
     try writer.u64be(1);
     try writer.bytes(&offline.magic);
     try writer.u64be(2);
@@ -1257,7 +1257,7 @@ test "remote disconnect during a local close removes the session promptly" {
     var remote = try transmitter_mod.Transmitter.init(576, .{});
     var collector: Collector = .{};
     var scratch: [576]u8 = undefined;
-    _ = try remote.send(&.{@intFromEnum(offline.Id.disconnect_notification)}, .reliable_ordered, 0, &scratch, &collector, Collector.emit);
+    _ = try remote.send(&.{@backingInt(offline.Id.disconnect_notification)}, .reliable_ordered, 0, &scratch, &collector, Collector.emit);
     try harness.inject(listener, peer.value.address, collector.wire[0..collector.len]);
     try std.testing.expectEqual(@as(usize, 1), harness.disconnected);
     try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
@@ -1393,7 +1393,7 @@ test "global turn budget carries unread batch entries fairly" {
 
     var ping: [33]u8 = undefined;
     var writer: @import("../protocol/cursor.zig").Writer = .{ .data = &ping };
-    try writer.byte(@intFromEnum(offline.Id.unconnected_ping));
+    try writer.byte(@backingInt(offline.Id.unconnected_ping));
     try writer.u64be(1);
     try writer.bytes(&offline.magic);
     try writer.u64be(2);
