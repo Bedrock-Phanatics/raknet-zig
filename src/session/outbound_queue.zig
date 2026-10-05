@@ -10,6 +10,7 @@ pub const Id = u64;
 
 pub const Message = struct {
     id: Id,
+    receipt: bool = false,
     payload: payload_mod.OwnedPayload,
     reliability: frame.Reliability,
     channel: u8,
@@ -155,6 +156,10 @@ pub const Queue = struct {
 
     pub fn iterator(self: *const Queue, lane: Lane) Iterator {
         return .{ .queue = self, .next_index = self.heads[@backingInt(lane)] };
+    }
+
+    pub fn requestReceipt(self: *Queue, lane: Lane) void {
+        self.slots[self.tails[@backingInt(lane)]].message.receipt = true;
     }
 
     pub fn cancel(self: *Queue, lane: Lane, id: Id) ?Message {

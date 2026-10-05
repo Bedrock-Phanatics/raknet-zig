@@ -233,6 +233,36 @@ test "client and server complete a real loopback handshake" {
     }
     try std.testing.expectEqualStrings("\xfeworld", collector.data[0..collector.len]);
 
+    try std.testing.expectError(error.UnsupportedReliability, session.send("\xfebad", @fromBackingInt(5), 0));
+    try std.testing.expectError(error.UnsupportedReliability, client.send("\xfebad", @fromBackingInt(5), 0));
+    try std.testing.expect(session.isConnected());
+    try std.testing.expect(!client.isClosed());
+    const client_receipt = try client.queueSendWithReceipt("\xfeclient-receipt", .reliable_ordered, 0);
+    const server_receipt = try session.queueSendWithReceipt("\xfeserver-receipt", .reliable_ordered, 0);
+    var client_acknowledged = false;
+    var server_acknowledged = false;
+    for (0..100) |_| {
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
+        _ = try listener.poll(timeout, .{ .context = &harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+        _ = client.poll(timeout, &collector, ClientCollector.collect) catch |err| switch (err) {
+            error.Timeout => 0,
+            else => return err,
+        };
+        if (client.pollSendReceipt()) |receipt| {
+            try std.testing.expectEqual(client_receipt, receipt.handle);
+            try std.testing.expectEqual(.acknowledged, receipt.outcome);
+            client_acknowledged = true;
+        }
+        if (session.pollSendReceipt()) |receipt| {
+            try std.testing.expectEqual(server_receipt, receipt.handle);
+            try std.testing.expectEqual(.acknowledged, receipt.outcome);
+            server_acknowledged = true;
+        }
+        if (client_acknowledged and server_acknowledged) break;
+    }
+    try std.testing.expect(client_acknowledged and server_acknowledged);
+    try std.testing.expect(client.pollSendReceipt() == null and session.pollSendReceipt() == null);
+
     var client_address = client.localAddress();
     client_address.ip4.bytes = .{ 127, 0, 0, 1 };
     try listener.socket.send(client_address, &.{ 0x84, 0 });
@@ -277,6 +307,7 @@ test "client and server complete a real loopback handshake" {
     for (client.messages[0..3]) |*message| message.* = .{ .from = client.server, .data = &invalid, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
     client.pending_message_index = 0;
     client.pending_message_count = 3;
+    try std.testing.expectEqual(@as(?u64, 0), client.nextDeadline());
     _ = try client.poll(.none, &collector, ClientCollector.collect);
     try std.testing.expectEqual(@as(usize, 1), client.pending_message_index);
     _ = try client.poll(.none, &collector, ClientCollector.collect);
@@ -284,7 +315,12 @@ test "client and server complete a real loopback handshake" {
     try std.testing.expect(client.receipts.isEmpty());
     while (client.pending_message_count != 0) _ = try client.poll(.none, &collector, ClientCollector.collect);
     try std.testing.expectError(error.Timeout, client.poll(.none, &collector, ClientCollector.collect));
+    const failed_receipt = try client.queueSendWithReceipt("\xfeunacknowledged", .reliable, 0);
     try std.testing.expectError(error.ConnectionTimedOut, client.processTimers(std.math.maxInt(u64)));
+    const failure = client.pollSendReceipt().?;
+    try std.testing.expectEqual(failed_receipt, failure.handle);
+    try std.testing.expectEqual(.failed, failure.outcome);
+    client.closeNow();
     try std.testing.expect(client.nextDeadline() == null);
 }
 

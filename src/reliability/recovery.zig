@@ -56,6 +56,7 @@ pub const Recovery = struct {
     unused_head: u32 = none,
     active_head: u32 = none,
     free_heads: [class_count]u32 = @splat(none),
+    receipt_ids: []u64 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, maximum_entries: usize, maximum_bytes: usize, maximum_transmissions: u8, mtu: usize) !Recovery {
         const slab_bytes = std.math.mul(usize, maximum_entries, mtu) catch std.math.maxInt(usize);
@@ -86,6 +87,7 @@ pub const Recovery = struct {
     }
 
     pub fn deinit(self: *Recovery) void {
+        self.allocator.free(self.receipt_ids);
         for (self.blocks) |block| if (block.allocated) self.allocator.free(block.data);
         self.allocator.free(self.blocks);
         self.allocator.free(self.heap);
@@ -96,6 +98,16 @@ pub const Recovery = struct {
     pub fn clear(self: *Recovery) void {
         while (self.active_head != none) self.removeSlot(self.active_head);
         for (self.slots) |*slot| slot.* = .{};
+    }
+
+    pub fn enableReceipts(self: *Recovery) !void {
+        if (self.receipt_ids.len != 0) return;
+        self.receipt_ids = try self.allocator.alloc(u64, self.slots.len);
+        @memset(self.receipt_ids, 0);
+    }
+
+    pub fn setReceipt(self: *Recovery, sequence: u32, id: u64) void {
+        self.receipt_ids[sequence % self.slots.len] = id;
     }
 
     pub fn track(self: *Recovery, raw_sequence: u32, data: []const u8, in_flight_bytes: usize, now_ms: u64, rto_ms: u32) !void {
@@ -137,12 +149,16 @@ pub const Recovery = struct {
     }
 
     pub fn acknowledge(self: *Recovery, ranges: []const ack.Record, now_ms: u64, maximum_work: usize) !Acknowledged {
+        return self.acknowledgeWithReceipts(ranges, now_ms, maximum_work, null, null);
+    }
+
+    pub fn acknowledgeWithReceipts(self: *Recovery, ranges: []const ack.Record, now_ms: u64, maximum_work: usize, context: ?*anyopaque, notify: ?*const fn (*anyopaque, u64) void) !Acknowledged {
         const range_count = try validateRanges(ranges, maximum_work);
         var result: Acknowledged = .{};
         if (range_count <= self.count_value) {
             var iterator = ack.SequenceIterator.init(ranges, maximum_work);
             while (try iterator.next()) |sequence| {
-                if (self.findAcknowledged(sequence)) |index| self.ackSlot(index, now_ms, &result, self.slots[index].sequence != uint24.normalize(sequence));
+                if (self.findAcknowledged(sequence)) |index| self.ackSlot(index, now_ms, &result, self.slots[index].sequence != uint24.normalize(sequence), context, notify);
             }
         } else {
             var current = self.active_head;
@@ -150,7 +166,7 @@ pub const Recovery = struct {
                 const slot = &self.slots[current];
                 const next = slot.active_next;
                 const original = slot.previous != none and contains(ranges, slot.previous);
-                if (original or contains(ranges, slot.sequence)) self.ackSlot(current, now_ms, &result, original);
+                if (original or contains(ranges, slot.sequence)) self.ackSlot(current, now_ms, &result, original, context, notify);
                 current = next;
             }
         }
@@ -236,6 +252,10 @@ pub const Recovery = struct {
             return slot;
         }
         const previous = self.slots[from].sequence;
+        if (self.receipt_ids.len != 0) {
+            self.receipt_ids[to] = self.receipt_ids[from];
+            self.receipt_ids[from] = 0;
+        }
         self.slots[to] = self.slots[from];
         self.slots[from] = .{ .sequence = previous, .forward = to };
         const slot = &self.slots[to];
@@ -298,6 +318,7 @@ pub const Recovery = struct {
     }
 
     fn removeSlot(self: *Recovery, slot_index: u32) void {
+        if (self.receipt_ids.len != 0) self.receipt_ids[slot_index] = 0;
         const slot = &self.slots[slot_index];
         if (slot.active_previous == none) self.active_head = slot.active_next else self.slots[slot.active_previous].active_next = slot.active_next;
         if (slot.active_next != none) self.slots[slot.active_next].active_previous = slot.active_previous;
@@ -309,11 +330,12 @@ pub const Recovery = struct {
     }
 
     // An ACK naming the first send gives an unambiguous RTT sample
-    fn ackSlot(self: *Recovery, slot_index: u32, now_ms: u64, result: *Acknowledged, original: bool) void {
+    fn ackSlot(self: *Recovery, slot_index: u32, now_ms: u64, result: *Acknowledged, original: bool, context: ?*anyopaque, notify: ?*const fn (*anyopaque, u64) void) void {
         const slot = &self.slots[slot_index];
         result.packets += 1;
         result.bytes +|= slot.in_flight_bytes;
         if (slot.transmissions == 1 or (original and slot.transmissions == 2)) result.rtt_sample_ms = time.elapsed(now_ms, slot.sent_ms);
+        if (notify) |callback| if (self.receipt_ids.len != 0 and self.receipt_ids[slot_index] != 0) callback(context.?, self.receipt_ids[slot_index]);
         self.removeSlot(slot_index);
     }
 

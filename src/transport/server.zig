@@ -22,6 +22,7 @@ const QuotaAllocator = @import("../util/quota_allocator.zig").QuotaAllocator;
 const time = @import("../util/time.zig");
 
 const State = enum { connecting, connected, closing, closed };
+pub const SessionHandle = struct { endpoint: EndpointKey, owner: u64 };
 
 pub const Options = struct {
     config: Config = .{},
@@ -221,6 +222,12 @@ pub const Session = struct {
     pub fn isConnected(self: Session) bool {
         return self.state == .connected;
     }
+    pub fn sessionHandle(self: *const Session) SessionHandle {
+        return .{ .endpoint = self.key, .owner = self.core.send_owner };
+    }
+    pub fn pollSendReceipt(self: *Session) ?core_mod.SendReceipt {
+        return self.core.pollSendReceipt();
+    }
     pub fn statistics(self: *const Session) core_mod.Statistics {
         var stats = self.core.statistics();
         stats.ack_records_sent = self.receipts.ack_records_sent;
@@ -228,6 +235,7 @@ pub const Session = struct {
         return stats;
     }
     pub fn close(self: *Session) void {
+        if (self.state == .closing or self.state == .closed) return;
         const now_ms = time.nowMilliseconds(self.socket.io);
         switch (self.state) {
             .closing, .closed => return,
@@ -239,7 +247,8 @@ pub const Session = struct {
         self.advanceClose(now_ms) catch return self.closeAt(now_ms);
         self.schedule() catch self.closeAt(now_ms);
     }
-    fn closeNow(self: *Session) void {
+    pub fn closeNow(self: *Session) void {
+        if (self.state == .closed) return;
         const now_ms = time.nowMilliseconds(self.socket.io);
         if ((self.state == .connected or self.state == .closing) and !self.core.disconnect_queued) {
             const payload = [_]u8{@backingInt(offline.Id.disconnect_notification)};
@@ -268,10 +277,19 @@ pub const Session = struct {
         return true;
     }
     pub fn queueSend(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        return self.queueSendImpl(payload, reliability, channel, false);
+    }
+    pub fn queueSendWithReceipt(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        return self.queueSendImpl(payload, reliability, channel, true);
+    }
+    fn queueSendImpl(self: *Session, payload: []const u8, reliability: frame.Reliability, channel: u8, receipt: bool) !core_mod.SendHandle {
         if (self.state != .connected) return error.NotConnected;
-        const handle = self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
+        const handle = (if (receipt) self.core.enqueueWithReceipt(payload, reliability, channel) else self.core.enqueueOutbound(.application, payload, reliability, channel)) catch |err| {
             self.closeOnError(.application_send, err);
             return err;
+        };
+        errdefer if (receipt) {
+            _ = self.core.send_receipts.remove(handle.id);
         };
         const now_ms = time.nowMilliseconds(self.socket.io);
         self.outbound_deadline_ms = now_ms;
@@ -414,6 +432,7 @@ pub const Session = struct {
 
     fn closeAt(self: *Session, now_ms: u64) void {
         self.state = .closed;
+        self.core.failSendReceipts();
         self.deadlines.upsert(self.key, now_ms) catch {};
     }
 };
@@ -447,6 +466,8 @@ pub const Listener = struct {
     pending_message_count: usize = 0,
     timer_turn: bool = false,
     closed: bool = false,
+    accepting: bool = true,
+    closed_socket: ?struct { address: std.Io.net.IpAddress, buffers: backend.BufferSizes, traffic: backend.Traffic } = null,
     handshake_timeout_ms: u32,
     ack_capacity: usize,
     timer_visits: u64 = 0,
@@ -528,9 +549,11 @@ pub const Listener = struct {
     }
 
     pub fn kernelBufferSizes(self: *const Listener) backend.BufferSizes {
+        if (self.closed_socket) |snapshot| return snapshot.buffers;
         return self.socket.kernelBufferSizes();
     }
     pub fn localAddress(self: *const Listener) std.Io.net.IpAddress {
+        if (self.closed_socket) |snapshot| return snapshot.address;
         return self.socket.value.address;
     }
     pub fn statistics(self: *const Listener) ListenerStatistics {
@@ -547,8 +570,8 @@ pub const Listener = struct {
             .active_sessions = self.sessions.count(),
             .session_memory_bytes = self.session_quota.used_bytes,
             .maximum_session_memory_bytes = self.session_quota.maximum_bytes,
-            .socket_buffers = self.socket.kernelBufferSizes(),
-            .traffic = self.socket.traffic,
+            .socket_buffers = self.kernelBufferSizes(),
+            .traffic = if (self.closed_socket) |snapshot| snapshot.traffic else self.socket.traffic,
             .unconnected_pings = handshake_counters.unconnected_pings,
             .open_connection_requests_1 = handshake_counters.open_connection_requests_1,
             .open_connection_requests_2 = handshake_counters.open_connection_requests_2,
@@ -572,11 +595,38 @@ pub const Listener = struct {
         @memmove(self.advertisement[0..advertisement.len], advertisement);
         self.handshake_handler.advertisement = self.advertisement[0..advertisement.len];
     }
+    pub fn lookupSession(self: *Listener, handle: SessionHandle) ?*Session {
+        if (self.closed) return null;
+        const found = self.sessions.get(handle.endpoint) orelse return null;
+        return if (found.core.send_owner == handle.owner and found.state != .closed) found else null;
+    }
+    pub fn stopAccepting(self: *Listener) void {
+        self.accepting = false;
+    }
+    pub fn beginShutdown(self: *Listener) void {
+        if (self.closed) return;
+        self.stopAccepting();
+        var iterator = self.sessions.valueIterator();
+        while (iterator.next()) |value| value.*.close();
+    }
+    /// Notifies and removes every session before closing the socket.
+    pub fn closeWithCallbacks(self: *Listener, callbacks: Callbacks) void {
+        if (self.closed) return;
+        self.stopAccepting();
+        while (self.sessions.count() != 0) {
+            var iterator = self.sessions.keyIterator();
+            const key = iterator.next().?.*;
+            self.sessions.get(key).?.closeNow();
+            self.removeSession(key, callbacks);
+        }
+        self.close();
+    }
     /// Cancel or await any pending waitReadable first
     pub fn close(self: *Listener) void {
         if (self.closed) return;
         var iterator = self.sessions.valueIterator();
         while (iterator.next()) |session| session.*.closeNow();
+        self.closed_socket = .{ .address = self.socket.value.address, .buffers = self.socket.kernelBufferSizes(), .traffic = self.socket.traffic };
         self.closed = true;
         self.socket.close();
     }
@@ -600,6 +650,10 @@ pub const Listener = struct {
 
     pub fn nextDeadline(self: *const Listener) ?u64 {
         if (self.closed) return null;
+        if (self.pending_message_index < self.pending_message_count) return 0;
+        return self.protocolDeadline();
+    }
+    fn protocolDeadline(self: *const Listener) ?u64 {
         const entry = self.deadlines.peek() orelse return null;
         return entry.deadline_ms;
     }
@@ -664,6 +718,11 @@ pub const Listener = struct {
                 continue;
             }
 
+            if (!self.accepting) {
+                stats.rate_limited_or_dropped += 1;
+                continue;
+            }
+
             const action = self.handshake_handler.handle(message.data, &key, std.hash.Wyhash.hash(self.source_secret, &key), now_ms / 30_000, now_ms, self.handshake_output);
             switch (action) {
                 .drop => stats.rate_limited_or_dropped += 1,
@@ -718,7 +777,7 @@ pub const Listener = struct {
         }
         self.deferred_receive_packets += self.pending_message_count - self.pending_message_index;
         self.processTimersInto(now_ms, callbacks, &stats, remaining);
-        if (remaining == 0) if (self.nextDeadline()) |deadline| {
+        if (remaining == 0) if (self.protocolDeadline()) |deadline| {
             self.timer_turn = deadline <= now_ms;
         };
         return stats;
@@ -895,6 +954,8 @@ pub const Listener = struct {
     fn removeSession(self: *Listener, key: EndpointKey, callbacks: Callbacks) void {
         _ = self.deadlines.remove(key);
         const removed = self.sessions.fetchRemove(key) orelse return;
+        removed.value.state = .closed;
+        removed.value.core.failSendReceipts();
         self.retired.add(removed.value.statistics());
         if (callbacks.disconnected) |notify| notify(callbacks.context, removed.value);
         removed.value.destroy();
@@ -1096,14 +1157,80 @@ test "listener answers an offline ping over loopback" {
     try std.testing.expect(listener.nextDeadline() == null);
 }
 
+test "native handles reject reconnects and shutdown fails pending sends before notification" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "test" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const first = try CloseHarness.open(listener, &peer);
+    const old = first.sessionHandle();
+    try std.testing.expectEqual(first, listener.lookupSession(old).?);
+    _ = try first.queueSendWithReceipt("\xfequeued", .reliable_ordered, 0);
+    first.closeNow();
+    try std.testing.expect(listener.lookupSession(old) == null);
+    _ = try listener.processTimers(time.nowMilliseconds(io), harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), harness.failed_receipts);
+    const second = try CloseHarness.open(listener, &peer);
+    const current = second.sessionHandle();
+    try std.testing.expect(old.owner != current.owner);
+    try std.testing.expect(listener.lookupSession(old) == null);
+    try std.testing.expectEqual(second, listener.lookupSession(current).?);
+    _ = try second.queueSendWithReceipt("\xfepending", .reliable, 0);
+    listener.beginShutdown();
+    try std.testing.expect(!listener.accepting);
+    try std.testing.expectError(error.NotConnected, second.send("\xferejected", .reliable, 0));
+    listener.closeWithCallbacks(harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 2), harness.disconnected);
+    try std.testing.expectEqual(@as(usize, 2), harness.failed_receipts);
+    try std.testing.expect(harness.closed_on_disconnect);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), listener.deadlines.count());
+    try std.testing.expect(listener.lookupSession(current) == null);
+    try std.testing.expectEqual(@as(usize, 0), listener.statistics().active_sessions);
+    try std.testing.expect(std.meta.eql(listener.localAddress(), listener.closed_socket.?.address));
+    _ = listener.kernelBufferSizes();
+    listener.closeWithCallbacks(harness.callbacks());
+    try std.testing.expectEqual(@as(usize, 2), harness.disconnected);
+}
+
+test "stopping acceptance drops new offline requests while retaining existing sessions" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const listener = try Listener.listen(std.testing.allocator, io, address, .{ .advertisement = "test" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(io, address, 576);
+    defer peer.close();
+    var harness: CloseHarness = .{};
+    const session = try CloseHarness.open(listener, &peer);
+    listener.stopAccepting();
+    var wire: [548]u8 = @splat(0);
+    wire[0] = @backingInt(offline.Id.open_connection_request_1);
+    @memcpy(wire[1..17], &offline.magic);
+    wire[17] = 11;
+    try harness.inject(listener, try std.Io.net.IpAddress.parseLiteral("127.0.0.1:1"), &wire);
+    try std.testing.expectEqual(@as(u64, 0), listener.handshake_handler.counters.open_connection_requests_1);
+    try std.testing.expectEqual(@as(u32, 1), listener.sessions.count());
+    try std.testing.expect(session.isConnected());
+    try std.testing.expectEqual(session, listener.lookupSession(session.sessionHandle()).?);
+}
+
 const CloseHarness = struct {
     disconnected: usize = 0,
+    failed_receipts: usize = 0,
+    closed_on_disconnect: bool = true,
 
     fn onConnect(_: *anyopaque, _: *Session) !void {}
     fn onMessage(_: *anyopaque, _: *Session, _: receiver.BorrowedPayload) !void {}
-    fn onDisconnect(raw: *anyopaque, _: *Session) void {
+    fn onDisconnect(raw: *anyopaque, session: *Session) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.disconnected += 1;
+        self.closed_on_disconnect = self.closed_on_disconnect and !session.isConnected();
+        while (session.pollSendReceipt()) |receipt| if (receipt.outcome == .failed) {
+            self.failed_receipts += 1;
+        };
     }
     fn callbacks(self: *@This()) Callbacks {
         return .{ .context = self, .connected = onConnect, .message = onMessage, .disconnected = onDisconnect };
@@ -1461,6 +1588,7 @@ test "continuous malformed input cannot starve a session close deadline" {
     listener.pending_message_count = 3;
     _ = try listener.poll(.none, harness.callbacks());
     try std.testing.expectEqual(@as(usize, 1), listener.pending_message_index);
+    try std.testing.expectEqual(@as(?u64, 0), listener.nextDeadline());
     try std.testing.expectEqual(@as(usize, 1), listener.sessions.count());
     _ = try listener.poll(.none, harness.callbacks());
     try std.testing.expectEqual(@as(usize, 1), listener.pending_message_index);

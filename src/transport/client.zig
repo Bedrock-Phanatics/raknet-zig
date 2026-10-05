@@ -228,6 +228,13 @@ pub const Client = struct {
     // Kept open until destroy() so a pending waitReadable never sees a closed handle
     fn abort(self: *Client) void {
         self.closed = true;
+        self.core.failSendReceipts();
+    }
+    pub fn closeNow(self: *Client) void {
+        self.abort();
+    }
+    pub fn pollSendReceipt(self: *Client) ?core_mod.SendReceipt {
+        return self.core.pollSendReceipt();
     }
     /// Cancel or await any pending waitReadable first
     pub fn destroy(self: *Client) void {
@@ -261,10 +268,19 @@ pub const Client = struct {
     }
 
     pub fn queueSend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        return self.queueSendImpl(payload, reliability, channel, false);
+    }
+    pub fn queueSendWithReceipt(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        return self.queueSendImpl(payload, reliability, channel, true);
+    }
+    fn queueSendImpl(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, receipt: bool) !core_mod.SendHandle {
         if (self.closed or self.closing) return error.ConnectionClosed;
-        const handle = self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
+        const handle = (if (receipt) self.core.enqueueWithReceipt(payload, reliability, channel) else self.core.enqueueOutbound(.application, payload, reliability, channel)) catch |err| {
             self.abortOnError(.application_send, err);
             return err;
+        };
+        errdefer if (receipt) {
+            _ = self.core.send_receipts.remove(handle.id);
         };
         const now_ms = time.nowMilliseconds(self.io);
         self.outbound_deadline_ms = now_ms;
@@ -294,6 +310,10 @@ pub const Client = struct {
 
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
+        if (self.pending_message_index < self.pending_message_count or self.pending_receive_error != null) return 0;
+        return self.protocolDeadline();
+    }
+    fn protocolDeadline(self: *const Client) ?u64 {
         var deadline = time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms);
         if (self.core.receiver_state.hasPendingDeliveries()) deadline = self.last_seen_ms;
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
@@ -420,7 +440,7 @@ pub const Client = struct {
             self.abort();
             return err;
         };
-        if (remaining == 0) if (self.nextDeadline()) |deadline| {
+        if (remaining == 0) if (self.protocolDeadline()) |deadline| {
             self.timer_turn = deadline <= latest_ms;
         };
         return delivered;
