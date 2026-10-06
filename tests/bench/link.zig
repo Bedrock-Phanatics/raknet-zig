@@ -204,6 +204,7 @@ pub fn simulate(io: std.Io, scenario: Scenario) !Result {
                 link.toSender(try datagram.encodeControl(.nack, &.{.{ .first = gap.first, .last = gap.last }}, &wire));
             }
         }
+        _ = try receiver.receiver_state.drainPending(config.batching.maximum_packets_per_iteration, &sink, Receiver.deliver);
         if (ack_deadline) |deadline| if (now >= deadline or pending_count > 200) {
             const canonical = receipt_batch.canonicalizeValues(pending_acks[0..pending_count], &records);
             var offset: usize = 0;

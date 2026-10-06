@@ -496,8 +496,8 @@ test "listener local address supports port zero and reuse port" {
     }
 }
 
-test "IPv6 client local address uses the bound port" {
-    if (builtin.os.tag != .linux) return;
+test "IPv6 local addresses and fragmented payloads respect the negotiated MTU" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) return;
     var io_instance: std.Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .unlimited });
     defer io_instance.deinit();
     const io = io_instance.io();
@@ -507,11 +507,16 @@ test "IPv6 client local address uses the bound port" {
     const Harness = struct {
         listener: *raknet.Server,
         connected: bool = false,
+        received: usize = 0,
         fn onConnect(raw: *anyopaque, _: *raknet.Session) error{ApplicationFailure}!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.connected = true;
         }
-        fn onMessage(_: *anyopaque, _: *raknet.Session, _: raknet.BorrowedPayload) error{ApplicationFailure}!void {}
+        fn onMessage(raw: *anyopaque, _: *raknet.Session, payload: raknet.BorrowedPayload) error{ApplicationFailure}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (payload.bytes.len != 8192 or payload.bytes[0] != 0xfe) return error.ApplicationFailure;
+            self.received += 1;
+        }
         fn run(self: *@This()) !void {
             while (!self.connected) _ = try self.listener.poll(.none, .{ .context = self, .connected = onConnect, .message = onMessage });
         }
@@ -524,6 +529,16 @@ test "IPv6 client local address uses the bound port" {
     try task.await(io);
     try std.testing.expect(client.localAddress().ip6.port != 0);
     try std.testing.expect(listener.localAddress().ip6.port != 0);
+    try std.testing.expectEqual(@as(u16, 1472), client.mtu);
+    try std.testing.expectEqual(@as(u16, 1424), client.core.transmitter_state.datagramMtu());
+    const payload: [8192]u8 = @splat(0xfe);
+    try client.send(&payload, .reliable_ordered, 0);
+    for (0..20) |_| {
+        _ = try listener.poll(.{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }, .{ .context = &harness, .connected = Harness.onConnect, .message = Harness.onMessage });
+        if (harness.received != 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), harness.received);
+    try std.testing.expectError(error.InvalidMtu, Client.connect(std.testing.allocator, io, listener.localAddress(), .{ .mtu = 576 }));
 }
 
 test "client readiness wakes on data and disconnect without polling" {

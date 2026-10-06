@@ -46,6 +46,8 @@ pub const Callbacks = struct {
     connected: *const fn (context: *anyopaque, session: *Session) core_mod.ApplicationCallbackError!void,
     message: *const fn (context: *anyopaque, session: *Session, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void,
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
+    /// Runs at the untrusted datagram boundary; false drops or consumes the packet.
+    filter_datagram: ?*const fn (context: *anyopaque, remote: std.Io.net.IpAddress, data: []const u8, now_ms: u64) bool = null,
 };
 
 const DeliveryBridge = struct {
@@ -56,6 +58,7 @@ const DeliveryBridge = struct {
 
     fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
         const self: *DeliveryBridge = @ptrCast(@alignCast(raw));
+        if (self.session.state == .closed) return;
         const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
         switch (packet) {
             .connected_ping => |sent| {
@@ -184,11 +187,12 @@ pub const Session = struct {
     ) !*Session {
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
-        var core = try core_mod.Core.init(allocator, mtu, config);
+        const overhead = net_address.ipUdpOverhead(address);
+        var core = try core_mod.Core.initWithOverhead(allocator, mtu, config, overhead);
         errdefer core.deinit();
-        const scratch = try allocator.alloc(u8, mtu);
+        const scratch = try allocator.alloc(u8, core.transmitter_state.datagramMtu());
         errdefer allocator.free(scratch);
-        var receipts = try receipt_batch.Batch.init(allocator, @min(ack_capacity, config.batching.maximum_ack_records), mtu, config.protocol.maximum_acknowledged_datagrams);
+        var receipts = try receipt_batch.Batch.init(allocator, @min(ack_capacity, config.batching.maximum_ack_records), mtu - overhead, config.protocol.maximum_acknowledged_datagrams);
         errdefer receipts.deinit();
         self.* = .{
             .allocator = allocator,
@@ -595,6 +599,14 @@ pub const Listener = struct {
         @memmove(self.advertisement[0..advertisement.len], advertisement);
         self.handshake_handler.advertisement = self.advertisement[0..advertisement.len];
     }
+    pub fn sendRaw(self: *Listener, remote: std.Io.net.IpAddress, data: []const u8) !void {
+        if (self.closed) return error.ConnectionClosed;
+        if (data.len == 0) return error.EmptyPayload;
+        if (data.len > self.config.protocol.maximum_mtu - net_address.ipUdpOverhead(remote)) return error.DatagramTooLarge;
+        const cost: u32 = @intCast(1 + (data.len - 1) / 64);
+        if (!self.limiter.allow(self.sourceKey(endpointKey(remote)), cost, time.nowMilliseconds(self.io))) return error.RateLimited;
+        try self.socket.send(remote, data);
+    }
     pub fn lookupSession(self: *Listener, handle: SessionHandle) ?*Session {
         if (self.closed) return null;
         const found = self.sessions.get(handle.endpoint) orelse return null;
@@ -712,6 +724,10 @@ pub const Listener = struct {
             processed += 1;
             stats.datagrams += 1;
             remaining -= 1;
+            if (callbacks.filter_datagram) |filter| if (!filter(callbacks.context, message.from, message.data, now_ms)) {
+                stats.rate_limited_or_dropped += 1;
+                continue;
+            };
             const key = endpointKey(message.from);
             if (self.sessions.get(key)) |session| {
                 try self.processExisting(session, key, message, now_ms, callbacks, &stats, &remaining);
@@ -723,7 +739,7 @@ pub const Listener = struct {
                 continue;
             }
 
-            const action = self.handshake_handler.handle(message.data, &key, std.hash.Wyhash.hash(self.source_secret, &key), now_ms / 30_000, now_ms, self.handshake_output);
+            const action = self.handshake_handler.handle(message.data, &key, self.sourceKey(key), now_ms / 30_000, now_ms, self.handshake_output);
             switch (action) {
                 .drop => stats.rate_limited_or_dropped += 1,
                 .response => |wire| try self.socket.send(message.from, wire),
@@ -793,6 +809,11 @@ pub const Listener = struct {
         stats: *PollStats,
         remaining: *usize,
     ) !void {
+        if (session.state == .closed) {
+            self.removeSession(key, callbacks);
+            stats.rate_limited_or_dropped += 1;
+            return;
+        }
         if (isOfflineHandshake(message.data)) {
             session.flushReceipts() catch |err| {
                 recordSessionFailure(stats, core_mod.classifyTransitionError(.receipt, err).class);
@@ -803,7 +824,7 @@ pub const Listener = struct {
             const repeated = self.handshake_handler.handle(
                 message.data,
                 &key,
-                std.hash.Wyhash.hash(self.source_secret, &key),
+                self.sourceKey(key),
                 now_ms / 30_000,
                 now_ms,
                 self.handshake_output,
@@ -949,6 +970,12 @@ pub const Listener = struct {
     fn record(self: *Listener, stats: PollStats) void {
         self.malformed_datagrams += stats.malformed;
         self.dropped_datagrams += stats.rate_limited_or_dropped;
+    }
+
+    fn sourceKey(self: *const Listener, endpoint: EndpointKey) u64 {
+        var source = endpoint;
+        @memset(source[17..19], 0);
+        return std.hash.Wyhash.hash(self.source_secret, &source);
     }
 
     fn removeSession(self: *Listener, key: EndpointKey, callbacks: Callbacks) void {
@@ -1171,7 +1198,8 @@ test "native handles reject reconnects and shutdown fails pending sends before n
     _ = try first.queueSendWithReceipt("\xfequeued", .reliable_ordered, 0);
     first.closeNow();
     try std.testing.expect(listener.lookupSession(old) == null);
-    _ = try listener.processTimers(time.nowMilliseconds(io), harness.callbacks());
+    var invalid = [_]u8{0};
+    try harness.inject(listener, peer.value.address, &invalid);
     try std.testing.expectEqual(@as(usize, 1), harness.failed_receipts);
     const second = try CloseHarness.open(listener, &peer);
     const current = second.sessionHandle();
@@ -1271,6 +1299,92 @@ const CloseHarness = struct {
         try self.inject(listener, peer.value.address, try @import("../protocol/datagram.zig").encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &wire));
     }
 };
+
+test "host filtering blocks before parsing and raw replies remain bounded" {
+    const Harness = struct {
+        calls: usize = 0,
+        blocked_until: u64 = std.math.maxInt(u64),
+        fn connected(_: *anyopaque, _: *Session) error{ApplicationFailure}!void {}
+        fn message(_: *anyopaque, _: *Session, _: receiver.BorrowedPayload) error{ApplicationFailure}!void {}
+        fn filter(raw: *anyopaque, _: std.Io.net.IpAddress, data: []const u8, now: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return now >= self.blocked_until and std.mem.eql(u8, data, "validated");
+        }
+    };
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const listener = try Listener.listen(std.testing.allocator, std.testing.io, address, .{ .advertisement = "test", .offline_burst = 2, .offline_rate_per_second = 1 });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(std.testing.io, address, 2048);
+    defer peer.close();
+    var harness: Harness = .{};
+    var wire = [_]u8{0};
+    for (0..2) |turn| {
+        if (turn == 1) harness.blocked_until = 0;
+        listener.messages[0] = .{ .from = peer.value.address, .data = &wire, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+        listener.pending_message_index = 0;
+        listener.pending_message_count = 1;
+        const stats = try listener.poll(.none, .{ .context = &harness, .connected = Harness.connected, .message = Harness.message, .filter_datagram = Harness.filter });
+        try std.testing.expectEqual(@as(usize, 1), stats.rate_limited_or_dropped);
+    }
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    try std.testing.expect(Harness.filter(&harness, peer.value.address, "validated", 0));
+    try std.testing.expectEqual(@as(u64, 0), listener.malformed_datagrams);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectError(error.EmptyPayload, listener.sendRaw(peer.value.address, ""));
+    const oversized: [1492]u8 = @splat(0);
+    try std.testing.expectError(error.DatagramTooLarge, listener.sendRaw(peer.value.address, &oversized));
+    try listener.sendRaw(peer.value.address, "raw");
+    var receive: [2048]u8 = undefined;
+    const reply = try peer.receive(&receive, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+    try std.testing.expectEqualStrings("raw", reply.data);
+    const changed_port = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:1");
+    try std.testing.expectEqual(listener.sourceKey(endpointKey(peer.value.address)), listener.sourceKey(endpointKey(changed_port)));
+    const source = listener.sourceKey(endpointKey(changed_port));
+    const now = time.nowMilliseconds(listener.io);
+    try std.testing.expect(listener.limiter.allow(source, 1, now));
+    try std.testing.expect(!listener.limiter.allow(source, 1, now));
+    try std.testing.expectError(error.RateLimited, listener.sendRaw(changed_port, "raw"));
+    const v6a = try std.Io.net.IpAddress.parseLiteral("[::1]:1");
+    const v6b = try std.Io.net.IpAddress.parseLiteral("[::1]:2");
+    try std.testing.expectEqual(listener.sourceKey(endpointKey(v6a)), listener.sourceKey(endpointKey(v6b)));
+    listener.close();
+    try std.testing.expectError(error.ConnectionClosed, listener.sendRaw(peer.value.address, "raw"));
+}
+
+test "forced close in a payload callback suppresses later frames" {
+    const Harness = struct {
+        calls: usize = 0,
+        fn connected(_: *anyopaque, _: *Session) error{ApplicationFailure}!void {}
+        fn message(raw: *anyopaque, session: *Session, _: receiver.BorrowedPayload) error{ApplicationFailure}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            session.closeNow();
+        }
+    };
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    const listener = try Listener.listen(std.testing.allocator, std.testing.io, address, .{ .advertisement = "test" });
+    defer listener.destroy();
+    var peer = try backend.Socket.bind(std.testing.io, address, 576);
+    defer peer.close();
+    _ = try CloseHarness.open(listener, &peer);
+    var harness: Harness = .{};
+    var storage: [128]u8 = undefined;
+    var control: [9]u8 = undefined;
+    const ping = try connected.encodePing(0, &control);
+    const frames = [_]frame.Frame{
+        .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .payload = "\xfefirst" },
+        .{ .reliability = .reliable_ordered, .reliable_index = 1, .order_index = 1, .order_channel = 0, .payload = "\xfesecond" },
+        .{ .reliability = .unreliable, .payload = ping },
+    };
+    const wire = try @import("../protocol/datagram.zig").encodeData(0, &frames, &storage);
+    listener.messages[0] = .{ .from = peer.value.address, .data = wire, .control = &.{}, .flags = @bitCast(@as(u8, 0)) };
+    listener.pending_message_count = 1;
+    _ = try listener.poll(.none, .{ .context = &harness, .connected = Harness.connected, .message = Harness.message });
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expectEqual(@as(u32, 0), listener.sessions.count());
+    try std.testing.expectEqual(@as(u64, 2), listener.statistics().traffic.datagrams_sent);
+}
 
 test "graceful session close drains data and retransmits the disconnect until ACKed" {
     const io = std.testing.io;

@@ -2,10 +2,19 @@ const std = @import("std");
 
 const OwnedPayload = @import("../payload.zig").OwnedPayload;
 const time = @import("../util/time.zig");
+const frame = @import("../protocol/frame.zig");
 
 const none = std.math.maxInt(u32);
 const class_sizes = [_]usize{ 64, 256, 576, 1200 };
 const retained_block_parts = 256;
+
+pub const Metadata = packed struct(u64) {
+    reliability: frame.Reliability = .unreliable,
+    order_index: u24 = 0,
+    sequence_index: u24 = 0,
+    order_channel: u8 = 0,
+    padding: u5 = 0,
+};
 
 const Fragment = struct {
     data: ?[]u8 = null,
@@ -20,6 +29,7 @@ const Assembly = struct {
     bytes: usize = 0,
     deadline_ms: u64 = 0,
     heap_index: u32 = none,
+    metadata: Metadata = .{},
 };
 
 pub const ScatterPayload = struct {
@@ -113,13 +123,17 @@ pub const Reassembler = struct {
     }
 
     pub fn push(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?OwnedPayload {
-        const slot = try self.retain(id, count_value, index, payload, now_ms);
+        return self.pushWithMetadata(id, count_value, index, payload, .{}, now_ms);
+    }
+
+    pub fn pushWithMetadata(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, metadata: Metadata, now_ms: u64) !?OwnedPayload {
+        const slot = try self.retain(id, count_value, index, payload, metadata, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return null;
         return try self.finish(slot.?);
     }
 
     pub fn pushScatter(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64, context: *anyopaque, consume: ScatterFn) !bool {
-        const slot = try self.retain(id, count_value, index, payload, now_ms);
+        const slot = try self.retain(id, count_value, index, payload, .{}, now_ms);
         if (slot == null or self.assemblies[slot.?].received != self.assemblies[slot.?].count) return false;
         const assembly = self.assemblies[slot.?];
         try consume(context, .{ .owner = self, .slot = slot.?, .fragment_count = assembly.count, .total_bytes = assembly.bytes });
@@ -127,13 +141,17 @@ pub const Reassembler = struct {
         return true;
     }
 
-    fn retain(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, now_ms: u64) !?usize {
+    fn retain(self: *Reassembler, id: u16, count_value: u32, index: u32, payload: []const u8, metadata: Metadata, now_ms: u64) !?usize {
         if (count_value < 2 or count_value > self.limits.maximum_parts or index >= count_value) return error.InvalidSplit;
         if (payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
 
         var slot = self.find(id);
         // Delayed fragments can reuse an active split ID.
         if (slot != null and self.assemblies[slot.?].count != count_value) return null;
+        if (slot != null and !std.meta.eql(self.assemblies[slot.?].metadata, metadata)) {
+            self.remove(slot.?);
+            return error.ConflictingFragment;
+        }
         var created = false;
         if (slot == null) {
             if (self.assembly_count == self.limits.maximum_concurrent) return error.TooManyAssemblies;
@@ -143,7 +161,7 @@ pub const Reassembler = struct {
             slot = self.freeSlot() orelse return error.InternalInvariant;
             try self.ensureFragmentBlock(slot.?, count_value);
             const deadline_ms = time.deadline(now_ms, self.limits.timeout_ms);
-            self.assemblies[slot.?] = .{ .active = true, .id = id, .count = count_value, .deadline_ms = deadline_ms };
+            self.assemblies[slot.?] = .{ .active = true, .id = id, .count = count_value, .deadline_ms = deadline_ms, .metadata = metadata };
             self.assembly_count += 1;
             self.total_parts += count_value;
             self.heapInsert(slot.?);
@@ -158,7 +176,6 @@ pub const Reassembler = struct {
                 self.remove(slot.?);
                 return error.ConflictingFragment;
             }
-            self.updateDeadline(slot.?, now_ms);
             return slot;
         }
         if (payload.len > self.limits.maximum_bytes - assembly.bytes) {
@@ -347,6 +364,31 @@ pub const Reassembler = struct {
 fn storageCapacity(len: usize) usize {
     for (class_sizes) |size| if (len <= size) return size;
     return len;
+}
+
+test "split metadata conflicts discard the assembly and duplicates do not extend expiry" {
+    const original: Metadata = .{ .reliability = .reliable_ordered, .order_index = 1, .sequence_index = 2, .order_channel = 3 };
+    for ([_]Metadata{
+        .{ .reliability = .reliable, .order_index = 1, .sequence_index = 2, .order_channel = 3 },
+        .{ .reliability = .reliable_ordered, .order_index = 2, .sequence_index = 2, .order_channel = 3 },
+        .{ .reliability = .reliable_ordered, .order_index = 1, .sequence_index = 3, .order_channel = 3 },
+        .{ .reliability = .reliable_ordered, .order_index = 1, .sequence_index = 2, .order_channel = 4 },
+    }) |conflicting| {
+        var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 2, .maximum_bytes = 8, .maximum_concurrent = 1, .maximum_total_bytes = 8, .maximum_total_parts = 2, .timeout_ms = 10 });
+        defer value.deinit();
+        try std.testing.expect((try value.pushWithMetadata(1, 2, 1, "b", original, 0)) == null);
+        try std.testing.expectError(error.ConflictingFragment, value.pushWithMetadata(1, 2, 0, "a", conflicting, 1));
+        try std.testing.expectEqual(@as(usize, 0), value.count());
+        try std.testing.expectEqual(@as(usize, 0), value.payloadBytes());
+        try std.testing.expect((try value.pushWithMetadata(1, 2, 0, "a", original, 2)) == null);
+        try std.testing.expect((try value.pushWithMetadata(1, 2, 0, "a", original, 11)) == null);
+        try std.testing.expectEqual(@as(?u64, 12), value.nextDeadline());
+        try std.testing.expectEqual(@as(usize, 1), value.expire(12, 1).expired);
+        try std.testing.expect((try value.pushWithMetadata(1, 2, 1, "b", original, 20)) == null);
+        const completed = (try value.pushWithMetadata(1, 2, 0, "a", original, 21)).?;
+        defer completed.deinit();
+        try std.testing.expectEqualStrings("ab", completed.bytes);
+    }
 }
 
 test "split assembly handles duplicates conflicts collisions and expiry" {

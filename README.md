@@ -102,6 +102,10 @@ For staged server shutdown, call `stopAccepting()` to stop new offline handshake
 
 Keep transport operations and receipt polling on the owner thread. Do not recursively poll, close the listener, or destroy transport objects from a callback. Session callbacks may send or close their session. `nextDeadline()` returns an already-due deadline when received datagrams remain buffered; `processTimers()` does not consume those datagrams, so call `poll()` before waiting again. Compute `pollTimeout()` on the owner before starting `waitReadable()`. The host supplies its bounded command queue and cancels or rearms the wait when commands arrive.
 
+`Callbacks.filter_datagram` runs before session lookup and RakNet parsing. Return `true` to continue validation or `false` to drop or consume the datagram. A host can use its own bounded address block table with expiry here, or validate a separate UDP query protocol. The input is untrusted and borrowed for the callback only; keep work bounded and never forward unchecked bytes to payload callbacks. `sendRaw(address, bytes)` sends a bounded UDP response using the same source-IP and global rate limits as offline traffic. Source ports cannot reset those limits. Cookies still bind the complete endpoint.
+
+Negotiated MTU includes IP and UDP headers. Connected datagrams reserve 28 bytes for IPv4 and 48 for IPv6; frames also respect their 16-bit bit-length field and configured payload limit. IPv6 probes preserve RakNet's legacy 28-byte handshake convention by advertising a conservative value 20 bytes below the requested MTU. IPv6 probes below the configured minimum are rejected or omitted from the fallback ladder.
+
 ## Minecraft batches
 
 Minecraft batch handling is provided by [Bedwire](https://github.com/Bedrock-Phanatics/bedwire)

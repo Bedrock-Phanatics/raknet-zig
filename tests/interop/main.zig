@@ -176,6 +176,9 @@ fn server(io: std.Io, address: std.Io.net.IpAddress, seconds: u32, listeners: us
             .reuse_port = shards.len > 1,
             .config = .{ .timing = .{ .maximum_ack_delay_ms = ack_ms } },
             .receive_batch_size = receive_batch,
+            // The load generator opens thousands of connections from one IP.
+            .offline_rate_per_second = 20_000,
+            .offline_burst = 40_000,
         };
         if (receive_buffer) |bytes| options.socket_buffers.receive_bytes = bytes;
         shard.* = .{ .listener = try raknet.Server.listen(allocator, io, address, options) };

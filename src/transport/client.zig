@@ -113,6 +113,8 @@ pub const Client = struct {
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
         try validateOptions(options);
+        const probe_overhead = net_address.ipUdpOverhead(server) - 28;
+        if (options.mtu < options.config.protocol.minimum_mtu + probe_overhead) return error.InvalidMtu;
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
         const local: std.Io.net.IpAddress = switch (server) {
@@ -132,10 +134,10 @@ pub const Client = struct {
         const deadline_ms = time.deadline(time.nowMilliseconds(io), options.handshake_timeout_ms);
 
         var ladder: [max_mtu_rungs]u16 = undefined;
-        ladder[0] = options.mtu;
+        ladder[0] = options.mtu - probe_overhead;
         var rungs: usize = 1;
-        for (options.mtu_fallbacks) |fallback| if (fallback < options.mtu) {
-            ladder[rungs] = fallback;
+        for (options.mtu_fallbacks) |fallback| if (fallback < options.mtu and fallback >= options.config.protocol.minimum_mtu + probe_overhead) {
+            ladder[rungs] = fallback - probe_overhead;
             rungs += 1;
         };
         var negotiator: client_handshake.Negotiator = .init(.{
@@ -159,9 +161,10 @@ pub const Client = struct {
         errdefer allocator.free(receive_storage);
 
         var transferred = false;
-        var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
+        const overhead = net_address.ipUdpOverhead(server);
+        var core = try core_mod.Core.initWithOverhead(allocator, reply2.mtu, options.config, overhead);
         errdefer if (transferred) self.core.deinit() else core.deinit();
-        var receipts = try receipt_batch.Batch.init(allocator, options.config.batching.maximum_ack_records, reply2.mtu, options.config.protocol.maximum_acknowledged_datagrams);
+        var receipts = try receipt_batch.Batch.init(allocator, options.config.batching.maximum_ack_records, reply2.mtu - overhead, options.config.protocol.maximum_acknowledged_datagrams);
         errdefer if (transferred) self.receipts.deinit() else receipts.deinit();
         self.* = .{
             .allocator = allocator,

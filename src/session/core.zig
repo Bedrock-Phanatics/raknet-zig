@@ -255,11 +255,15 @@ pub const Core = struct {
     nack_records_received: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, mtu: u16, config: Config) !Core {
+        return initWithOverhead(allocator, mtu, config, 28);
+    }
+    pub fn initWithOverhead(allocator: std.mem.Allocator, mtu: u16, config: Config, ip_udp_overhead: u16) !Core {
         try config.validate();
         if (mtu < config.protocol.minimum_mtu or mtu > config.protocol.maximum_mtu) return error.InvalidMtu;
+        const transmitter_state = try transmitter.Transmitter.initWithOverhead(mtu, config, ip_udp_overhead);
         var receiver_state = try receiver.Receiver.init(allocator, config);
         errdefer receiver_state.deinit();
-        var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, mtu);
+        var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, transmitter_state.datagramMtu());
         recovery_state.maximum_delay_ms = config.timing.maximum_rto_ms;
         recovery_state.minimum_abandon_ms = config.timing.idle_timeout_ms;
         errdefer recovery_state.deinit();
@@ -276,7 +280,7 @@ pub const Core = struct {
             .allocator = allocator,
             .config = config,
             .receiver_state = receiver_state,
-            .transmitter_state = try transmitter.Transmitter.init(mtu, config),
+            .transmitter_state = transmitter_state,
             .outbound_state = outbound_state,
             .recovery_state = recovery_state,
             .congestion_state = try congestion.Controller.init(mtu),
@@ -864,7 +868,7 @@ test "core packetization stops at the available congestion window" {
     };
     var core = try Core.init(std.testing.allocator, 576, .{});
     defer core.deinit();
-    core.congestion_state.window = 576;
+    core.congestion_state.window = 548;
     var scratch: [576]u8 = undefined;
     var payload: [1200]u8 = @splat(1);
     var packetization = try core.beginPacketization(payload.len, .reliable_ordered, 0);
@@ -897,8 +901,8 @@ test "queued compatible messages share one datagram" {
     defer core.deinit();
     core.congestion_state.window = 576;
     var scratch: [576]u8 = undefined;
-    var first: [276]u8 = @splat(1);
-    var second: [276]u8 = @splat(2);
+    var first: [262]u8 = @splat(1);
+    var second: [262]u8 = @splat(2);
     _ = try core.enqueueOutbound(.application, &first, .reliable_ordered, 3);
     _ = try core.enqueueOutbound(.application, &second, .reliable_ordered, 3);
     _ = try core.enqueueOutbound(.application, "later", .reliable_ordered, 3);
@@ -906,7 +910,7 @@ test "queued compatible messages share one datagram" {
 
     const sent = try core.flushOutbound(.application, &scratch, 1, 0, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 1), sent.datagrams);
-    try std.testing.expectEqual(@as(usize, 576), sent.wire_bytes);
+    try std.testing.expectEqual(@as(usize, 548), sent.wire_bytes);
     try std.testing.expectEqual(@as(usize, 2), collector.frames);
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
     try std.testing.expectEqual(@as(u32, 2), core.transmitter_state.reliable_index);
@@ -1106,7 +1110,7 @@ test "partial send failure rolls back only the failed datagram" {
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.datagram_sequence);
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.reliable_index);
     try std.testing.expectEqual(@as(usize, 1), core.recovery_state.count());
-    try std.testing.expectEqual(@as(u64, 576), core.congestion_state.in_flight);
+    try std.testing.expectEqual(@as(u64, 548), core.congestion_state.in_flight);
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
     const progress = core.outbound_packetization[@backingInt(outbound_queue.Lane.application)].?;
     try std.testing.expectEqual(progress.capacity, progress.offset);

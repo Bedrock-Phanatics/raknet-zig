@@ -9,6 +9,28 @@ const reassembly = @import("../reliability/reassembly.zig");
 const receive_window = @import("../reliability/receive_window.zig");
 const uint24 = @import("../util/uint24.zig");
 
+test "split frames cannot change their delivery channel" {
+    const Counter = struct {
+        calls: usize = 0,
+        fn deliver(raw: *anyopaque, _: BorrowedPayload) DeliveryError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var receiver = try Receiver.init(std.testing.allocator, .{});
+    defer receiver.deinit();
+    var counter: Counter = .{};
+    var storage: [128]u8 = undefined;
+    var value: frame.Frame = .{ .reliability = .reliable_ordered, .reliable_index = 0, .order_index = 0, .order_channel = 0, .split = .{ .count = 2, .id = 7, .index = 0 }, .payload = "a" };
+    _ = try receiver.process(try @import("../protocol/datagram.zig").encodeData(0, &.{value}, &storage), 0, &counter, Counter.deliver);
+    value.reliable_index = 1;
+    value.order_channel = 1;
+    value.split.?.index = 1;
+    try std.testing.expectError(error.ConflictingFragment, receiver.process(try @import("../protocol/datagram.zig").encodeData(1, &.{value}, &storage), 1, &counter, Counter.deliver));
+    try std.testing.expectEqual(@as(usize, 0), counter.calls);
+    try std.testing.expectEqual(@as(usize, 0), receiver.splits.total_bytes);
+}
+
 pub const Receipt = struct {
     acknowledge: ?u32 = null,
     missing: ?receive_window.Gap = null,
@@ -217,7 +239,12 @@ pub const Receiver = struct {
         var complete: ?OwnedPayload = null;
         defer if (complete) |owned| owned.deinit();
         if (value.split) |split| {
-            complete = try self.splits.push(split.id, split.count, split.index, payload, now_ms);
+            complete = try self.splits.pushWithMetadata(split.id, split.count, split.index, payload, .{
+                .reliability = value.reliability,
+                .order_index = @intCast(value.order_index orelse 0),
+                .sequence_index = @intCast(value.sequence_index orelse 0),
+                .order_channel = value.order_channel orelse 0,
+            }, now_ms);
             if (complete == null) {
                 try self.commitReliable(value.reliable_index);
                 return 0;
