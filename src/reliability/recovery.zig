@@ -329,7 +329,7 @@ pub const Recovery = struct {
         slot.* = .{};
     }
 
-    // An ACK naming the first send gives an unambiguous RTT sample
+    // Original-send ACKs can measure RTT after one resend.
     fn ackSlot(self: *Recovery, slot_index: u32, now_ms: u64, result: *Acknowledged, original: bool, context: ?*anyopaque, notify: ?*const fn (*anyopaque, u64) void) void {
         const slot = &self.slots[slot_index];
         result.packets += 1;

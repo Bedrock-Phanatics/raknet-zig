@@ -208,14 +208,14 @@ pub const Socket = struct {
         const failure, _ = self.value.receiveManyTimeout(self.io, &message, &byte, .{ .peek = true }, timeout);
         const err = failure orelse return;
         switch (err) {
-            // Windows fails a peek into a short buffer instead of truncating
+            // Windows rejects short peek buffers without truncating.
             error.MessageOversize => {},
             error.ConcurrencyUnavailable => if (builtin.os.tag == .windows) return self.pollAfd(timeout) else return err,
             else => return err,
         }
     }
 
-    // Threaded cannot wait on Windows datagram sockets.
+    // Threaded cannot wait on Windows UDP sockets.
     fn pollAfd(self: *const Socket, timeout: std.Io.Timeout) !void {
         const windows = std.os.windows;
         const PollHandle = extern struct { handle: windows.HANDLE, events: windows.ULONG, status: windows.NTSTATUS };
@@ -239,7 +239,7 @@ pub const Socket = struct {
         if (status != .SUCCESS) return windows.unexpectedStatus(status);
     }
 
-    // Windows reports ICMP unreachable from an earlier send on a later receive
+    // Windows delivers old ICMP errors on later receives.
     fn skipReset(self: *Socket, err: anyerror) bool {
         if (builtin.os.tag != .windows or (err != error.PortUnreachable and err != error.ConnectionResetByPeer)) return false;
         self.traffic.connection_resets += 1;
@@ -271,7 +271,7 @@ pub const Socket = struct {
         // Custom providers may use virtual handles.
         if (builtin.os.tag == .linux and messages.len > 1 and self.io.vtable == std.Io.Threaded.global_single_threaded.io().vtable) {
             if (try self.receiveManyLinux(messages, data_storage)) |batch| return batch;
-            // Threaded floors sub-ms waits to zero and spins, this wait is uncancelable but under 1 ms
+            // Avoid sub-ms busy waits; this uncancelable poll lasts under 1 ms.
             if (remainingNanoseconds(self.io, timeout)) |remaining| if (remaining < std.time.ns_per_ms) {
                 if (remaining == 0 or !try self.pollLinux(remaining)) return error.Timeout;
                 return try self.receiveManyLinux(messages, data_storage) orelse error.Timeout;
@@ -427,7 +427,7 @@ fn bindReusePort(address: std.Io.net.IpAddress) !std.Io.net.Socket {
     return .{ .handle = fd, .address = bound };
 }
 
-// Negative means relative, in 100ns units
+// AFD uses negative 100 ns ticks for relative timeouts.
 fn afdTimeout(io: std.Io, timeout: std.Io.Timeout) i64 {
     const remaining = remainingNanoseconds(io, timeout) orelse return std.math.maxInt(i64);
     return -@as(i64, @intCast(@min(std.math.divCeil(u64, remaining, 100) catch unreachable, std.math.maxInt(i64))));
@@ -442,7 +442,7 @@ fn remainingNanoseconds(io: std.Io, timeout: std.Io.Timeout) ?u64 {
     return @intCast(std.math.clamp(remaining, 0, std.math.maxInt(u64)));
 }
 
-// std.Io's AFD handles reject this, skipReset covers them
+// AFD handles reject this; skipReset() handles their ICMP errors.
 fn ignoreConnectionResets(handle: std.Io.net.Socket.Handle) !void {
     if (builtin.os.tag != .windows) return;
     const sio_udp_connreset: u32 = 0x9800000C;

@@ -106,6 +106,8 @@ Keep transport operations and receipt polling on the owner thread. Do not recurs
 
 Negotiated MTU includes IP and UDP headers. Connected datagrams reserve 28 bytes for IPv4 and 48 for IPv6; frames also respect their 16-bit bit-length field and configured payload limit. IPv6 probes preserve RakNet's legacy 28-byte handshake convention by advertising a conservative value 20 bytes below the requested MTU. IPv6 probes below the configured minimum are rejected or omitted from the fallback ladder.
 
+Expired incomplete reliable split messages close the session and fail pending send receipts: already-ACKed fragments cannot be recovered after their assembly is discarded. Unreliable split messages may expire without closing. Conflicting fragment counts involving reliable traffic also close the session. Advanced `Core` integrations must handle errors from `expireSplits()`; direct reassembler users must check `ExpiryBatch.reliable_expired`.
+
 ## Minecraft batches
 
 Minecraft batch handling is provided by [Bedwire](https://github.com/Bedrock-Phanatics/bedwire)

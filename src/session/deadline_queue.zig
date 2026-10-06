@@ -8,7 +8,7 @@ pub const Entry = struct {
     order: u64,
 };
 
-// Map pointers stay valid since the preallocated map never rehashes
+// Preallocation keeps these map pointers stable.
 const HeapEntry = struct {
     deadline_ms: u64,
     order: u64,

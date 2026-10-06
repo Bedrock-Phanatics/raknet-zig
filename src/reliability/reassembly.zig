@@ -64,7 +64,7 @@ pub const Limits = struct {
     }
 };
 
-pub const ExpiryBatch = struct { expired: usize, inspected: usize };
+pub const ExpiryBatch = struct { expired: usize, inspected: usize, reliable_expired: usize = 0 };
 
 pub const Reassembler = struct {
     allocator: std.mem.Allocator,
@@ -146,8 +146,12 @@ pub const Reassembler = struct {
         if (payload.len > self.limits.maximum_bytes) return error.InvalidSplit;
 
         var slot = self.find(id);
-        // Delayed fragments can reuse an active split ID.
-        if (slot != null and self.assemblies[slot.?].count != count_value) return null;
+        if (slot != null and self.assemblies[slot.?].count != count_value) {
+            // Delayed unreliable fragments can reuse split IDs.
+            if (!metadata.reliability.hasReliableIndex() and !self.assemblies[slot.?].metadata.reliability.hasReliableIndex()) return null;
+            self.remove(slot.?);
+            return error.ConflictingFragment;
+        }
         if (slot != null and !std.meta.eql(self.assemblies[slot.?].metadata, metadata)) {
             self.remove(slot.?);
             return error.ConflictingFragment;
@@ -209,13 +213,15 @@ pub const Reassembler = struct {
 
     pub fn expire(self: *Reassembler, now_ms: u64, maximum_work: usize) ExpiryBatch {
         var expired: usize = 0;
+        var reliable_expired: usize = 0;
         while (expired < maximum_work and self.heap_len != 0) {
             const slot = self.heap[0];
             if (!time.reached(now_ms, self.assemblies[slot].deadline_ms)) break;
+            reliable_expired += @intFromBool(self.assemblies[slot].metadata.reliability.hasReliableIndex());
             self.remove(slot);
             expired += 1;
         }
-        return .{ .expired = expired, .inspected = expired };
+        return .{ .expired = expired, .inspected = expired, .reliable_expired = reliable_expired };
     }
 
     pub fn nextDeadline(self: Reassembler) ?u64 {
@@ -411,6 +417,18 @@ test "split assembly handles duplicates conflicts collisions and expiry" {
     try std.testing.expectEqual(@as(usize, 2), value.expire(100, 2).expired);
     try std.testing.expectEqual(@as(?u64, null), value.nextDeadline());
     try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+}
+
+test "reliable split count collisions cannot acknowledge discarded fragments" {
+    var value = try Reassembler.init(std.testing.allocator, .{ .maximum_parts = 4, .maximum_bytes = 16, .maximum_concurrent = 1, .maximum_total_bytes = 16, .maximum_total_parts = 4, .timeout_ms = 10 });
+    defer value.deinit();
+    for ([_]frame.Reliability{ .unreliable, .reliable_ordered }) |first| {
+        try std.testing.expect((try value.pushWithMetadata(7, 2, 0, "a", .{ .reliability = first }, 0)) == null);
+        try std.testing.expectError(error.ConflictingFragment, value.pushWithMetadata(7, 3, 1, "b", .{ .reliability = .reliable_ordered }, 1));
+        try std.testing.expectEqual(@as(usize, 0), value.count());
+        try std.testing.expectEqual(@as(usize, 0), value.payloadBytes());
+        try std.testing.expectEqual(@as(usize, 0), value.total_parts);
+    }
 }
 
 test "conflicting split counts preserve progress deadlines and budgets across ID reuse" {

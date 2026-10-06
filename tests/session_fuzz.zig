@@ -69,7 +69,7 @@ fn exercise(input: []const u8) !void {
                 var due: [8]raknet.advanced.reliability.recovery.Due = undefined;
                 _ = core.collectRetransmissions(now, &due, 8);
             },
-            3 => _ = core.expireSplits(now, 8),
+            3 => _ = core.expireSplits(now, 8) catch {},
             4 => if (bytes.len != 0) {
                 _ = core.sendControl(bytes, if (control & 1 == 0) .unreliable else .reliable_ordered, 0, &scratch, now, &unused, Sink.emit) catch {};
             },

@@ -205,8 +205,7 @@ pub const Client = struct {
     pub fn traffic(self: *const Client) backend.Traffic {
         return self.socket.traffic;
     }
-    /// Starts graceful shutdown. Keep calling poll() or processTimers() until isClosed().
-    /// Use destroy() to close immediately.
+    /// Keep polling or processing timers until isClosed().
     pub fn close(self: *Client) void {
         if (self.closed or self.closing) return;
         self.closing = true;
@@ -228,7 +227,7 @@ pub const Client = struct {
             },
         }
     }
-    // Kept open until destroy() so a pending waitReadable never sees a closed handle
+    // Keep the socket alive for pending readiness waits.
     fn abort(self: *Client) void {
         self.closed = true;
         self.core.failSendReceipts();
@@ -239,7 +238,7 @@ pub const Client = struct {
     pub fn pollSendReceipt(self: *Client) ?core_mod.SendReceipt {
         return self.core.pollSendReceipt();
     }
-    /// Cancel or await any pending waitReadable first
+    /// Cancel or await pending waitReadable() calls first.
     pub fn destroy(self: *Client) void {
         if (!self.closed and !self.core.disconnect_queued) {
             var payload = [_]u8{@backingInt(offline.Id.disconnect_notification)};
@@ -332,7 +331,7 @@ pub const Client = struct {
         return time.earliest(self.io, limit, time.atMilliseconds(deadline));
     }
 
-    /// Safe to run beside the owner, pass pollTimeout() since timers aren't checked
+    /// May run beside the owner; pass pollTimeout() to honor timers.
     pub fn waitReadable(self: *const Client, timeout: std.Io.Timeout) !void {
         return self.socket.waitReadable(timeout);
     }
@@ -341,7 +340,7 @@ pub const Client = struct {
         _ = try self.processTimersAt(now_ms, null);
     }
 
-    /// Advances timers and delivers buffered ordered messages within the turn budget.
+    /// Delivers buffered ordered messages within the timer work budget.
     pub fn processTimersWithMessages(self: *Client, now_ms: u64, context: *anyopaque, on_message: MessageFn) !usize {
         var bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
         return self.processTimersAt(now_ms, &bridge);
@@ -553,7 +552,7 @@ pub const Client = struct {
             const used = switch (timer) {
                 0 => try self.flushReceiptsUpTo(quota),
                 1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
-                2 => self.core.expireSplits(now_ms, quota).inspected,
+                2 => (try self.core.expireSplits(now_ms, quota)).inspected,
                 3 => try self.flushRetransmissions(now_ms, quota),
                 else => try self.core.receiver_state.drainPending(quota, bridge.?, PollBridge.deliver),
             };

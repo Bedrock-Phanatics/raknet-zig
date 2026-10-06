@@ -146,7 +146,7 @@ pub fn classifyIncomingError(err: anyerror) IncomingFailure {
         error.CongestionWindowFull,
         => .{ .class = .resource, .disposition = .close_session },
 
-        error.TransportFailure => .{ .class = .transport, .disposition = .close_session },
+        error.TransportFailure, error.SplitReassemblyTimedOut => .{ .class = .transport, .disposition = .close_session },
         error.ApplicationFailure => .{ .class = .application, .disposition = .close_session },
         else => .{ .class = .internal, .disposition = .close_session },
     };
@@ -439,7 +439,6 @@ pub const Core = struct {
     }
 
     pub fn pollSendReceipt(self: *Core) ?SendReceipt {
-        // ponytail: bounded scan; add a ready queue if polling becomes hot.
         var iterator = self.send_receipts.iterator();
         while (iterator.next()) |entry| {
             const outcome = entry.value_ptr.outcome orelse continue;
@@ -677,8 +676,15 @@ pub const Core = struct {
         return self.receiver_state.nextSplitDeadline();
     }
 
-    pub fn expireSplits(self: *Core, now_ms: u64, maximum_work: usize) reassembly.ExpiryBatch {
-        return self.receiver_state.expireSplits(now_ms, maximum_work);
+    pub fn expireSplits(self: *Core, now_ms: u64, maximum_work: usize) !reassembly.ExpiryBatch {
+        const batch = self.receiver_state.expireSplits(now_ms, maximum_work);
+        // ACKed fragments cannot be recovered after discarding their assembly.
+        if (batch.reliable_expired != 0) {
+            self.terminal_send_failure = true;
+            self.failSendReceipts();
+            return error.SplitReassemblyTimedOut;
+        }
+        return batch;
     }
 
     pub fn collectRetransmissions(self: *Core, now_ms: u64, output: []recovery.Due, maximum_work: usize) recovery.DueBatch {
@@ -711,6 +717,36 @@ const ReceiptHarness = struct {
         _ = try core.processIncoming(wire, 100, self, discard);
     }
 };
+
+test "split expiry respects work limits and only reliable loss is terminal" {
+    for ([_]frame.Reliability{ .unreliable, .unreliable_sequenced, .reliable, .reliable_ordered, .reliable_sequenced }) |reliability| {
+        var config: Config = .{};
+        config.timing.split_timeout_ms = 10;
+        var core = try Core.init(std.testing.allocator, 576, config);
+        defer core.deinit();
+        const handle = try core.enqueueWithReceipt("pending", .reliable_ordered, 0);
+        try std.testing.expect((try core.receiver_state.splits.pushWithMetadata(7, 2, 0, "a", .{ .reliability = reliability }, 0)) == null);
+        try std.testing.expectEqual(@as(usize, 0), (try core.expireSplits(10, 0)).expired);
+        try std.testing.expectEqual(@as(usize, 0), (try core.expireSplits(9, 1)).expired);
+        try std.testing.expectEqual(@as(usize, 1), core.receiver_state.splits.count());
+        if (reliability.hasReliableIndex()) {
+            try std.testing.expectError(error.SplitReassemblyTimedOut, core.expireSplits(10, 1));
+            const receipt = core.pollSendReceipt().?;
+            try std.testing.expectEqual(handle, receipt.handle);
+            try std.testing.expectEqual(.failed, receipt.outcome);
+            try std.testing.expectError(error.ConnectionClosed, core.enqueueOutbound(.application, "later", .reliable_ordered, 0));
+            const failure = classifyIncomingError(error.SplitReassemblyTimedOut);
+            try std.testing.expectEqual(.transport, failure.class);
+            try std.testing.expectEqual(.close_session, failure.disposition);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), (try core.expireSplits(10, 1)).expired);
+            try std.testing.expect(core.pollSendReceipt() == null);
+            _ = try core.enqueueOutbound(.application, "later", .reliable_ordered, 0);
+        }
+        try std.testing.expectEqual(@as(usize, 0), core.receiver_state.splits.count());
+        try std.testing.expectEqual(@as(usize, 0), core.receiver_state.splits.payloadBytes());
+    }
+}
 
 test "receipts wait for every fragment across partial flushes resends and wrap" {
     var core = try Core.init(std.testing.allocator, 576, .{});

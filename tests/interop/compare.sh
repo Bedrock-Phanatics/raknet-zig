@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Compares a Zig server with a go-raknet server under one Go client on Linux
 # usage: compare.sh <zig-interop> <go-interop> <output-dir> [rounds]
 set -euo pipefail
 zig=$(realpath "$1")

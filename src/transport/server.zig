@@ -46,7 +46,7 @@ pub const Callbacks = struct {
     connected: *const fn (context: *anyopaque, session: *Session) core_mod.ApplicationCallbackError!void,
     message: *const fn (context: *anyopaque, session: *Session, payload: receiver.BorrowedPayload) core_mod.ApplicationCallbackError!void,
     disconnected: ?*const fn (context: *anyopaque, session: *Session) void = null,
-    /// Runs at the untrusted datagram boundary; false drops or consumes the packet.
+    /// Untrusted input; false drops or consumes the datagram.
     filter_datagram: ?*const fn (context: *anyopaque, remote: std.Io.net.IpAddress, data: []const u8, now_ms: u64) bool = null,
 };
 
@@ -405,7 +405,7 @@ pub const Session = struct {
             const used = switch (timer) {
                 0 => try self.flushReceiptsUpTo(quota),
                 1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
-                2 => self.core.expireSplits(now_ms, quota).inspected,
+                2 => (try self.core.expireSplits(now_ms, quota)).inspected,
                 3 => try self.flushRetransmissions(now_ms, quota),
                 else => try self.core.receiver_state.drainPending(quota, bridge, DeliveryBridge.deliver),
             };
@@ -621,7 +621,6 @@ pub const Listener = struct {
         var iterator = self.sessions.valueIterator();
         while (iterator.next()) |value| value.*.close();
     }
-    /// Notifies and removes every session before closing the socket.
     pub fn closeWithCallbacks(self: *Listener, callbacks: Callbacks) void {
         if (self.closed) return;
         self.stopAccepting();
@@ -633,7 +632,7 @@ pub const Listener = struct {
         }
         self.close();
     }
-    /// Cancel or await any pending waitReadable first
+    /// Cancel or await pending waitReadable() calls first.
     pub fn close(self: *Listener) void {
         if (self.closed) return;
         var iterator = self.sessions.valueIterator();
@@ -675,7 +674,7 @@ pub const Listener = struct {
         return time.earliest(self.io, limit, time.atMilliseconds(deadline));
     }
 
-    /// Safe to run beside the owner, pass pollTimeout() since timers aren't checked
+    /// May run beside the owner; pass pollTimeout() to honor timers.
     pub fn waitReadable(self: *const Listener, timeout: std.Io.Timeout) !void {
         return self.socket.waitReadable(timeout);
     }
