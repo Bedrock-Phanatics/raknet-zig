@@ -499,7 +499,11 @@ fn setWindowsBuffer(io: std.Io, handle: std.Io.net.Socket.Handle, option: std.os
         },
     });
     const status = result.device_io_control.u.Status;
-    if (status != .SUCCESS) return windows.unexpectedStatus(status);
+    switch (status) {
+        .SUCCESS => {},
+        .NO_MEMORY, .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        else => return windows.unexpectedStatus(status),
+    }
 }
 
 fn setLinuxBuffer(handle: std.Io.net.Socket.Handle, option: u32, value: u32) !void {
@@ -663,6 +667,43 @@ test "socket buffer options are bounded" {
     try BufferOptions.validate(.{});
     try std.testing.expectError(error.InvalidConfiguration, BufferOptions.validate(.{ .receive_bytes = 0 }));
     try std.testing.expectError(error.InvalidConfiguration, BufferOptions.validate(.{ .send_bytes = 256 * 1024 * 1024 + 1 }));
+}
+
+test "Windows buffer configuration reports resource failure and closes its socket" {
+    if (builtin.os.tag != .windows) return;
+    const Harness = struct {
+        var calls: usize = 0;
+        var closes: usize = 0;
+        var fail_at: usize = 1;
+        var status: std.os.windows.NTSTATUS = .INSUFFICIENT_RESOURCES;
+
+        fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            calls += 1;
+            if (calls == fail_at) return .{ .device_io_control = .{ .u = .{ .Status = status }, .Information = 0 } };
+            return std.testing.io.vtable.operate(userdata, operation);
+        }
+
+        fn close(userdata: ?*anyopaque, sockets: []const std.Io.net.Socket) void {
+            closes += sockets.len;
+            std.testing.io.vtable.netClose(userdata, sockets);
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = Harness.operate;
+    vtable.netClose = Harness.close;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    for ([_]std.os.windows.NTSTATUS{ .NO_MEMORY, .INSUFFICIENT_RESOURCES }) |status| {
+        for (1..3) |fail_at| {
+            Harness.calls = 0;
+            Harness.closes = 0;
+            Harness.fail_at = fail_at;
+            Harness.status = status;
+            try std.testing.expectError(error.SystemResources, Socket.bindWithBuffers(io, address, 64, .{ .receive_bytes = 64 * 1024, .send_bytes = 64 * 1024 }));
+            try std.testing.expectEqual(fail_at, Harness.calls);
+            try std.testing.expectEqual(@as(usize, 1), Harness.closes);
+        }
+    }
 }
 
 test "Windows UDP receive buffer accepts a burst above the default capacity" {
