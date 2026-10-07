@@ -261,7 +261,7 @@ def main():
     parser.add_argument("--ack-ms", type=int, default=0)
     parser.add_argument("--receive-batch", type=int, default=32)
     parser.add_argument("--send-batch", type=int, help="candidate server only: 1..256, default 64")
-    parser.add_argument("--receive-buffer", type=int, help="Linux socket receive bytes; actual kernel capacity is logged")
+    parser.add_argument("--receive-buffer", type=int, help="Linux/Windows socket receive bytes; kernel capacity is logged where available")
     parser.add_argument("--server-cpus", default="")
     parser.add_argument("--client-cpus", default="")
     parser.add_argument("--go-cpus", type=int, default=4)

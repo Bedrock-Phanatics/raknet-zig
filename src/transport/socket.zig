@@ -10,7 +10,7 @@ pub const BufferOptions = struct {
         const maximum = 256 * 1024 * 1024;
         if (self.receive_bytes) |value| if (value == 0 or value > maximum) return error.InvalidConfiguration;
         if (self.send_bytes) |value| if (value == 0 or value > maximum) return error.InvalidConfiguration;
-        if (builtin.os.tag != .linux and (self.receive_bytes != null or self.send_bytes != null)) return error.SocketBufferConfigurationUnsupported;
+        if (builtin.os.tag != .linux and builtin.os.tag != .windows and (self.receive_bytes != null or self.send_bytes != null)) return error.SocketBufferConfigurationUnsupported;
     }
 };
 
@@ -91,7 +91,7 @@ pub const Socket = struct {
         var value = if (builtin.os.tag == .linux and reuse_port) try bindReusePort(address) else try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
         errdefer value.close(io);
         try ignoreConnectionResets(value.handle);
-        return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(value.handle, buffers) };
+        return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(io, value.handle, buffers) };
     }
     pub fn close(self: *Socket) void {
         self.value.close(self.io);
@@ -472,7 +472,11 @@ const winsock = struct {
     extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
 };
 
-fn configureBuffers(handle: std.Io.net.Socket.Handle, options: BufferOptions) !BufferSizes {
+fn configureBuffers(io: std.Io, handle: std.Io.net.Socket.Handle, options: BufferOptions) !BufferSizes {
+    if (builtin.os.tag == .windows) {
+        if (options.receive_bytes) |value| try setWindowsBuffer(io, handle, .RECEIVE_WINDOW_SIZE, value);
+        if (options.send_bytes) |value| try setWindowsBuffer(io, handle, .SEND_WINDOW_SIZE, value);
+    }
     if (builtin.os.tag != .linux) return .{ .receive_bytes = null, .send_bytes = null };
     if (options.receive_bytes) |value| try setLinuxBuffer(handle, std.os.linux.SO.RCVBUF, value);
     if (options.send_bytes) |value| try setLinuxBuffer(handle, std.os.linux.SO.SNDBUF, value);
@@ -480,6 +484,22 @@ fn configureBuffers(handle: std.Io.net.Socket.Handle, options: BufferOptions) !B
         .receive_bytes = try getLinuxBuffer(handle, std.os.linux.SO.RCVBUF),
         .send_bytes = try getLinuxBuffer(handle, std.os.linux.SO.SNDBUF),
     };
+}
+
+fn setWindowsBuffer(io: std.Io, handle: std.Io.net.Socket.Handle, option: std.os.windows.AFD.INFORMATION.TYPE, value: u32) !void {
+    const windows = std.os.windows;
+    var info: windows.AFD.INFORMATION = .{ .InformationType = option, .Information = .{ .LargeInteger = value } };
+    const result = try io.operate(.{
+        .device_io_control = .{
+            // Buffer controls complete synchronously.
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = false } },
+            .code = windows.IOCTL.AFD.SET_INFORMATION,
+            .in = std.mem.asBytes(&info),
+            .out = &.{},
+        },
+    });
+    const status = result.device_io_control.u.Status;
+    if (status != .SUCCESS) return windows.unexpectedStatus(status);
 }
 
 fn setLinuxBuffer(handle: std.Io.net.Socket.Handle, option: u32, value: u32) !void {
@@ -645,10 +665,34 @@ test "socket buffer options are bounded" {
     try std.testing.expectError(error.InvalidConfiguration, BufferOptions.validate(.{ .send_bytes = 256 * 1024 * 1024 + 1 }));
 }
 
+test "Windows UDP receive buffer accepts a burst above the default capacity" {
+    if (builtin.os.tag != .windows) return;
+    const io = std.testing.io;
+    for ([_][]const u8{ "127.0.0.1:0", "[::1]:0" }) |literal| {
+        const address = try std.Io.net.IpAddress.parseLiteral(literal);
+        var receiver = try Socket.bindWithBuffers(io, address, 1492, .{ .receive_bytes = 128 * 1024 });
+        defer receiver.close();
+        var sender = try Socket.bind(io, address, 1492);
+        defer sender.close();
+        var payload: [1492]u8 = @splat(0);
+        for (0..80) |index| {
+            std.mem.writeInt(u32, payload[0..4], @intCast(index), .little);
+            try sender.send(receiver.value.address, &payload);
+        }
+        var storage: [1492]u8 = undefined;
+        for (0..80) |index| {
+            const message = try receiver.receive(&storage, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+            try std.testing.expectEqual(payload.len, message.data.len);
+            try std.testing.expectEqual(@as(u32, @intCast(index)), std.mem.readInt(u32, message.data[0..4], .little));
+        }
+        try std.testing.expectEqual(@as(u64, 0), sender.traffic.send_drops);
+    }
+}
+
 test "socket reports kernel buffer sizes where supported" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
-    if (builtin.os.tag != .linux) {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) {
         try std.testing.expectError(error.SocketBufferConfigurationUnsupported, Socket.bindWithBuffers(io, address, 64, .{ .receive_bytes = 64 * 1024 }));
         return;
     }
@@ -657,6 +701,9 @@ test "socket reports kernel buffer sizes where supported" {
     if (builtin.os.tag == .linux) {
         try std.testing.expect(socket.kernelBufferSizes().receive_bytes.? >= 64 * 1024);
         try std.testing.expect(socket.kernelBufferSizes().send_bytes.? >= 64 * 1024);
+    } else {
+        try std.testing.expectEqual(@as(?u32, null), socket.kernelBufferSizes().receive_bytes);
+        try std.testing.expectEqual(@as(?u32, null), socket.kernelBufferSizes().send_bytes);
     }
 }
 
