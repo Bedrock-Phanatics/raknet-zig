@@ -47,6 +47,7 @@ pub const Packetization = struct {
 pub const Transmitter = struct {
     config: Config,
     mtu: u16,
+    ip_udp_overhead: u16 = 28,
     datagram_sequence: u32 = 0,
     reliable_index: u32 = 0,
     sequence_indices: [256]u32 = @splat(0),
@@ -54,9 +55,16 @@ pub const Transmitter = struct {
     split_id: u16 = 0,
 
     pub fn init(mtu: u16, config: Config) !Transmitter {
+        return initWithOverhead(mtu, config, 28);
+    }
+    pub fn initWithOverhead(mtu: u16, config: Config, ip_udp_overhead: u16) !Transmitter {
         try config.validate();
         if (mtu < config.protocol.minimum_mtu or mtu > config.protocol.maximum_mtu) return error.InvalidMtu;
-        return .{ .config = config, .mtu = mtu };
+        if (ip_udp_overhead != 28 and ip_udp_overhead != 48) return error.InvalidMtu;
+        return .{ .config = config, .mtu = mtu, .ip_udp_overhead = ip_udp_overhead };
+    }
+    pub fn datagramMtu(self: *const Transmitter) u16 {
+        return self.mtu - self.ip_udp_overhead;
     }
 
     pub fn send(self: *Transmitter, payload: []const u8, reliability: frame.Reliability, channel: u8, scratch: []u8, context: *anyopaque, emit: EmitFn) !Sent {
@@ -89,7 +97,7 @@ pub const Transmitter = struct {
         emit: EmitFn,
     ) !Sent {
         if (payload.len != packetization.payload_len or packetization.offset > payload.len) return error.InvalidPacketizationState;
-        if (scratch.len < self.mtu) return error.NoSpaceLeft;
+        if (scratch.len < self.datagramMtu()) return error.NoSpaceLeft;
         const had_progress = packetization.offset != 0;
         var sent: Sent = .{ .datagrams = 0, .wire_bytes = 0 };
         while (!packetization.complete() and sent.datagrams < maximum_datagrams) {
@@ -111,7 +119,7 @@ pub const Transmitter = struct {
             const wire_size = try std.math.add(usize, 4, try frame.encodedSize(value));
             if (wire_size > maximum_wire_bytes -| sent.wire_bytes) break;
             const sequence = self.datagram_sequence;
-            const wire = try datagram.encodeData(sequence, &.{value}, scratch[0..self.mtu]);
+            const wire = try datagram.encodeData(sequence, &.{value}, scratch[0..self.datagramMtu()]);
             emit(context, sequence, packetization.reliability.hasReliableIndex(), wire) catch |err| {
                 if (had_progress or sent.datagrams != 0) return error.PartialSendFailure;
                 return err;
@@ -128,14 +136,14 @@ pub const Transmitter = struct {
 
     pub fn pack(self: *Transmitter, source: anytype, scratch: []u8, maximum_wire_bytes: usize, context: *anyopaque, emit: EmitFn) !PackResult {
         if (maximum_wire_bytes < 4) return .{};
-        if (scratch.len < self.mtu) return error.NoSpaceLeft;
+        if (scratch.len < self.datagramMtu()) return error.NoSpaceLeft;
         var messages = source;
         const first = messages.next() orelse return .{};
         try self.validateMessage(first);
-        const first_capacity = try payloadCapacity(self.mtu, first.reliability, false);
+        const first_capacity = try self.messageCapacity(first.reliability, false);
         if (first.payload.len > first_capacity) return .{};
 
-        const limit = @min(@as(usize, self.mtu), maximum_wire_bytes);
+        const limit = @min(@as(usize, self.datagramMtu()), maximum_wire_bytes);
         var writer: cursor.Writer = .{ .data = scratch[0..limit] };
         try writer.byte(0x84);
         try writer.u24le(self.datagram_sequence);
@@ -164,6 +172,7 @@ pub const Transmitter = struct {
             if (message.reliability.hasOrderIndex()) next_order = uint24.add(next_order, 1);
             if (message.reliability.hasSequenceIndex()) next_sequence = uint24.add(next_sequence, 1);
             count += 1;
+            if (count == self.config.batching.maximum_packets_per_iteration) break;
         }
         if (count == 0) return .{};
 
@@ -180,9 +189,10 @@ pub const Transmitter = struct {
         var messages = source;
         const first = messages.next() orelse return false;
         try self.validateMessage(first);
-        const capacity = try payloadCapacity(self.mtu, first.reliability, false);
+        const capacity = try self.messageCapacity(first.reliability, false);
         if (first.payload.len > capacity) return true;
-        var remaining = @as(usize, self.mtu) - 4;
+        var remaining = @as(usize, self.datagramMtu()) - 4;
+        var count: usize = 0;
 
         var pending: ?PackedMessage = first;
         while (pending) |message| : (pending = messages.next()) {
@@ -200,7 +210,8 @@ pub const Transmitter = struct {
             const encoded_size = try frame.encodedSize(value);
             if (encoded_size > remaining) return true;
             remaining -= encoded_size;
-            if (remaining == 0) return true;
+            count += 1;
+            if (remaining == 0 or count == self.config.batching.maximum_packets_per_iteration) return true;
         }
         return false;
     }
@@ -211,7 +222,7 @@ pub const Transmitter = struct {
 
     pub fn estimateWireBytes(self: *const Transmitter, payload_len: usize, reliability: frame.Reliability, channel: u8) !usize {
         const packet_layout = try self.layout(payload_len, reliability, channel);
-        const overhead = @as(usize, self.mtu) - packet_layout.capacity;
+        const overhead = @as(usize, self.datagramMtu()) - try payloadCapacity(self.datagramMtu(), reliability, packet_layout.split);
         return try std.math.add(usize, payload_len, try std.math.mul(usize, packet_layout.fragment_count, overhead));
     }
 
@@ -225,13 +236,17 @@ pub const Transmitter = struct {
         if (payload_len > self.config.protocol.maximum_split_bytes) return error.MessageTooLarge;
         if (channel >= self.config.protocol.maximum_order_channels and reliability.hasOrderIndex()) return error.InvalidOrderChannel;
 
-        const unsplit_capacity = try payloadCapacity(self.mtu, reliability, false);
+        const unsplit_capacity = try self.messageCapacity(reliability, false);
         const split = payload_len > unsplit_capacity;
         if (split and !reliability.hasReliableIndex()) return error.UnreliableMessageTooLarge;
-        const capacity = if (split) try payloadCapacity(self.mtu, reliability, true) else unsplit_capacity;
-        const count = (payload_len + capacity - 1) / capacity;
+        const capacity = if (split) try self.messageCapacity(reliability, true) else unsplit_capacity;
+        const count = 1 + (payload_len - 1) / capacity;
         if (count > self.config.protocol.maximum_split_parts or count > std.math.maxInt(u32)) return error.MessageTooLarge;
         return .{ .capacity = capacity, .fragment_count = count, .split = split };
+    }
+
+    fn messageCapacity(self: *const Transmitter, reliability: frame.Reliability, split: bool) !usize {
+        return @min(try payloadCapacity(self.datagramMtu(), reliability, split), @min(8191, self.config.protocol.maximum_frame_payload));
     }
 
     fn reserveReliable(self: *Transmitter) u32 {
@@ -273,7 +288,92 @@ fn payloadCapacity(mtu: u16, reliability: frame.Reliability, split: bool) !usize
     };
     const overhead = 4 + (try frame.encodedSize(probe)) - 1;
     if (mtu <= overhead) return error.InvalidMtu;
-    return @min(@as(usize, mtu) - overhead, 8191);
+    return @as(usize, mtu) - overhead;
+}
+
+test "IP headers frame limits and wire estimates hold across MTU boundaries" {
+    const Collector = struct {
+        maximum_wire: usize,
+        maximum_payload: usize,
+        received: [8192]u8 = undefined,
+        length: usize = 0,
+        fn emit(raw: *anyopaque, _: u32, _: bool, wire: []const u8) EmitError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (wire.len > self.maximum_wire) return error.TransportFailure;
+            var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
+            const value = frame.decodeOne(&decoded.frames, self.maximum_payload, 8192) catch return error.TransportFailure;
+            if (value.payload.len > self.received.len - self.length) return error.TransportFailure;
+            @memcpy(self.received[self.length..][0..value.payload.len], value.payload);
+            self.length += value.payload.len;
+        }
+    };
+    for ([_]u16{ 576, 1200, 1492, 9000, 65_507 }) |mtu| {
+        for ([_]u16{ 28, 48 }) |overhead| {
+            for ([_]usize{ 127, 8192 }) |frame_limit| {
+                var config: Config = .{};
+                config.protocol.maximum_mtu = mtu;
+                config.protocol.maximum_datagram_size = @max(2048, mtu);
+                config.protocol.maximum_frame_payload = frame_limit;
+                var transmitter = try Transmitter.initWithOverhead(mtu, config, overhead);
+                var scratch: [65_507]u8 = undefined;
+                const payload: [8192]u8 = @splat(0xfe);
+                var collector: Collector = .{ .maximum_wire = mtu - overhead, .maximum_payload = @min(8191, frame_limit) };
+                const estimated = try transmitter.estimateWireBytes(payload.len, .reliable_ordered, 0);
+                const sent = try transmitter.send(&payload, .reliable_ordered, 0, scratch[0 .. mtu - overhead], &collector, Collector.emit);
+                try std.testing.expectEqual(estimated, sent.wire_bytes);
+                try std.testing.expectEqualSlices(u8, &payload, &collector.received);
+                try std.testing.expectEqual(payload.len, collector.length);
+            }
+        }
+    }
+    var config: Config = .{};
+    config.protocol.maximum_split_bytes = std.math.maxInt(usize);
+    config.session.maximum_split_bytes_per_connection = std.math.maxInt(usize);
+    const transmitter = try Transmitter.init(576, config);
+    try std.testing.expectError(error.MessageTooLarge, transmitter.fragmentCount(std.math.maxInt(usize), .reliable, 0));
+    try std.testing.expectError(error.InvalidMtu, Transmitter.initWithOverhead(576, .{}, 0));
+}
+
+test "packed datagrams obey the receiver frame work limit" {
+    const Iterator = struct {
+        messages: []const PackedMessage,
+        fn next(self: *@This()) ?PackedMessage {
+            if (self.messages.len == 0) return null;
+            defer self.messages = self.messages[1..];
+            return self.messages[0];
+        }
+    };
+    const Collector = struct {
+        wire: [1492]u8 = undefined,
+        length: usize = 0,
+        delivered: usize = 0,
+        fn emit(raw: *anyopaque, _: u32, _: bool, wire: []const u8) EmitError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(self.wire[0..wire.len], wire);
+            self.length = wire.len;
+        }
+        fn deliver(raw: *anyopaque, payload: @import("receiver.zig").BorrowedPayload) @import("receiver.zig").DeliveryError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!std.mem.eql(u8, payload.bytes, "x")) return error.ApplicationFailure;
+            self.delivered += 1;
+        }
+    };
+    var config: Config = .{};
+    config.batching.maximum_packets_per_iteration = 2;
+    var transmitter = try Transmitter.init(1492, config);
+    var receiver = try @import("receiver.zig").Receiver.init(std.testing.allocator, config);
+    defer receiver.deinit();
+    const messages: [3]PackedMessage = @splat(.{ .payload = "x", .reliability = .reliable_ordered, .channel = 0 });
+    var scratch: [1492]u8 = undefined;
+    var collector: Collector = .{};
+    try std.testing.expect(try transmitter.packReady(Iterator{ .messages = &messages }));
+    const first = try transmitter.pack(Iterator{ .messages = &messages }, &scratch, scratch.len, &collector, Collector.emit);
+    _ = try receiver.process(collector.wire[0..collector.length], 0, &collector, Collector.deliver);
+    try std.testing.expectEqual(@as(usize, 2), first.messages);
+    const second = try transmitter.pack(Iterator{ .messages = messages[first.messages..] }, &scratch, scratch.len, &collector, Collector.emit);
+    _ = try receiver.process(collector.wire[0..collector.length], 1, &collector, Collector.deliver);
+    try std.testing.expectEqual(@as(usize, 1), second.messages);
+    try std.testing.expectEqual(@as(usize, 3), collector.delivered);
 }
 
 test "transmitter packetizes a split message within MTU" {
@@ -314,13 +414,13 @@ test "packetization resumes at datagram boundaries within a wire budget" {
     var collector: Collector = .{};
     var packetization = try transmitter.beginPacketization(payload.len, .reliable_ordered, 0);
 
-    const blocked = try transmitter.sendAvailable(&packetization, &payload, &scratch, 575, 1, &collector, Collector.emit);
+    const blocked = try transmitter.sendAvailable(&packetization, &payload, &scratch, 547, 1, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 0), blocked.datagrams);
     try std.testing.expectEqual(@as(usize, 0), packetization.offset);
 
-    const first = try transmitter.sendAvailable(&packetization, &payload, &scratch, 576, 1, &collector, Collector.emit);
+    const first = try transmitter.sendAvailable(&packetization, &payload, &scratch, 548, 1, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 1), first.datagrams);
-    try std.testing.expectEqual(@as(usize, 576), first.wire_bytes);
+    try std.testing.expectEqual(@as(usize, 548), first.wire_bytes);
     try std.testing.expect(!packetization.complete());
 
     const rest = try transmitter.sendAvailable(&packetization, &payload, &scratch, std.math.maxInt(usize), std.math.maxInt(usize), &collector, Collector.emit);
@@ -343,7 +443,7 @@ test "packer fills one datagram with exact frame accounting" {
         frames: usize = 0,
         fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (!reliable or sequence != 0 or wire.len != 576) return error.TransportFailure;
+            if (!reliable or sequence != 0 or wire.len != 548) return error.TransportFailure;
             var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
             while (decoded.frames.remaining() != 0) {
                 const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
@@ -355,8 +455,8 @@ test "packer fills one datagram with exact frame accounting" {
     };
     var transmitter = try Transmitter.init(576, .{});
     var scratch: [576]u8 = undefined;
-    var first: [276]u8 = @splat(1);
-    var second: [276]u8 = @splat(2);
+    var first: [262]u8 = @splat(1);
+    var second: [262]u8 = @splat(2);
     const messages = [_]PackedMessage{
         .{ .payload = &first, .reliability = .reliable_ordered, .channel = 3 },
         .{ .payload = &second, .reliability = .reliable_ordered, .channel = 3 },
@@ -366,7 +466,7 @@ test "packer fills one datagram with exact frame accounting" {
     const result = try transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, scratch.len, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 2), result.messages);
     try std.testing.expectEqual(@as(usize, 1), result.sent.datagrams);
-    try std.testing.expectEqual(@as(usize, 576), result.sent.wire_bytes);
+    try std.testing.expectEqual(@as(usize, 548), result.sent.wire_bytes);
     try std.testing.expectEqual(@as(usize, 2), collector.frames);
     try std.testing.expectEqual(@as(u32, 2), transmitter.reliable_index);
     try std.testing.expectEqual(@as(u32, 2), transmitter.order_indices[3]);
@@ -441,7 +541,7 @@ test "packer honors MTU boundaries for every reliability mode" {
         calls: usize = 0,
         fn emit(raw: *anyopaque, sequence: u32, reliable: bool, wire: []const u8) EmitError!void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (sequence != 0 or reliable != self.expected.hasReliableIndex() or wire.len != 576) return error.TransportFailure;
+            if (sequence != 0 or reliable != self.expected.hasReliableIndex() or wire.len != 548) return error.TransportFailure;
             var decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
             const value = frame.decodeOne(&decoded.frames, 8192, 2048) catch return error.TransportFailure;
             if (decoded.frames.remaining() != 0 or value.reliability != self.expected) return error.TransportFailure;
@@ -460,7 +560,7 @@ test "packer honors MTU boundaries for every reliability mode" {
             try std.testing.expectError(error.UnsupportedReliability, unsupported_transmitter.packReady(MessageIterator{ .messages = &unsupported }));
             continue;
         }
-        const capacity = try payloadCapacity(576, reliability, false);
+        const capacity = try payloadCapacity(548, reliability, false);
         var payload: [576]u8 = @splat(0xa5);
         const messages = [_]PackedMessage{.{ .payload = payload[0..capacity], .reliability = reliability, .channel = 5 }};
         var transmitter = try Transmitter.init(576, .{});
@@ -468,13 +568,13 @@ test "packer honors MTU boundaries for every reliability mode" {
         var collector: Collector = .{ .expected = reliability };
 
         try std.testing.expect(try transmitter.packReady(MessageIterator{ .messages = &messages }));
-        const short = try transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, 575, &collector, Collector.emit);
+        const short = try transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, 547, &collector, Collector.emit);
         try std.testing.expectEqual(@as(usize, 0), short.messages);
         try std.testing.expectEqual(@as(usize, 0), collector.calls);
 
-        const exact = try transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, 576, &collector, Collector.emit);
+        const exact = try transmitter.pack(MessageIterator{ .messages = &messages }, &scratch, 548, &collector, Collector.emit);
         try std.testing.expectEqual(@as(usize, 1), exact.messages);
-        try std.testing.expectEqual(@as(usize, 576), exact.sent.wire_bytes);
+        try std.testing.expectEqual(@as(usize, 548), exact.sent.wire_bytes);
         try std.testing.expectEqual(@as(usize, 1), collector.calls);
         try std.testing.expectEqual(@as(u32, @intFromBool(reliability.hasReliableIndex())), transmitter.reliable_index);
         try std.testing.expectEqual(@as(u32, @intFromBool(reliability.hasOrderIndex())), transmitter.order_indices[5]);
@@ -511,7 +611,7 @@ test "packing readiness detects full and incompatible prefixes" {
     };
     try std.testing.expect(!try transmitter.packReady(MessageIterator{ .messages = &small }));
 
-    var exact_payload: [562]u8 = @splat(1);
+    var exact_payload: [534]u8 = @splat(1);
     const exact = [_]PackedMessage{.{ .payload = &exact_payload, .reliability = .reliable_ordered, .channel = 0 }};
     try std.testing.expect(try transmitter.packReady(MessageIterator{ .messages = &exact }));
 

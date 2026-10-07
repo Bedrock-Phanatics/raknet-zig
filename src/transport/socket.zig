@@ -10,7 +10,7 @@ pub const BufferOptions = struct {
         const maximum = 256 * 1024 * 1024;
         if (self.receive_bytes) |value| if (value == 0 or value > maximum) return error.InvalidConfiguration;
         if (self.send_bytes) |value| if (value == 0 or value > maximum) return error.InvalidConfiguration;
-        if (builtin.os.tag != .linux and (self.receive_bytes != null or self.send_bytes != null)) return error.SocketBufferConfigurationUnsupported;
+        if (builtin.os.tag != .linux and builtin.os.tag != .windows and (self.receive_bytes != null or self.send_bytes != null)) return error.SocketBufferConfigurationUnsupported;
     }
 };
 
@@ -91,7 +91,7 @@ pub const Socket = struct {
         var value = if (builtin.os.tag == .linux and reuse_port) try bindReusePort(address) else try address.bind(io, .{ .mode = .dgram, .protocol = .udp });
         errdefer value.close(io);
         try ignoreConnectionResets(value.handle);
-        return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(value.handle, buffers) };
+        return .{ .io = io, .value = value, .maximum_datagram_size = maximum_datagram_size, .buffer_sizes = try configureBuffers(io, value.handle, buffers) };
     }
     pub fn close(self: *Socket) void {
         self.value.close(self.io);
@@ -208,14 +208,14 @@ pub const Socket = struct {
         const failure, _ = self.value.receiveManyTimeout(self.io, &message, &byte, .{ .peek = true }, timeout);
         const err = failure orelse return;
         switch (err) {
-            // Windows fails a peek into a short buffer instead of truncating
+            // Windows rejects short peek buffers without truncating.
             error.MessageOversize => {},
             error.ConcurrencyUnavailable => if (builtin.os.tag == .windows) return self.pollAfd(timeout) else return err,
             else => return err,
         }
     }
 
-    // Threaded cannot wait on Windows datagram sockets.
+    // Threaded cannot wait on Windows UDP sockets.
     fn pollAfd(self: *const Socket, timeout: std.Io.Timeout) !void {
         const windows = std.os.windows;
         const PollHandle = extern struct { handle: windows.HANDLE, events: windows.ULONG, status: windows.NTSTATUS };
@@ -239,7 +239,7 @@ pub const Socket = struct {
         if (status != .SUCCESS) return windows.unexpectedStatus(status);
     }
 
-    // Windows reports ICMP unreachable from an earlier send on a later receive
+    // Windows delivers old ICMP errors on later receives.
     fn skipReset(self: *Socket, err: anyerror) bool {
         if (builtin.os.tag != .windows or (err != error.PortUnreachable and err != error.ConnectionResetByPeer)) return false;
         self.traffic.connection_resets += 1;
@@ -271,7 +271,7 @@ pub const Socket = struct {
         // Custom providers may use virtual handles.
         if (builtin.os.tag == .linux and messages.len > 1 and self.io.vtable == std.Io.Threaded.global_single_threaded.io().vtable) {
             if (try self.receiveManyLinux(messages, data_storage)) |batch| return batch;
-            // Threaded floors sub-ms waits to zero and spins, this wait is uncancelable but under 1 ms
+            // Avoid sub-ms busy waits; this uncancelable poll lasts under 1 ms.
             if (remainingNanoseconds(self.io, timeout)) |remaining| if (remaining < std.time.ns_per_ms) {
                 if (remaining == 0 or !try self.pollLinux(remaining)) return error.Timeout;
                 return try self.receiveManyLinux(messages, data_storage) orelse error.Timeout;
@@ -427,7 +427,7 @@ fn bindReusePort(address: std.Io.net.IpAddress) !std.Io.net.Socket {
     return .{ .handle = fd, .address = bound };
 }
 
-// Negative means relative, in 100ns units
+// AFD uses negative 100 ns ticks for relative timeouts.
 fn afdTimeout(io: std.Io, timeout: std.Io.Timeout) i64 {
     const remaining = remainingNanoseconds(io, timeout) orelse return std.math.maxInt(i64);
     return -@as(i64, @intCast(@min(std.math.divCeil(u64, remaining, 100) catch unreachable, std.math.maxInt(i64))));
@@ -442,7 +442,7 @@ fn remainingNanoseconds(io: std.Io, timeout: std.Io.Timeout) ?u64 {
     return @intCast(std.math.clamp(remaining, 0, std.math.maxInt(u64)));
 }
 
-// std.Io's AFD handles reject this, skipReset covers them
+// AFD handles reject this; skipReset() handles their ICMP errors.
 fn ignoreConnectionResets(handle: std.Io.net.Socket.Handle) !void {
     if (builtin.os.tag != .windows) return;
     const sio_udp_connreset: u32 = 0x9800000C;
@@ -472,7 +472,11 @@ const winsock = struct {
     extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
 };
 
-fn configureBuffers(handle: std.Io.net.Socket.Handle, options: BufferOptions) !BufferSizes {
+fn configureBuffers(io: std.Io, handle: std.Io.net.Socket.Handle, options: BufferOptions) !BufferSizes {
+    if (builtin.os.tag == .windows) {
+        if (options.receive_bytes) |value| try setWindowsBuffer(io, handle, .RECEIVE_WINDOW_SIZE, value);
+        if (options.send_bytes) |value| try setWindowsBuffer(io, handle, .SEND_WINDOW_SIZE, value);
+    }
     if (builtin.os.tag != .linux) return .{ .receive_bytes = null, .send_bytes = null };
     if (options.receive_bytes) |value| try setLinuxBuffer(handle, std.os.linux.SO.RCVBUF, value);
     if (options.send_bytes) |value| try setLinuxBuffer(handle, std.os.linux.SO.SNDBUF, value);
@@ -480,6 +484,26 @@ fn configureBuffers(handle: std.Io.net.Socket.Handle, options: BufferOptions) !B
         .receive_bytes = try getLinuxBuffer(handle, std.os.linux.SO.RCVBUF),
         .send_bytes = try getLinuxBuffer(handle, std.os.linux.SO.SNDBUF),
     };
+}
+
+fn setWindowsBuffer(io: std.Io, handle: std.Io.net.Socket.Handle, option: std.os.windows.AFD.INFORMATION.TYPE, value: u32) !void {
+    const windows = std.os.windows;
+    var info: windows.AFD.INFORMATION = .{ .InformationType = option, .Information = .{ .LargeInteger = value } };
+    const result = try io.operate(.{
+        .device_io_control = .{
+            // Buffer controls complete synchronously.
+            .file = .{ .handle = handle, .flags = .{ .nonblocking = false } },
+            .code = windows.IOCTL.AFD.SET_INFORMATION,
+            .in = std.mem.asBytes(&info),
+            .out = &.{},
+        },
+    });
+    const status = result.device_io_control.u.Status;
+    switch (status) {
+        .SUCCESS => {},
+        .NO_MEMORY, .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        else => return windows.unexpectedStatus(status),
+    }
 }
 
 fn setLinuxBuffer(handle: std.Io.net.Socket.Handle, option: u32, value: u32) !void {
@@ -645,10 +669,71 @@ test "socket buffer options are bounded" {
     try std.testing.expectError(error.InvalidConfiguration, BufferOptions.validate(.{ .send_bytes = 256 * 1024 * 1024 + 1 }));
 }
 
+test "Windows buffer configuration reports resource failure and closes its socket" {
+    if (builtin.os.tag != .windows) return;
+    const Harness = struct {
+        var calls: usize = 0;
+        var closes: usize = 0;
+        var fail_at: usize = 1;
+        var status: std.os.windows.NTSTATUS = .INSUFFICIENT_RESOURCES;
+
+        fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            calls += 1;
+            if (calls == fail_at) return .{ .device_io_control = .{ .u = .{ .Status = status }, .Information = 0 } };
+            return std.testing.io.vtable.operate(userdata, operation);
+        }
+
+        fn close(userdata: ?*anyopaque, sockets: []const std.Io.net.Socket) void {
+            closes += sockets.len;
+            std.testing.io.vtable.netClose(userdata, sockets);
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.operate = Harness.operate;
+    vtable.netClose = Harness.close;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
+    for ([_]std.os.windows.NTSTATUS{ .NO_MEMORY, .INSUFFICIENT_RESOURCES }) |status| {
+        for (1..3) |fail_at| {
+            Harness.calls = 0;
+            Harness.closes = 0;
+            Harness.fail_at = fail_at;
+            Harness.status = status;
+            try std.testing.expectError(error.SystemResources, Socket.bindWithBuffers(io, address, 64, .{ .receive_bytes = 64 * 1024, .send_bytes = 64 * 1024 }));
+            try std.testing.expectEqual(fail_at, Harness.calls);
+            try std.testing.expectEqual(@as(usize, 1), Harness.closes);
+        }
+    }
+}
+
+test "Windows UDP receive buffer accepts a burst above the default capacity" {
+    if (builtin.os.tag != .windows) return;
+    const io = std.testing.io;
+    for ([_][]const u8{ "127.0.0.1:0", "[::1]:0" }) |literal| {
+        const address = try std.Io.net.IpAddress.parseLiteral(literal);
+        var receiver = try Socket.bindWithBuffers(io, address, 1492, .{ .receive_bytes = 128 * 1024 });
+        defer receiver.close();
+        var sender = try Socket.bind(io, address, 1492);
+        defer sender.close();
+        var payload: [1492]u8 = @splat(0);
+        for (0..80) |index| {
+            std.mem.writeInt(u32, payload[0..4], @intCast(index), .little);
+            try sender.send(receiver.value.address, &payload);
+        }
+        var storage: [1492]u8 = undefined;
+        for (0..80) |index| {
+            const message = try receiver.receive(&storage, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+            try std.testing.expectEqual(payload.len, message.data.len);
+            try std.testing.expectEqual(@as(u32, @intCast(index)), std.mem.readInt(u32, message.data[0..4], .little));
+        }
+        try std.testing.expectEqual(@as(u64, 0), sender.traffic.send_drops);
+    }
+}
+
 test "socket reports kernel buffer sizes where supported" {
     const io = std.testing.io;
     const address = try std.Io.net.IpAddress.parseLiteral("127.0.0.1:0");
-    if (builtin.os.tag != .linux) {
+    if (builtin.os.tag != .linux and builtin.os.tag != .windows) {
         try std.testing.expectError(error.SocketBufferConfigurationUnsupported, Socket.bindWithBuffers(io, address, 64, .{ .receive_bytes = 64 * 1024 }));
         return;
     }
@@ -657,6 +742,9 @@ test "socket reports kernel buffer sizes where supported" {
     if (builtin.os.tag == .linux) {
         try std.testing.expect(socket.kernelBufferSizes().receive_bytes.? >= 64 * 1024);
         try std.testing.expect(socket.kernelBufferSizes().send_bytes.? >= 64 * 1024);
+    } else {
+        try std.testing.expectEqual(@as(?u32, null), socket.kernelBufferSizes().receive_bytes);
+        try std.testing.expectEqual(@as(?u32, null), socket.kernelBufferSizes().send_bytes);
     }
 }
 

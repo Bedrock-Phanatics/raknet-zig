@@ -24,6 +24,8 @@ pub const Options = struct {
     handshake_timeout_ms: u32 = 5_000,
     handshake_retry_ms: u32 = 500,
     handshake_transient_errors: u16 = 10,
+    /// Null uses one quarter of the idle timeout.
+    keepalive_interval_ms: ?u32 = null,
     receive_batch_size: usize = 32,
     socket_buffers: backend.BufferOptions = .{},
 };
@@ -45,6 +47,8 @@ pub const Client = struct {
     server_guid: u64,
     mtu: u16,
     last_seen_ms: u64,
+    keepalive_interval_ms: u32,
+    last_keepalive_ms: u64 = 0,
     outbound_deadline_ms: ?u64 = null,
     ack_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
@@ -65,6 +69,7 @@ pub const Client = struct {
 
         fn deliver(raw: *anyopaque, payload: receiver.BorrowedPayload) receiver.DeliveryError!void {
             const self: *PollBridge = @ptrCast(@alignCast(raw));
+            if (self.remote_disconnect or self.client.closed) return;
             const packet = connected.decode(payload.bytes) catch return error.PeerProtocolFailure;
             switch (packet) {
                 .connected_ping => |sent| {
@@ -112,6 +117,8 @@ pub const Client = struct {
 
     pub fn connect(allocator: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress, options: Options) !*Client {
         try validateOptions(options);
+        const probe_overhead = net_address.ipUdpOverhead(server) - 28;
+        if (options.mtu < options.config.protocol.minimum_mtu + probe_overhead) return error.InvalidMtu;
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
         const local: std.Io.net.IpAddress = switch (server) {
@@ -131,10 +138,10 @@ pub const Client = struct {
         const deadline_ms = time.deadline(time.nowMilliseconds(io), options.handshake_timeout_ms);
 
         var ladder: [max_mtu_rungs]u16 = undefined;
-        ladder[0] = options.mtu;
+        ladder[0] = options.mtu - probe_overhead;
         var rungs: usize = 1;
-        for (options.mtu_fallbacks) |fallback| if (fallback < options.mtu) {
-            ladder[rungs] = fallback;
+        for (options.mtu_fallbacks) |fallback| if (fallback < options.mtu and fallback >= options.config.protocol.minimum_mtu + probe_overhead) {
+            ladder[rungs] = fallback - probe_overhead;
             rungs += 1;
         };
         var negotiator: client_handshake.Negotiator = .init(.{
@@ -158,9 +165,10 @@ pub const Client = struct {
         errdefer allocator.free(receive_storage);
 
         var transferred = false;
-        var core = try core_mod.Core.init(allocator, reply2.mtu, options.config);
+        const overhead = net_address.ipUdpOverhead(server);
+        var core = try core_mod.Core.initWithOverhead(allocator, reply2.mtu, options.config, overhead);
         errdefer if (transferred) self.core.deinit() else core.deinit();
-        var receipts = try receipt_batch.Batch.init(allocator, options.config.batching.maximum_ack_records, reply2.mtu, options.config.protocol.maximum_acknowledged_datagrams);
+        var receipts = try receipt_batch.Batch.init(allocator, options.config.batching.maximum_ack_records, reply2.mtu - overhead, options.config.protocol.maximum_acknowledged_datagrams);
         errdefer if (transferred) self.receipts.deinit() else receipts.deinit();
         self.* = .{
             .allocator = allocator,
@@ -178,6 +186,7 @@ pub const Client = struct {
             .server_guid = reply2.server_guid,
             .mtu = reply2.mtu,
             .last_seen_ms = time.nowMilliseconds(io),
+            .keepalive_interval_ms = keepaliveInterval(options),
         };
         transferred = true;
         try self.finishConnectedHandshake(&negotiator, deadline, options.handshake_retry_ms, options.config.batching.maximum_packets_per_iteration);
@@ -201,8 +210,7 @@ pub const Client = struct {
     pub fn traffic(self: *const Client) backend.Traffic {
         return self.socket.traffic;
     }
-    /// Starts graceful shutdown. Keep calling poll() or processTimers() until isClosed().
-    /// Use destroy() to close immediately.
+    /// Keep polling or processing timers until isClosed().
     pub fn close(self: *Client) void {
         if (self.closed or self.closing) return;
         self.closing = true;
@@ -224,11 +232,18 @@ pub const Client = struct {
             },
         }
     }
-    // Kept open until destroy() so a pending waitReadable never sees a closed handle
+    // Keep the socket alive for pending readiness waits.
     fn abort(self: *Client) void {
         self.closed = true;
+        self.core.failSendReceipts();
     }
-    /// Cancel or await any pending waitReadable first
+    pub fn closeNow(self: *Client) void {
+        self.abort();
+    }
+    pub fn pollSendReceipt(self: *Client) ?core_mod.SendReceipt {
+        return self.core.pollSendReceipt();
+    }
+    /// Cancel or await pending waitReadable() calls first.
     pub fn destroy(self: *Client) void {
         if (!self.closed and !self.core.disconnect_queued) {
             var payload = [_]u8{@backingInt(offline.Id.disconnect_notification)};
@@ -260,10 +275,19 @@ pub const Client = struct {
     }
 
     pub fn queueSend(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        return self.queueSendImpl(payload, reliability, channel, false);
+    }
+    pub fn queueSendWithReceipt(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8) !core_mod.SendHandle {
+        return self.queueSendImpl(payload, reliability, channel, true);
+    }
+    fn queueSendImpl(self: *Client, payload: []const u8, reliability: frame.Reliability, channel: u8, receipt: bool) !core_mod.SendHandle {
         if (self.closed or self.closing) return error.ConnectionClosed;
-        const handle = self.core.enqueueOutbound(.application, payload, reliability, channel) catch |err| {
+        const handle = (if (receipt) self.core.enqueueWithReceipt(payload, reliability, channel) else self.core.enqueueOutbound(.application, payload, reliability, channel)) catch |err| {
             self.abortOnError(.application_send, err);
             return err;
+        };
+        errdefer if (receipt) {
+            _ = self.core.send_receipts.remove(handle.id);
         };
         const now_ms = time.nowMilliseconds(self.io);
         self.outbound_deadline_ms = now_ms;
@@ -293,7 +317,13 @@ pub const Client = struct {
 
     pub fn nextDeadline(self: *const Client) ?u64 {
         if (self.closed) return null;
+        if (self.pending_message_index < self.pending_message_count or self.pending_receive_error != null) return 0;
+        return self.protocolDeadline();
+    }
+    fn protocolDeadline(self: *const Client) ?u64 {
         var deadline = time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms);
+        if (self.keepaliveDeadline()) |keepalive| deadline = @min(deadline, keepalive);
+        if (self.core.receiver_state.hasPendingDeliveries()) deadline = self.last_seen_ms;
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
         if (self.core.nextRetransmissionDeadline()) |retransmission| deadline = @min(deadline, retransmission);
@@ -302,23 +332,35 @@ pub const Client = struct {
         return deadline;
     }
 
+    fn keepaliveDeadline(self: *const Client) ?u64 {
+        if (self.closed or self.closing) return null;
+        return time.deadline(@max(self.last_seen_ms, self.last_keepalive_ms), self.keepalive_interval_ms);
+    }
+
     pub fn pollTimeout(self: *const Client, limit: std.Io.Timeout) std.Io.Timeout {
         const deadline = self.nextDeadline() orelse return limit;
         return time.earliest(self.io, limit, time.atMilliseconds(deadline));
     }
 
-    /// Safe to run beside the owner, pass pollTimeout() since timers aren't checked
+    /// May run beside the owner; pass pollTimeout() to honor timers.
     pub fn waitReadable(self: *const Client, timeout: std.Io.Timeout) !void {
         return self.socket.waitReadable(timeout);
     }
 
     pub fn processTimers(self: *Client, now_ms: u64) !void {
+        _ = try self.processTimersAt(now_ms, null);
+    }
+
+    /// Delivers buffered ordered messages within the timer work budget.
+    pub fn processTimersWithMessages(self: *Client, now_ms: u64, context: *anyopaque, on_message: MessageFn) !usize {
+        var bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = now_ms };
+        return self.processTimersAt(now_ms, &bridge);
+    }
+
+    fn processTimersAt(self: *Client, now_ms: u64, bridge: ?*PollBridge) !usize {
         if (self.closed) return error.ConnectionClosed;
-        if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms))) {
-            self.abort();
-            return error.ConnectionTimedOut;
-        }
-        self.processDueTimers(now_ms, self.core.config.batching.maximum_packets_per_iteration) catch |err| {
+        try self.checkIdleTimeout(now_ms);
+        const delivered = self.processDueTimers(now_ms, self.core.config.batching.maximum_packets_per_iteration, bridge) catch |err| {
             self.abort();
             return err;
         };
@@ -326,14 +368,21 @@ pub const Client = struct {
             self.abort();
             return err;
         };
+        return delivered;
+    }
+
+    fn checkIdleTimeout(self: *Client, now_ms: u64) !void {
+        if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms))) {
+            self.abort();
+            return error.ConnectionTimedOut;
+        }
     }
 
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
         if (self.closed) return error.ConnectionClosed;
         if (self.timer_turn) {
             self.timer_turn = false;
-            try self.processTimers(time.nowMilliseconds(self.io));
-            return 0;
+            return self.processTimersWithMessages(time.nowMilliseconds(self.io), context, on_message);
         }
         if (self.pending_receive_error) |err| {
             self.pending_receive_error = null;
@@ -342,7 +391,8 @@ pub const Client = struct {
         if (self.pending_message_index == self.pending_message_count) {
             const batch = self.socket.receiveMany(self.messages, self.receive_storage, self.pollTimeout(timeout)) catch |err| switch (err) {
                 error.Timeout => {
-                    try self.processTimers(time.nowMilliseconds(self.io));
+                    const delivered = try self.processTimersWithMessages(time.nowMilliseconds(self.io), context, on_message);
+                    if (delivered != 0) return delivered;
                     return error.Timeout;
                 },
                 else => return err,
@@ -393,12 +443,14 @@ pub const Client = struct {
             self.pending_message_index = 0;
             self.pending_message_count = 0;
         }
+        try self.checkIdleTimeout(latest_ms);
         const flushed = self.flushQueuedAtLimit(latest_ms, remaining) catch |err| {
             self.abortOnError(.application_send, err);
             return err;
         };
         remaining -= @min(remaining, flushed.datagrams);
-        self.processDueTimers(latest_ms, remaining) catch |err| {
+        var timer_bridge: PollBridge = .{ .client = self, .context = context, .callback = on_message, .now_ms = latest_ms };
+        delivered += self.processDueTimers(latest_ms, remaining, &timer_bridge) catch |err| {
             self.abortOnError(.retransmission, err);
             return err;
         };
@@ -406,7 +458,7 @@ pub const Client = struct {
             self.abort();
             return err;
         };
-        if (remaining == 0) if (self.nextDeadline()) |deadline| {
+        if (remaining == 0) if (self.protocolDeadline()) |deadline| {
             self.timer_turn = deadline <= latest_ms;
         };
         return delivered;
@@ -491,35 +543,59 @@ pub const Client = struct {
         if (self.receipts.isEmpty()) self.ack_deadline_ms = null;
         return sent;
     }
-    fn processDueTimers(self: *Client, now_ms: u64, maximum_work: usize) !void {
-        if (maximum_work == 0) return;
+    fn processDueTimers(self: *Client, now_ms: u64, maximum_work: usize, bridge: ?*PollBridge) !usize {
+        if (maximum_work == 0) return 0;
+        var delivered: usize = 0;
         var remaining = maximum_work;
         var active: usize = @as(usize, @intFromBool(self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms)) +
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
-            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false);
+            @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false) +
+            @intFromBool(bridge != null and self.core.receiver_state.hasPendingDeliveries()) +
+            @intFromBool(if (self.keepaliveDeadline()) |deadline| deadline <= now_ms else false);
         const start = self.timer_cursor;
         var visited: usize = 0;
-        while (visited < 4 and remaining != 0 and active != 0) : (visited += 1) {
-            const timer = (start + visited) % 4;
+        while (visited < 6 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 6;
             const due = switch (timer) {
                 0 => self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms,
                 1 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
                 2 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
-                else => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+                3 => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
+                4 => bridge != null and self.core.receiver_state.hasPendingDeliveries(),
+                else => if (self.keepaliveDeadline()) |deadline| deadline <= now_ms else false,
             };
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
             const used = switch (timer) {
                 0 => try self.flushReceiptsUpTo(quota),
                 1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
-                2 => self.core.expireSplits(now_ms, quota).inspected,
-                else => try self.flushRetransmissions(now_ms, quota),
+                2 => (try self.core.expireSplits(now_ms, quota)).inspected,
+                3 => try self.flushRetransmissions(now_ms, quota),
+                4 => try self.core.receiver_state.drainPending(quota, bridge.?, PollBridge.deliver),
+                else => try self.sendKeepalive(now_ms),
             };
+            if (timer == 4) delivered += used;
             remaining -= @min(remaining, @max(@as(usize, 1), used));
             active -= 1;
-            self.timer_cursor = @intCast((timer + 1) % 4);
+            self.timer_cursor = @intCast((timer + 1) % 6);
+            if (bridge) |delivery| if (delivery.remote_disconnect) {
+                self.flushReceipts() catch {};
+                self.abort();
+                break;
+            };
         }
+        return delivered;
+    }
+
+    fn sendKeepalive(self: *Client, now_ms: u64) !usize {
+        self.last_keepalive_ms = now_ms;
+        if (!self.receipts.isEmpty() or self.core.outboundCount(.control) != 0) return 0;
+        var wire: [9]u8 = undefined;
+        const ping = try connected.encodePing(now_ms, &wire);
+        const wire_bytes = try self.core.transmitter_state.estimateWireBytes(ping.len, .unreliable, 0);
+        if (wire_bytes > self.core.congestion_state.available()) return 0;
+        return self.sendControlWire(ping, .unreliable, 0, now_ms);
     }
 
     fn flushRetransmissions(self: *Client, now_ms: u64, maximum_work: usize) !usize {
@@ -550,13 +626,19 @@ fn validateOptions(options: Options) !void {
         options.mtu_attempts == 0 or
         options.mtu_fallbacks.len >= max_mtu_rungs or
         options.receive_batch_size == 0 or
-        options.receive_batch_size > 256;
+        options.receive_batch_size > 256 or
+        keepaliveInterval(options) == 0 or
+        keepaliveInterval(options) > options.config.timing.idle_timeout_ms / 2;
     if (invalid) return error.InvalidConfiguration;
     var previous = options.config.protocol.maximum_mtu + 1;
     for (options.mtu_fallbacks) |fallback| {
         if (fallback < options.config.protocol.minimum_mtu or fallback > options.config.protocol.maximum_mtu or fallback >= previous) return error.InvalidConfiguration;
         previous = fallback;
     }
+}
+
+fn keepaliveInterval(options: Options) u32 {
+    return options.keepalive_interval_ms orelse @max(1, options.config.timing.idle_timeout_ms / 4);
 }
 
 const max_mtu_rungs = 8;
@@ -591,4 +673,20 @@ test "client validates a descending MTU ladder" {
     try validateOptions(.{ .mtu = 1200 });
     try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .mtu_fallbacks = &.{ 1200, 1200 } }));
     try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .mtu_fallbacks = &.{ 576, 1200 } }));
+}
+
+test "client keepalive leaves room before the idle timeout" {
+    try std.testing.expectEqual(@as(u32, 2_500), keepaliveInterval(.{}));
+    try validateOptions(.{ .keepalive_interval_ms = 5_000 });
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .keepalive_interval_ms = 0 }));
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .keepalive_interval_ms = 5_001 }));
+    var options: Options = .{};
+    options.config.timing.idle_timeout_ms = 100;
+    try std.testing.expectEqual(@as(u32, 25), keepaliveInterval(options));
+    try validateOptions(options);
+    options.keepalive_interval_ms = 51;
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(options));
+    options.keepalive_interval_ms = null;
+    options.config.timing.idle_timeout_ms = 1;
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(options));
 }

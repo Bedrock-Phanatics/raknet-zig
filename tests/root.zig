@@ -3,6 +3,7 @@ const raknet = @import("raknet");
 test {
     _ = raknet;
     _ = @import("loopback.zig");
+    _ = @import("keepalive.zig");
     _ = @import("codec_fuzz.zig");
     _ = @import("session_fuzz.zig");
     _ = @import("network_simulation.zig");

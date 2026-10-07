@@ -85,12 +85,18 @@ pub const IncomingFailure = struct {
 pub const ApplicationCallbackError = error{ApplicationFailure};
 pub const SendError = error{TransportFailure};
 pub const SendHandle = struct { id: outbound_queue.Id, owner: u64 };
+pub const SendReceipt = struct {
+    handle: SendHandle,
+    outcome: enum { acknowledged, failed, canceled },
+};
+const ReceiptState = struct { remaining: usize, outcome: ?@FieldType(SendReceipt, "outcome") = null };
 pub const CancelResult = enum { canceled, not_found, in_progress };
 const QueuedMessages = struct {
     iterator: outbound_queue.Iterator,
 
     pub fn next(self: *@This()) ?transmitter.PackedMessage {
         const message = self.iterator.next() orelse return null;
+        if (message.receipt) return null;
         return .{
             .payload = message.payload.bytes,
             .reliability = message.reliability,
@@ -140,7 +146,7 @@ pub fn classifyIncomingError(err: anyerror) IncomingFailure {
         error.CongestionWindowFull,
         => .{ .class = .resource, .disposition = .close_session },
 
-        error.TransportFailure => .{ .class = .transport, .disposition = .close_session },
+        error.TransportFailure, error.SplitReassemblyTimedOut => .{ .class = .transport, .disposition = .close_session },
         error.ApplicationFailure => .{ .class = .application, .disposition = .close_session },
         else => .{ .class = .internal, .disposition = .close_session },
     };
@@ -171,6 +177,8 @@ pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) Inc
             error.MessageTooLarge,
             error.InvalidOrderChannel,
             error.UnreliableMessageTooLarge,
+            error.UnsupportedReliability,
+            error.UnsupportedReceiptReliability,
             error.NotConnected,
             error.ConnectionClosed,
             => .{ .class = .application, .disposition = .reject },
@@ -180,6 +188,7 @@ pub fn classifyTransitionError(transition: SessionTransition, err: anyerror) Inc
             error.OutboundQueueFull,
             error.OutboundQueueBytesExceeded,
             error.OutboundQueueIdExhausted,
+            error.SendReceiptQueueFull,
             => .{ .class = .resource, .disposition = .retry },
 
             error.OutOfMemory,
@@ -233,6 +242,8 @@ pub const Core = struct {
     rtt_state: rtt.Estimator,
     ack_records: []ack.Record,
     send_owner: u64,
+    send_receipts: std.AutoHashMapUnmanaged(outbound_queue.Id, ReceiptState) = .empty,
+    emitting_receipt: ?outbound_queue.Id = null,
     terminal_send_failure: bool = false,
     newest_sent: u32 = 0,
     close_deadline_ms: ?u64 = null,
@@ -244,11 +255,15 @@ pub const Core = struct {
     nack_records_received: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, mtu: u16, config: Config) !Core {
+        return initWithOverhead(allocator, mtu, config, 28);
+    }
+    pub fn initWithOverhead(allocator: std.mem.Allocator, mtu: u16, config: Config, ip_udp_overhead: u16) !Core {
         try config.validate();
         if (mtu < config.protocol.minimum_mtu or mtu > config.protocol.maximum_mtu) return error.InvalidMtu;
+        const transmitter_state = try transmitter.Transmitter.initWithOverhead(mtu, config, ip_udp_overhead);
         var receiver_state = try receiver.Receiver.init(allocator, config);
         errdefer receiver_state.deinit();
-        var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, mtu);
+        var recovery_state = try recovery.Recovery.init(allocator, config.session.maximum_retransmissions, config.session.maximum_recovery_bytes, 8, transmitter_state.datagramMtu());
         recovery_state.maximum_delay_ms = config.timing.maximum_rto_ms;
         recovery_state.minimum_abandon_ms = config.timing.idle_timeout_ms;
         errdefer recovery_state.deinit();
@@ -265,7 +280,7 @@ pub const Core = struct {
             .allocator = allocator,
             .config = config,
             .receiver_state = receiver_state,
-            .transmitter_state = try transmitter.Transmitter.init(mtu, config),
+            .transmitter_state = transmitter_state,
             .outbound_state = outbound_state,
             .recovery_state = recovery_state,
             .congestion_state = try congestion.Controller.init(mtu),
@@ -275,6 +290,7 @@ pub const Core = struct {
         };
     }
     pub fn deinit(self: *Core) void {
+        self.send_receipts.deinit(self.allocator);
         self.receiver_state.deinit();
         self.recovery_state.deinit();
         self.outbound_state.deinit();
@@ -409,7 +425,47 @@ pub const Core = struct {
         return .{ .id = try self.outbound_state.enqueue(lane, payload, reliability, channel), .owner = self.send_owner };
     }
 
+    pub fn enqueueWithReceipt(self: *Core, payload: []const u8, reliability: frame.Reliability, channel: u8) !SendHandle {
+        if (self.terminal_send_failure) return error.ConnectionClosed;
+        if (!reliability.hasReliableIndex() or !reliability.supportedForSend()) return error.UnsupportedReceiptReliability;
+        const fragments = try self.transmitter_state.fragmentCount(payload.len, reliability, channel);
+        if (self.send_receipts.count() >= self.config.session.maximum_queued_outbound_packets) return error.SendReceiptQueueFull;
+        try self.recovery_state.enableReceipts();
+        try self.send_receipts.ensureUnusedCapacity(self.allocator, 1);
+        const handle = try self.enqueueOutbound(.application, payload, reliability, channel);
+        self.outbound_state.requestReceipt(.application);
+        self.send_receipts.putAssumeCapacity(handle.id, .{ .remaining = fragments });
+        return handle;
+    }
+
+    pub fn pollSendReceipt(self: *Core) ?SendReceipt {
+        var iterator = self.send_receipts.iterator();
+        while (iterator.next()) |entry| {
+            const outcome = entry.value_ptr.outcome orelse continue;
+            const id = entry.key_ptr.*;
+            _ = self.send_receipts.remove(id);
+            return .{ .handle = .{ .id = id, .owner = self.send_owner }, .outcome = outcome };
+        }
+        return null;
+    }
+
+    pub fn failSendReceipts(self: *Core) void {
+        var iterator = self.send_receipts.valueIterator();
+        while (iterator.next()) |state| if (state.outcome == null) {
+            state.outcome = .failed;
+        };
+    }
+
+    fn acknowledgedReceipt(raw: *anyopaque, id: u64) void {
+        const self: *Core = @ptrCast(@alignCast(raw));
+        const state = self.send_receipts.getPtr(id) orelse return;
+        if (state.outcome != null) return;
+        state.remaining -= 1;
+        if (state.remaining == 0) state.outcome = .acknowledged;
+    }
+
     pub fn outboundReady(self: *const Core, lane: outbound_queue.Lane) !bool {
+        if (self.outbound_state.peek(lane)) |head| if (head.receipt) return true;
         return self.transmitter_state.packReady(QueuedMessages{ .iterator = self.outbound_state.iterator(lane) });
     }
 
@@ -425,6 +481,7 @@ pub const Core = struct {
                 if (head.id == handle.id and self.outbound_packetization[lane_index] != null) return .in_progress;
             }
             if (self.outbound_state.cancel(lane, handle.id)) |message| {
+                if (self.send_receipts.getPtr(handle.id)) |state| state.outcome = .canceled;
                 message.payload.deinit();
                 return .canceled;
             }
@@ -468,7 +525,7 @@ pub const Core = struct {
         while (total.datagrams < maximum_datagrams) {
             const message = self.outbound_state.peek(lane) orelse break;
             if (self.outbound_packetization[lane_index] == null) {
-                const batch = self.packQueued(lane, scratch, now_ms, context, emit) catch |err| {
+                const batch = (if (message.receipt) transmitter.PackResult{} else self.packQueued(lane, scratch, now_ms, context, emit)) catch |err| {
                     if (total.datagrams != 0) {
                         self.terminal_send_failure = true;
                         return error.PartialSendFailure;
@@ -486,6 +543,8 @@ pub const Core = struct {
                 }
                 self.outbound_packetization[lane_index] = try self.transmitter_state.beginPacketization(message.payload.bytes.len, message.reliability, message.channel);
             }
+            self.emitting_receipt = if (message.receipt) message.id else null;
+            defer self.emitting_receipt = null;
             const sent = self.sendAvailable(
                 &self.outbound_packetization[lane_index].?,
                 message.payload.bytes,
@@ -523,6 +582,7 @@ pub const Core = struct {
     pub fn advanceClose(self: *Core, now_ms: u64) !CloseStep {
         const deadline = self.close_deadline_ms orelse return .pending;
         if (now_ms >= deadline) {
+            self.failSendReceipts();
             self.recovery_state.clear();
             self.outbound_state.clear();
             self.outbound_packetization = @splat(null);
@@ -552,6 +612,7 @@ pub const Core = struct {
         try self.congestion_state.sent(in_flight_bytes);
         errdefer self.congestion_state.cancel(in_flight_bytes);
         try self.recovery_state.track(sequence, wire, in_flight_bytes, now_ms, self.rtt_state.rto());
+        if (self.emitting_receipt) |id| self.recovery_state.setReceipt(sequence, id);
         self.newest_sent = sequence;
     }
 
@@ -591,7 +652,7 @@ pub const Core = struct {
                 break :blk .{ .incoming = .{ .data = receipt }, .work_units = receipt.workUnits() };
             },
             .ack => |decoded| blk: {
-                const result = try self.recovery_state.acknowledge(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams);
+                const result = try self.recovery_state.acknowledgeWithReceipts(decoded.records, now_ms, self.config.protocol.maximum_acknowledged_datagrams, self, acknowledgedReceipt);
                 self.ack_records_received += decoded.records.len;
                 self.acknowledged_datagrams +|= result.packets;
                 if (result.packets != 0) self.congestion_state.acknowledged(decoded.records[decoded.records.len - 1].last, result.bytes, result.packets);
@@ -615,8 +676,15 @@ pub const Core = struct {
         return self.receiver_state.nextSplitDeadline();
     }
 
-    pub fn expireSplits(self: *Core, now_ms: u64, maximum_work: usize) reassembly.ExpiryBatch {
-        return self.receiver_state.expireSplits(now_ms, maximum_work);
+    pub fn expireSplits(self: *Core, now_ms: u64, maximum_work: usize) !reassembly.ExpiryBatch {
+        const batch = self.receiver_state.expireSplits(now_ms, maximum_work);
+        // ACKed fragments cannot be recovered after discarding their assembly.
+        if (batch.reliable_expired != 0) {
+            self.terminal_send_failure = true;
+            self.failSendReceipts();
+            return error.SplitReassemblyTimedOut;
+        }
+        return batch;
     }
 
     pub fn collectRetransmissions(self: *Core, now_ms: u64, output: []recovery.Due, maximum_work: usize) recovery.DueBatch {
@@ -632,6 +700,155 @@ pub const Core = struct {
         return batch;
     }
 };
+
+const ReceiptHarness = struct {
+    sequences: [32]u32 = undefined,
+    count: usize = 0,
+    fn emit(raw: *anyopaque, wire: []const u8) SendError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const decoded = frame.decodeDatagram(wire) catch return error.TransportFailure;
+        self.sequences[self.count] = decoded.sequence;
+        self.count += 1;
+    }
+    fn discard(_: *anyopaque, _: receiver.BorrowedPayload) !void {}
+    fn acknowledge(self: *@This(), core: *Core, sequence: u32) !void {
+        var storage: [32]u8 = undefined;
+        const wire = try datagram.encodeControl(.ack, &.{.{ .first = sequence, .last = sequence }}, &storage);
+        _ = try core.processIncoming(wire, 100, self, discard);
+    }
+};
+
+test "split expiry respects work limits and only reliable loss is terminal" {
+    for ([_]frame.Reliability{ .unreliable, .unreliable_sequenced, .reliable, .reliable_ordered, .reliable_sequenced }) |reliability| {
+        var config: Config = .{};
+        config.timing.split_timeout_ms = 10;
+        var core = try Core.init(std.testing.allocator, 576, config);
+        defer core.deinit();
+        const handle = try core.enqueueWithReceipt("pending", .reliable_ordered, 0);
+        try std.testing.expect((try core.receiver_state.splits.pushWithMetadata(7, 2, 0, "a", .{ .reliability = reliability }, 0)) == null);
+        try std.testing.expectEqual(@as(usize, 0), (try core.expireSplits(10, 0)).expired);
+        try std.testing.expectEqual(@as(usize, 0), (try core.expireSplits(9, 1)).expired);
+        try std.testing.expectEqual(@as(usize, 1), core.receiver_state.splits.count());
+        if (reliability.hasReliableIndex()) {
+            try std.testing.expectError(error.SplitReassemblyTimedOut, core.expireSplits(10, 1));
+            const receipt = core.pollSendReceipt().?;
+            try std.testing.expectEqual(handle, receipt.handle);
+            try std.testing.expectEqual(.failed, receipt.outcome);
+            try std.testing.expectError(error.ConnectionClosed, core.enqueueOutbound(.application, "later", .reliable_ordered, 0));
+            const failure = classifyIncomingError(error.SplitReassemblyTimedOut);
+            try std.testing.expectEqual(.transport, failure.class);
+            try std.testing.expectEqual(.close_session, failure.disposition);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), (try core.expireSplits(10, 1)).expired);
+            try std.testing.expect(core.pollSendReceipt() == null);
+            _ = try core.enqueueOutbound(.application, "later", .reliable_ordered, 0);
+        }
+        try std.testing.expectEqual(@as(usize, 0), core.receiver_state.splits.count());
+        try std.testing.expectEqual(@as(usize, 0), core.receiver_state.splits.payloadBytes());
+    }
+}
+
+test "receipts wait for every fragment across partial flushes resends and wrap" {
+    var core = try Core.init(std.testing.allocator, 576, .{});
+    defer core.deinit();
+    core.transmitter_state.datagram_sequence = uint24.mask;
+    core.congestion_state.window = 576;
+    const payload: [1200]u8 = @splat(0xfe);
+    const handle = try core.enqueueWithReceipt(&payload, .reliable_ordered, 0);
+    var harness: ReceiptHarness = .{};
+    var scratch: [576]u8 = undefined;
+    const fragments = try core.transmitter_state.fragmentCount(payload.len, .reliable_ordered, 0);
+    for (0..fragments) |part| {
+        _ = try core.flushOutbound(.application, &scratch, 1, 0, &harness, ReceiptHarness.emit);
+        try std.testing.expectEqual(part + 1, harness.count);
+        try std.testing.expect(core.pollSendReceipt() == null);
+        const original = harness.sequences[part];
+        _ = try core.recovery_state.markNack(&.{.{ .first = original, .last = original }}, 0, 1);
+        var due: [1]recovery.Due = undefined;
+        try std.testing.expectEqual(@as(usize, 1), core.collectRetransmissions(0, &due, 1).items.len);
+        try harness.acknowledge(&core, if (part % 2 == 0) original else due[0].sequence);
+        try harness.acknowledge(&core, due[0].sequence);
+        if (part + 1 != fragments) try std.testing.expect(core.pollSendReceipt() == null);
+    }
+    const receipt = core.pollSendReceipt().?;
+    try std.testing.expectEqual(handle, receipt.handle);
+    try std.testing.expectEqual(.acknowledged, receipt.outcome);
+    try std.testing.expect(core.pollSendReceipt() == null);
+    try std.testing.expectEqual(@as(usize, 0), core.recovery_state.count());
+}
+
+test "receipt tags survive a full recovery ring and range ACKs" {
+    var config: Config = .{};
+    config.session.maximum_retransmissions = 2;
+    var core = try Core.init(std.testing.allocator, 576, config);
+    defer core.deinit();
+    _ = try core.enqueueWithReceipt("a", .reliable, 0);
+    _ = try core.enqueueWithReceipt("b", .reliable, 0);
+    var harness: ReceiptHarness = .{};
+    var scratch: [576]u8 = undefined;
+    _ = try core.flushOutbound(.application, &scratch, 2, 0, &harness, ReceiptHarness.emit);
+    _ = try core.recovery_state.markNack(&.{.{ .first = 0, .last = 0 }}, 0, 1);
+    var due: [1]recovery.Due = undefined;
+    try std.testing.expectEqual(@as(usize, 1), core.collectRetransmissions(0, &due, 1).items.len);
+    const wire = try datagram.encodeControl(.ack, &.{.{ .first = 0, .last = 6 }}, &scratch);
+    _ = try core.processIncoming(wire, 100, &harness, ReceiptHarness.discard);
+    for (0..2) |_| try std.testing.expectEqual(.acknowledged, core.pollSendReceipt().?.outcome);
+    try std.testing.expect(core.pollSendReceipt() == null);
+}
+
+test "receipt limits cancellation shutdown and untracked packing are independent" {
+    var config: Config = .{};
+    config.session.maximum_queued_outbound_packets = 3;
+    config.session.reserved_control_queue_packets = 1;
+    var core = try Core.init(std.testing.allocator, 576, config);
+    defer core.deinit();
+    try std.testing.expectEqual(@as(usize, 0), core.recovery_state.receipt_ids.len);
+    const canceled = try core.enqueueWithReceipt("a", .reliable, 0);
+    try std.testing.expectEqual(.canceled, core.cancelOutbound(canceled));
+    const sent = try core.enqueueWithReceipt("b", .reliable, 0);
+    var harness: ReceiptHarness = .{};
+    var scratch: [576]u8 = undefined;
+    _ = try core.flushOutbound(.application, &scratch, 1, 0, &harness, ReceiptHarness.emit);
+    try harness.acknowledge(&core, harness.sequences[0]);
+    const failed = try core.enqueueWithReceipt("c", .reliable, 0);
+    try std.testing.expectError(error.SendReceiptQueueFull, core.enqueueWithReceipt("d", .reliable, 0));
+    try std.testing.expectError(error.UnsupportedReceiptReliability, core.enqueueWithReceipt("d", .unreliable, 0));
+    core.beginClose(0);
+    try std.testing.expectEqual(.done, try core.advanceClose(config.timing.shutdown_timeout_ms));
+    var completed: usize = 0;
+    while (core.pollSendReceipt()) |receipt| {
+        const expected: @FieldType(SendReceipt, "outcome") = if (receipt.handle.id == canceled.id) .canceled else if (receipt.handle.id == sent.id) .acknowledged else blk: {
+            try std.testing.expectEqual(failed, receipt.handle);
+            break :blk .failed;
+        };
+        try std.testing.expectEqual(expected, receipt.outcome);
+        completed += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), completed);
+    try std.testing.expectEqual(@as(u32, 0), core.send_receipts.count());
+}
+
+fn checkReceiptAllocationFailures(allocator: std.mem.Allocator) !void {
+    var core = try Core.init(allocator, 576, .{});
+    defer core.deinit();
+    _ = try core.enqueueOutbound(.application, "untracked", .reliable, 0);
+    const handle = try core.enqueueWithReceipt("tracked", .reliable, 0);
+    _ = try core.enqueueOutbound(.application, "untracked", .reliable, 0);
+    var harness: ReceiptHarness = .{};
+    var scratch: [576]u8 = undefined;
+    for (0..3) |_| _ = try core.flushOutbound(.application, &scratch, 1, 0, &harness, ReceiptHarness.emit);
+    try std.testing.expectEqual(@as(usize, 3), harness.count);
+    try harness.acknowledge(&core, harness.sequences[0]);
+    try std.testing.expect(core.pollSendReceipt() == null);
+    try harness.acknowledge(&core, harness.sequences[1]);
+    try std.testing.expectEqual(handle, core.pollSendReceipt().?.handle);
+    core.failSendReceipts();
+    try std.testing.expect(core.pollSendReceipt() == null);
+}
+
+test "optional receipt storage survives all allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReceiptAllocationFailures, .{});
+}
 
 test "core validates ACKs against actual send state" {
     const Collector = struct {
@@ -687,7 +904,7 @@ test "core packetization stops at the available congestion window" {
     };
     var core = try Core.init(std.testing.allocator, 576, .{});
     defer core.deinit();
-    core.congestion_state.window = 576;
+    core.congestion_state.window = 548;
     var scratch: [576]u8 = undefined;
     var payload: [1200]u8 = @splat(1);
     var packetization = try core.beginPacketization(payload.len, .reliable_ordered, 0);
@@ -720,8 +937,8 @@ test "queued compatible messages share one datagram" {
     defer core.deinit();
     core.congestion_state.window = 576;
     var scratch: [576]u8 = undefined;
-    var first: [276]u8 = @splat(1);
-    var second: [276]u8 = @splat(2);
+    var first: [262]u8 = @splat(1);
+    var second: [262]u8 = @splat(2);
     _ = try core.enqueueOutbound(.application, &first, .reliable_ordered, 3);
     _ = try core.enqueueOutbound(.application, &second, .reliable_ordered, 3);
     _ = try core.enqueueOutbound(.application, "later", .reliable_ordered, 3);
@@ -729,7 +946,7 @@ test "queued compatible messages share one datagram" {
 
     const sent = try core.flushOutbound(.application, &scratch, 1, 0, &collector, Collector.emit);
     try std.testing.expectEqual(@as(usize, 1), sent.datagrams);
-    try std.testing.expectEqual(@as(usize, 576), sent.wire_bytes);
+    try std.testing.expectEqual(@as(usize, 548), sent.wire_bytes);
     try std.testing.expectEqual(@as(usize, 2), collector.frames);
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
     try std.testing.expectEqual(@as(u32, 2), core.transmitter_state.reliable_index);
@@ -929,7 +1146,7 @@ test "partial send failure rolls back only the failed datagram" {
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.datagram_sequence);
     try std.testing.expectEqual(@as(u32, 1), core.transmitter_state.reliable_index);
     try std.testing.expectEqual(@as(usize, 1), core.recovery_state.count());
-    try std.testing.expectEqual(@as(u64, 576), core.congestion_state.in_flight);
+    try std.testing.expectEqual(@as(u64, 548), core.congestion_state.in_flight);
     try std.testing.expectEqual(@as(usize, 1), core.outbound_state.count(.application));
     const progress = core.outbound_packetization[@backingInt(outbound_queue.Lane.application)].?;
     try std.testing.expectEqual(progress.capacity, progress.offset);

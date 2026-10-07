@@ -24,6 +24,10 @@ pub fn unspecified(address: offline.Address) offline.Address {
     };
 }
 
+pub fn ipUdpOverhead(address: std.Io.net.IpAddress) u16 {
+    return if (toRakNet(address) == .ipv6) 48 else 28;
+}
+
 const mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
 
 test "IP addresses preserve their RakNet wire fields" {

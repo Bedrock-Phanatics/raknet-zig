@@ -15,7 +15,7 @@ pub const Estimator = struct {
 
     pub fn observe(self: *Estimator, raw_sample_ms: u64) void {
         const sample = @min(raw_sample_ms, self.maximum_rto_ms);
-        // Peers that batch ACKs produce recurring slow samples the variance soon forgets
+        // Keep RTO above recurring delayed ACKs.
         self.peak_ms = @max(sample, self.peak_ms - self.peak_ms / 128);
         if (!self.initialized) {
             self.smoothed_ms = sample;

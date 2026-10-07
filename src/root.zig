@@ -10,9 +10,11 @@ pub const ListenerStatistics = @import("transport/server.zig").ListenerStatistic
 pub const OwnedPayload = @import("payload.zig").OwnedPayload;
 pub const Pong = @import("transport/ping.zig").Pong;
 pub const SendHandle = @import("session/core.zig").SendHandle;
+pub const SendReceipt = @import("session/core.zig").SendReceipt;
 pub const Server = @import("transport/server.zig").Listener;
 pub const ServerOptions = @import("transport/server.zig").Options;
 pub const Session = @import("transport/server.zig").Session;
+pub const SessionHandle = @import("transport/server.zig").SessionHandle;
 pub const SessionStatistics = @import("session/core.zig").Statistics;
 pub const ping = @import("transport/ping.zig").ping;
 
