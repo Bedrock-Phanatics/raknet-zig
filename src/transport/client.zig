@@ -24,6 +24,8 @@ pub const Options = struct {
     handshake_timeout_ms: u32 = 5_000,
     handshake_retry_ms: u32 = 500,
     handshake_transient_errors: u16 = 10,
+    /// Null uses one quarter of the idle timeout.
+    keepalive_interval_ms: ?u32 = null,
     receive_batch_size: usize = 32,
     socket_buffers: backend.BufferOptions = .{},
 };
@@ -45,6 +47,8 @@ pub const Client = struct {
     server_guid: u64,
     mtu: u16,
     last_seen_ms: u64,
+    keepalive_interval_ms: u32,
+    last_keepalive_ms: u64 = 0,
     outbound_deadline_ms: ?u64 = null,
     ack_deadline_ms: ?u64 = null,
     timer_cursor: u8 = 0,
@@ -182,6 +186,7 @@ pub const Client = struct {
             .server_guid = reply2.server_guid,
             .mtu = reply2.mtu,
             .last_seen_ms = time.nowMilliseconds(io),
+            .keepalive_interval_ms = keepaliveInterval(options),
         };
         transferred = true;
         try self.finishConnectedHandshake(&negotiator, deadline, options.handshake_retry_ms, options.config.batching.maximum_packets_per_iteration);
@@ -317,6 +322,7 @@ pub const Client = struct {
     }
     fn protocolDeadline(self: *const Client) ?u64 {
         var deadline = time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms);
+        if (self.keepaliveDeadline()) |keepalive| deadline = @min(deadline, keepalive);
         if (self.core.receiver_state.hasPendingDeliveries()) deadline = self.last_seen_ms;
         if (self.ack_deadline_ms) |ack_deadline| deadline = @min(deadline, ack_deadline);
         if (self.outbound_deadline_ms) |outbound| deadline = @min(deadline, outbound);
@@ -324,6 +330,11 @@ pub const Client = struct {
         if (self.core.nextSplitDeadline()) |split| deadline = @min(deadline, split);
         if (self.core.close_deadline_ms) |close_deadline| deadline = @min(deadline, close_deadline);
         return deadline;
+    }
+
+    fn keepaliveDeadline(self: *const Client) ?u64 {
+        if (self.closed or self.closing) return null;
+        return time.deadline(@max(self.last_seen_ms, self.last_keepalive_ms), self.keepalive_interval_ms);
     }
 
     pub fn pollTimeout(self: *const Client, limit: std.Io.Timeout) std.Io.Timeout {
@@ -348,10 +359,7 @@ pub const Client = struct {
 
     fn processTimersAt(self: *Client, now_ms: u64, bridge: ?*PollBridge) !usize {
         if (self.closed) return error.ConnectionClosed;
-        if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms))) {
-            self.abort();
-            return error.ConnectionTimedOut;
-        }
+        try self.checkIdleTimeout(now_ms);
         const delivered = self.processDueTimers(now_ms, self.core.config.batching.maximum_packets_per_iteration, bridge) catch |err| {
             self.abort();
             return err;
@@ -361,6 +369,13 @@ pub const Client = struct {
             return err;
         };
         return delivered;
+    }
+
+    fn checkIdleTimeout(self: *Client, now_ms: u64) !void {
+        if (time.reached(now_ms, time.deadline(self.last_seen_ms, self.core.config.timing.idle_timeout_ms))) {
+            self.abort();
+            return error.ConnectionTimedOut;
+        }
     }
 
     pub fn poll(self: *Client, timeout: std.Io.Timeout, context: *anyopaque, on_message: MessageFn) !usize {
@@ -428,6 +443,7 @@ pub const Client = struct {
             self.pending_message_index = 0;
             self.pending_message_count = 0;
         }
+        try self.checkIdleTimeout(latest_ms);
         const flushed = self.flushQueuedAtLimit(latest_ms, remaining) catch |err| {
             self.abortOnError(.application_send, err);
             return err;
@@ -535,17 +551,19 @@ pub const Client = struct {
             @intFromBool(self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms) +
             @intFromBool(if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false) +
             @intFromBool(if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false) +
-            @intFromBool(bridge != null and self.core.receiver_state.hasPendingDeliveries());
+            @intFromBool(bridge != null and self.core.receiver_state.hasPendingDeliveries()) +
+            @intFromBool(if (self.keepaliveDeadline()) |deadline| deadline <= now_ms else false);
         const start = self.timer_cursor;
         var visited: usize = 0;
-        while (visited < 5 and remaining != 0 and active != 0) : (visited += 1) {
-            const timer = (start + visited) % 5;
+        while (visited < 6 and remaining != 0 and active != 0) : (visited += 1) {
+            const timer = (start + visited) % 6;
             const due = switch (timer) {
                 0 => self.ack_deadline_ms != null and self.ack_deadline_ms.? <= now_ms,
                 1 => self.outbound_deadline_ms != null and self.outbound_deadline_ms.? <= now_ms,
                 2 => if (self.core.nextSplitDeadline()) |deadline| deadline <= now_ms else false,
                 3 => if (self.core.nextRetransmissionDeadline()) |deadline| deadline <= now_ms else false,
-                else => bridge != null and self.core.receiver_state.hasPendingDeliveries(),
+                4 => bridge != null and self.core.receiver_state.hasPendingDeliveries(),
+                else => if (self.keepaliveDeadline()) |deadline| deadline <= now_ms else false,
             };
             if (!due) continue;
             const quota = @max(@as(usize, 1), remaining / active);
@@ -554,12 +572,13 @@ pub const Client = struct {
                 1 => (try self.flushQueuedAtLimit(now_ms, quota)).datagrams,
                 2 => (try self.core.expireSplits(now_ms, quota)).inspected,
                 3 => try self.flushRetransmissions(now_ms, quota),
-                else => try self.core.receiver_state.drainPending(quota, bridge.?, PollBridge.deliver),
+                4 => try self.core.receiver_state.drainPending(quota, bridge.?, PollBridge.deliver),
+                else => try self.sendKeepalive(now_ms),
             };
             if (timer == 4) delivered += used;
             remaining -= @min(remaining, @max(@as(usize, 1), used));
             active -= 1;
-            self.timer_cursor = @intCast((timer + 1) % 5);
+            self.timer_cursor = @intCast((timer + 1) % 6);
             if (bridge) |delivery| if (delivery.remote_disconnect) {
                 self.flushReceipts() catch {};
                 self.abort();
@@ -567,6 +586,16 @@ pub const Client = struct {
             };
         }
         return delivered;
+    }
+
+    fn sendKeepalive(self: *Client, now_ms: u64) !usize {
+        self.last_keepalive_ms = now_ms;
+        if (!self.receipts.isEmpty() or self.core.outboundCount(.control) != 0) return 0;
+        var wire: [9]u8 = undefined;
+        const ping = try connected.encodePing(now_ms, &wire);
+        const wire_bytes = try self.core.transmitter_state.estimateWireBytes(ping.len, .unreliable, 0);
+        if (wire_bytes > self.core.congestion_state.available()) return 0;
+        return self.sendControlWire(ping, .unreliable, 0, now_ms);
     }
 
     fn flushRetransmissions(self: *Client, now_ms: u64, maximum_work: usize) !usize {
@@ -597,13 +626,19 @@ fn validateOptions(options: Options) !void {
         options.mtu_attempts == 0 or
         options.mtu_fallbacks.len >= max_mtu_rungs or
         options.receive_batch_size == 0 or
-        options.receive_batch_size > 256;
+        options.receive_batch_size > 256 or
+        keepaliveInterval(options) == 0 or
+        keepaliveInterval(options) > options.config.timing.idle_timeout_ms / 2;
     if (invalid) return error.InvalidConfiguration;
     var previous = options.config.protocol.maximum_mtu + 1;
     for (options.mtu_fallbacks) |fallback| {
         if (fallback < options.config.protocol.minimum_mtu or fallback > options.config.protocol.maximum_mtu or fallback >= previous) return error.InvalidConfiguration;
         previous = fallback;
     }
+}
+
+fn keepaliveInterval(options: Options) u32 {
+    return options.keepalive_interval_ms orelse @max(1, options.config.timing.idle_timeout_ms / 4);
 }
 
 const max_mtu_rungs = 8;
@@ -638,4 +673,20 @@ test "client validates a descending MTU ladder" {
     try validateOptions(.{ .mtu = 1200 });
     try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .mtu_fallbacks = &.{ 1200, 1200 } }));
     try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .mtu_fallbacks = &.{ 576, 1200 } }));
+}
+
+test "client keepalive leaves room before the idle timeout" {
+    try std.testing.expectEqual(@as(u32, 2_500), keepaliveInterval(.{}));
+    try validateOptions(.{ .keepalive_interval_ms = 5_000 });
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .keepalive_interval_ms = 0 }));
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(.{ .keepalive_interval_ms = 5_001 }));
+    var options: Options = .{};
+    options.config.timing.idle_timeout_ms = 100;
+    try std.testing.expectEqual(@as(u32, 25), keepaliveInterval(options));
+    try validateOptions(options);
+    options.keepalive_interval_ms = 51;
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(options));
+    options.keepalive_interval_ms = null;
+    options.config.timing.idle_timeout_ms = 1;
+    try std.testing.expectError(error.InvalidConfiguration, validateOptions(options));
 }
