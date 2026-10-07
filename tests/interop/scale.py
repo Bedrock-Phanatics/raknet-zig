@@ -79,13 +79,14 @@ def command(binary, cpus, *args):
     return ["taskset", "-c", cpus, *cmd] if cpus and os.name != "nt" else cmd
 
 
-def server_command(args, kind):
+def server_command(args, kind, is_baseline=False):
     lifetime = args.seconds + (args.warmup_ms + 999) // 1000 + args.ramp_timeout + 10
     argv = ["server", f"{args.host}:{args.port}", lifetime * args.churn_rounds]
     if kind == "zig":
         argv += [args.listeners, args.ack_ms, args.receive_batch]
-        if args.send_batch is not None or args.receive_buffer is not None:
-            argv += [args.send_batch or 64]
+        send_batch = None if is_baseline else args.send_batch
+        if send_batch is not None or args.receive_buffer is not None:
+            argv += [send_batch or 64]
         if args.receive_buffer is not None:
             argv += [args.receive_buffer]
     return command(args.zig if kind == "zig" else args.go, args.server_cpus, *argv)
@@ -101,7 +102,7 @@ def stop(proc):
         proc.wait()
 
 
-def run_case(args, server_kind, client_kind, connections, payload, repeat, output, existing_server=None):
+def run_case(args, server_kind, client_kind, connections, payload, repeat, output, existing_server=None, is_baseline=False):
     name = f"{server_kind}-{client_kind}-n{connections}-p{payload}-r{repeat}"
     events = queue.Queue()
     processes, readers = [], []
@@ -128,11 +129,12 @@ def run_case(args, server_kind, client_kind, connections, payload, repeat, outpu
     row = dict(server=server_kind, client=client_kind, connections=connections, payload=payload,
                repeat=repeat, seconds=args.seconds, warmup_ms=args.warmup_ms, window=args.window,
                interval_ms=args.interval_ms, listeners=args.listeners, ack_ms=args.ack_ms,
-               receive_batch=args.receive_batch, send_batch=args.send_batch, platform=platform.platform(), valid=False)
+               receive_batch=args.receive_batch, send_batch=None if is_baseline else args.send_batch,
+               platform=platform.platform(), valid=False)
     phases, snapshots, network = {}, [], []
     final, fairness, ready = {}, {}, {}
     try:
-        server = existing_server or launch("server", server_command(args, server_kind))
+        server = existing_server or launch("server", server_command(args, server_kind, is_baseline))
         time.sleep(0.5)
         baseline = process_sample(server.pid)
         client_binary = args.client_zig if client_kind == "zig" else binaries[client_kind]
@@ -211,17 +213,17 @@ def run_case(args, server_kind, client_kind, connections, payload, repeat, outpu
     return row
 
 
-def run_rounds(args, server, client, connections, payload, repeat, output):
+def run_rounds(args, server, client, connections, payload, repeat, output, is_baseline=False):
     if args.churn_rounds == 1:
-        yield run_case(args, server, client, connections, payload, repeat, output)
+        yield run_case(args, server, client, connections, payload, repeat, output, is_baseline=is_baseline)
         return
     name = f"{server}-{client}-n{connections}-p{payload}-r{repeat}-churn-server.log"
     with (output / name).open("w") as log:
-        proc = subprocess.Popen(server_command(args, server), stdout=log, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(server_command(args, server, is_baseline), stdout=log, stderr=subprocess.STDOUT,
                                 env={**os.environ, "GOMAXPROCS": str(args.go_cpus)})
         try:
             for cohort in range(args.churn_rounds):
-                row = run_case(args, server, client, connections, payload, f"{repeat}-c{cohort}", output, proc)
+                row = run_case(args, server, client, connections, payload, f"{repeat}-c{cohort}", output, proc, is_baseline)
                 row["cohort"] = cohort
                 if cohort + 1 == args.churn_rounds:
                     time.sleep(11)  # Allow the 10-second idle timeout to expire.
@@ -288,6 +290,7 @@ def main():
     binaries = [args.zig, args.client_zig, args.go] + ([args.baseline_zig] if args.baseline_zig else [])
     hashes = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in binaries}
     config = {k: v for k, v in vars(args).items() if k != "resume"}
+    config["send_batch_candidate_only"] = True
     rows = []
     if args.resume and output.exists():
         if args.churn_rounds != 1:
@@ -319,7 +322,7 @@ def main():
                                 continue
                             destination = output / variant
                             destination.mkdir(exist_ok=True)
-                            for row in run_rounds(args, server, client, connections, payload, repeat, destination):
+                            for row in run_rounds(args, server, client, connections, payload, repeat, destination, is_baseline=variant == "before"):
                                 row["variant"] = variant
                                 rows.append(row)
                                 log.write(json.dumps(row) + "\n")
