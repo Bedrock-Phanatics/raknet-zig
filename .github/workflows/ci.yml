@@ -47,6 +47,7 @@ jobs:
           - ubuntu-latest
           - windows-latest
           - macos-latest
+          - macos-15-intel
 
     steps:
       - name: Checkout
@@ -63,6 +64,39 @@ jobs:
 
       - name: Run tests
         run: zig build test -Doptimize=Debug -Dfuzz-iterations=20000
+
+  release-test:
+    name: Test (${{ matrix.os }}, ${{ matrix.optimize }})
+    needs: format
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - macos-15-intel
+        optimize:
+          - ReleaseSafe
+          - ReleaseFast
+        exclude:
+          - os: ubuntu-latest
+            optimize: ReleaseSafe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-tests-${{ matrix.optimize }}
+
+      - name: Run tests
+        run: zig build test -Doptimize=${{ matrix.optimize }} -Dfuzz-iterations=20000
 
   release-safe:
     name: ReleaseSafe + Bench Smoke
